@@ -33,7 +33,7 @@ tuned hot-tier in-memory cluster.
 Requirements: Docker and `curl`. No signup.
 
 ```bash
-git clone https://github.com/desquaredp/rosalinddb.git
+git clone https://github.com/rosalinddb/rosalinddb.git
 cd rosalinddb
 docker compose up
 ```
@@ -143,7 +143,7 @@ More gotchas in [`docs/deploy/self-host.md`](docs/deploy/self-host.md) §5.
 ## MCP server
 
 The companion MCP server for Claude / Cursor users lives at
-[desquaredp/rosalinddb-mcp](https://github.com/desquaredp/rosalinddb-mcp).
+[rosalinddb/rosalinddb-mcp](https://github.com/rosalinddb/rosalinddb-mcp).
 It exposes the full RosalindDB management surface (datasets, ingest,
 query) as MCP tools.
 

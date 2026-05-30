@@ -9,7 +9,7 @@ after `docker compose up` works, when you want to put it behind a real domain.
 ## 1. The headline path
 
 ```bash
-git clone https://github.com/desquaredp/rosalinddb
+git clone https://github.com/rosalinddb/rosalinddb
 cd rosalinddb
 docker compose up
 ```
