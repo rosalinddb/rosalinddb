@@ -2,7 +2,7 @@
 
 If you believe you've found a security vulnerability in RosalindDB, please **do not** open a public GitHub issue.
 
-Report it via GitHub Security Advisories: https://github.com/desquaredp/rosalinddb/security/advisories/new
+Report it via GitHub Security Advisories: https://github.com/rosalinddb/rosalinddb/security/advisories/new
 
 We'll acknowledge receipt within 72 hours and aim to address confirmed reports within 30 days. We'll coordinate disclosure with you once a fix is available.
 

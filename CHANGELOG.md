@@ -25,5 +25,5 @@ Initial public release.
 - Optional authentication (JWT + API keys) and optional per-tenant limits, both
   off by default for self-hosting (`RB_REQUIRE_AUTH`, `RB_ENABLE_QUOTAS`).
 
-[Unreleased]: https://github.com/desquaredp/rosalinddb/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/desquaredp/rosalinddb/releases/tag/v0.1.0
+[Unreleased]: https://github.com/rosalinddb/rosalinddb/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/rosalinddb/rosalinddb/releases/tag/v0.1.0
