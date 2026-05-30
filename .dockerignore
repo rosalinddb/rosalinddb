@@ -1,0 +1,58 @@
+# Build context exclusions for the deployment image.
+# Keep the context small: only adapters/, services/, scripts/ and
+# requirements.txt are needed to run the process roles.
+
+# Version control
+.git/
+.gitattributes
+.gitignore
+
+# Python caches and virtualenvs
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE / editor / OS cruft
+.idea/
+.vscode/
+.DS_Store
+**/.DS_Store
+*.swp
+*~
+
+# Secrets and local env
+.env
+.env.*
+*.env
+
+# Tests and local data (not run in the image)
+tests/
+data/
+
+# Docs and project metadata
+docs/
+*.md
+logo*.png
+
+# CI
+.github/
+
+# Local docker compose stack
+docker-compose.yml
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+.coverage.*

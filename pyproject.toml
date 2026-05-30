@@ -1,0 +1,10 @@
+[tool.pytest.ini_options]
+# The suite is two-tiered. Markers are applied automatically by directory in
+# tests/conftest.py (tests/unit -> unit, tests/integration -> integration), so
+# `pytest -m unit` runs the fast hermetic suite (no Docker) and
+# `pytest -m integration` runs the MinIO-backed suite (Docker required).
+testpaths = ["tests"]
+markers = [
+    "unit: fast, hermetic tests — zero filesystem and zero network I/O; storage goes through the memory:// adapter",
+    "integration: end-to-end tests against a real MinIO container (testcontainers); requires Docker",
+]

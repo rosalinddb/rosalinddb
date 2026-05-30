@@ -1,0 +1,193 @@
+# Resource-pinned compose override for local benchmarking.
+#
+# Layered on top of the base docker-compose.yml:
+#
+#   docker compose \
+#     -p rosalinddb-bench \
+#     -f docker-compose.yml \
+#     -f bench/docker-compose.bench.yml \
+#     up -d
+#
+# Adds:
+#   1. CPU + memory caps on every service (cp / query_dp ~ 1 CPU each,
+#      workers + postgres ~ 0.5 CPU). Constrains the stack to behave like
+#      a small cloud VM rather than an unbounded laptop.
+#   2. RB_REQUIRE_AUTH + RB_ENABLE_QUOTAS = true, so the bench exercises
+#      the auth + quota path.
+#   3. An OTLP/HTTP exporter pointing at otel-collector:4318 — pair with
+#      the observability/ compose project.
+#   4. A k6 container on the same network as cp; request RTT is loopback.
+
+networks:
+  default:
+    name: rosalinddb-bench_default
+  obs:
+    name: rosalinddb-observability_default
+    external: true
+
+services:
+  # === Stateful deps — modest caps; not under test. ===
+  postgres:
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512m
+
+  redis:
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256m
+
+  minio:
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512m
+
+  # === Application services — production-shaped caps. ===
+  cp:
+    networks:
+      - default
+      - obs
+    environment:
+      RB_REQUIRE_AUTH: "true"
+      RB_ENABLE_QUOTAS: "true"
+      # High-volume bench knobs. Defaults match the contract numbers
+      # (`_DEFAULT_VECTOR_QUOTA = 100_000`, daily query quota 10_000,
+      # rate limit 50 RPS / 100 burst) so a normal matrix bench is
+      # unaffected. Override via shell env at compose-up time when a
+      # single-tenant 1M-vector seed would blow the defaults — e.g.
+      # `RB_TEST_VECTOR_QUOTA=10000000 RB_TEST_QUERY_QUOTA=100000000 \
+      #  RB_RATE_LIMIT_RPS=100000 RB_RATE_LIMIT_BURST=200000 \
+      #  docker compose -p rosalinddb-bench ... up -d` for the mmap
+      # comparison bench.
+      RB_TEST_VECTOR_QUOTA: "${RB_TEST_VECTOR_QUOTA:-100000}"
+      RB_TEST_QUERY_QUOTA: "${RB_TEST_QUERY_QUOTA:-10000}"
+      RB_RATE_LIMIT_RPS: "${RB_RATE_LIMIT_RPS:-50}"
+      RB_RATE_LIMIT_BURST: "${RB_RATE_LIMIT_BURST:-100}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      OTEL_SERVICE_NAME: "rb-cp"
+      OTEL_RESOURCE_ATTRIBUTES: "service.name=rb-cp,deployment.environment=bench"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
+
+  query_dp:
+    networks:
+      - default
+      - obs
+    environment:
+      RB_REQUIRE_AUTH: "true"
+      RB_ENABLE_QUOTAS: "true"
+      # The mmap flag is consumed inside the FAISS-loading hot path.
+      # `services/query_api/v1_query.py` captures `RB_FAISS_MMAP` ONCE at
+      # module import time into `_MMAP_ENABLED`, so flipping it requires a
+      # DP restart; the comparison bench (`run_mmap_comparison.sh`) brings
+      # the DP down + back up between the off and on runs.
+      RB_FAISS_MMAP: "${RB_FAISS_MMAP:-false}"
+      # SSD-cache layer; default-off / behaviour-preserving.
+      # The bench scripts set these explicitly via shell env at compose-up
+      # time to exercise the tier + prewarm + listen paths.
+      RB_SHARD_TIER_BYTES: "${RB_SHARD_TIER_BYTES:-}"
+      RB_SHARD_TIER_DIR: "${RB_SHARD_TIER_DIR:-}"
+      RB_SHARD_TIER_MIN_RESIDENT_S: "${RB_SHARD_TIER_MIN_RESIDENT_S:-}"
+      RB_CATALOG_LISTEN: "${RB_CATALOG_LISTEN:-}"
+      RB_CATALOG_FRESHNESS_S: "${RB_CATALOG_FRESHNESS_S:-}"
+      RB_PREWARM_CONSUMER: "${RB_PREWARM_CONSUMER:-}"
+      RB_ADMIN_ENDPOINTS: "${RB_ADMIN_ENDPOINTS:-}"
+      RB_DP_RESIDENCY_REGISTRY: "${RB_DP_RESIDENCY_REGISTRY:-}"
+      RB_DP_RESIDENCY_SYNC_S: "${RB_DP_RESIDENCY_SYNC_S:-}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      OTEL_SERVICE_NAME: "rb-dp"
+      OTEL_RESOURCE_ATTRIBUTES: "service.name=rb-dp,deployment.environment=bench"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2g
+
+  validator:
+    networks:
+      - default
+      - obs
+    environment:
+      RB_REQUIRE_AUTH: "true"
+      RB_ENABLE_QUOTAS: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      OTEL_SERVICE_NAME: "rb-validator"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512m
+
+  index_builder:
+    networks:
+      - default
+      - obs
+    environment:
+      RB_REQUIRE_AUTH: "true"
+      RB_ENABLE_QUOTAS: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      OTEL_SERVICE_NAME: "rb-builder"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1g
+
+  ephemeral_runner:
+    networks:
+      - default
+      - obs
+    environment:
+      RB_REQUIRE_AUTH: "true"
+      RB_ENABLE_QUOTAS: "true"
+      # The ephemeral runner is a separate process that imports `_MMAP_ENABLED`
+      # from `services.query_api.v1_query`; that import resolves the flag from
+      # this process's own env at import time. Validator and index_builder do
+      # NOT load FAISS indexes, so they intentionally do not get this var.
+      RB_FAISS_MMAP: "${RB_FAISS_MMAP:-false}"
+      # SSD-cache layer — mirrored from query_dp so the ephemeral
+      # path delegates to shard_tier when the tier is active. Same
+      # default-off behaviour-preserving contract.
+      RB_SHARD_TIER_BYTES: "${RB_SHARD_TIER_BYTES:-}"
+      RB_SHARD_TIER_DIR: "${RB_SHARD_TIER_DIR:-}"
+      RB_CATALOG_LISTEN: "${RB_CATALOG_LISTEN:-}"
+      RB_CATALOG_FRESHNESS_S: "${RB_CATALOG_FRESHNESS_S:-}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      OTEL_SERVICE_NAME: "rb-ephemeral"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512m
+
+  # === Load generator — on the same default network as cp. ===
+  k6:
+    image: grafana/k6:latest
+    container_name: rosalinddb-bench-k6
+    depends_on:
+      cp:
+        condition: service_started
+    networks:
+      - default
+    environment:
+      BASE_URL: "http://cp:8080"
+    volumes:
+      - ./bench:/bench
+    working_dir: /bench
+    # Kept alive so `docker compose exec` can drive individual k6 runs
+    # from run_matrix.sh. Each cell is a separate `k6 run` invocation.
+    entrypoint: ["sleep", "infinity"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g

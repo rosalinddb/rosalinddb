@@ -1,0 +1,57 @@
+@startuml mmap-component
+title RosalindDB query path with FAISS mmap
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam wrapWidth 200
+
+actor "client" as client
+
+component "cp\n(Control Plane,\npublic origin)" as cp
+component "query_dp\n(Query Data Plane;\nFAISS cache + mmap'd index)" as dp
+database "cache_dir\n(local SSD,\nCACHE_DIR)" as cachedir
+cloud "object_store\n(S3-compatible)" as os
+
+client -down-> cp : HTTPS\nPOST /v1/query
+cp -down-> dp : internal HTTP proxy\n(loopback in self-host,\nprivate net in prod)
+
+dp -right-> os : GET shard.bin via _ensure_cached\n[on cache miss only]
+dp -down-> cachedir : write file, atomic rename\n[on cache miss only]
+dp -down-> cachedir : mmap(2) open\n[cheap, no I/O]
+dp -down-> cachedir : page faults during index.search\n[on-demand, kernel reads touched pages]
+
+note right of os
+  WAN cost: paid once per shard.
+  Skipped entirely on a cache hit.
+end note
+
+note right of cachedir
+  Three distinct interactions:
+  - one-time write on miss
+  - cheap mmap open (offset table only)
+  - on-demand page faults during search
+  Must be a real local filesystem;
+  never a FUSE object-store mount.
+end note
+
+note left of dp
+  In-process _SHARD_CACHE keys by shard_id.
+  Under RB_FAISS_MMAP=true the cached
+  entry is the mmap-backed FAISS object
+  plus the parsed sidecar; the byte
+  accounting falls back to a fixed
+  _MMAP_INDEX_ESTIMATE_BYTES (32 MiB)
+  because resident bytes are the kernel's
+  page cache, not the Python heap.
+end note
+
+note bottom of cp
+  Trusts request after authenticating;
+  injects X-RB-Tenant-Id for the DP.
+end note
+
+@enduml

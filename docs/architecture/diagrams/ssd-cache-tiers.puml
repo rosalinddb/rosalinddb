@@ -1,0 +1,78 @@
+@startuml ssd-cache-tiers
+' Three-tier cache architecture with the data flow on a cache miss.
+' Object store (durable, immutable, versioned) -> SSD tier (latency,
+' W-TinyLFU) -> RAM tier (working set, mmap-backed). Builder writes only
+' to object store + Postgres catalog; DPs pull through the tiers.
+
+title RosalindDB query_dp cache tiers (object store + SSD + RAM)
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam wrapWidth 220
+
+actor "client" as client
+component "cp\n(Control Plane,\nrendezvous routing)" as cp
+component "index_builder\n(writes versioned URIs,\npublishes PREWARM_SHARD)" as builder
+
+node "query_dp" as dp {
+  component "_SHARD_CACHE\n(in-process LRU,\nFAISS + sidecar)" as ram
+  database "shard_tier\n(SSD, W-TinyLFU,\nimmutable files)" as ssd
+}
+
+database "shard_catalog\n(Postgres,\nversioned URIs)" as catalog
+cloud "object_store\n(S3-compatible;\nshard-{id}-{hash}.bin keys)" as os
+
+client -down-> cp : POST /v1/query
+cp -down-> dp : pick_dp(shard_id)\n[rendezvous + residency hint]
+cp -right-> catalog : list_shards\n[+ residency hint read]
+catalog -left-> cp : newest shard\n+ DP residency
+
+dp -down-> ram : _cache_get(shard_id)
+note right of ram
+  HIT  -> reuse FAISS handle + sidecar
+  MISS -> fall through to SSD tier
+end note
+
+ram -down-> ssd : shard_tier.fetch(shard_id, uri)
+note right of ssd
+  HIT  -> mmap(2) the local file,
+          deserialise, populate RAM
+  MISS -> single-flight GET from
+          object store, atomic
+          temp+rename, then mmap
+end note
+
+ssd -down-> os : GET shard.bin\n[cache miss only;\none GET per uncached URI]
+os -up-> ssd : bytes\n(content-addressed, immutable)
+
+builder -right-> os : PUT shard-{id}-{hash}.bin\n[never overwrites]
+builder -down-> catalog : add_shard (NOTIFY)\n[publishes versioned URI]
+builder -left-> dp : PREWARM_SHARD\n[rendezvous-elected DP only]
+
+catalog -up-> dp : LISTEN catalog_updates\n[push invalidation]
+
+note bottom of os
+  Durable source of truth.
+  Versioned URIs: a published key
+  is never overwritten. Orphan GC
+  sweeps unreferenced keys after 24h.
+end note
+
+note bottom of ssd
+  Latency tier. POSIX unlink-with-open-fd
+  guarantee: an mmap on an evicted file
+  stays valid until the last fd closes.
+end note
+
+note bottom of ram
+  Working set. Bytes-budgeted LRU at
+  RB_SHARD_CACHE_BYTES (default 512 MB).
+  Under mmap, FAISS pages live in the
+  kernel page cache, not RSS.
+end note
+
+@enduml

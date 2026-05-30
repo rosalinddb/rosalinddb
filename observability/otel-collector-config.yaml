@@ -1,0 +1,54 @@
+# OTEL collector — receives OTLP from rb-cp / rb-dp / workers, fans out to
+# Tempo for traces and Prometheus (via the prometheus *exporter*, which
+# exposes /metrics for prometheus to scrape) for metrics.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch spans/metrics to reduce request fan-out to Tempo.
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+  # Drop noisy attributes if they pile up; safe no-op otherwise.
+  memory_limiter:
+    check_interval: 5s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+exporters:
+  # Tempo accepts OTLP/gRPC on its receiver port.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  # Re-exposes metrics as a /metrics endpoint that prometheus scrapes.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: rb
+    send_timestamps: true
+    metric_expiration: 5m
+  # Console debug — kept low-verbosity so it doesn't drown the bench logs.
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]

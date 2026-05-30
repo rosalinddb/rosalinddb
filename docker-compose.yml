@@ -1,0 +1,332 @@
+# RosalindDB — self-host docker compose stack.
+#
+# THE HEADLINE PORTABLE INSTALL PATH. `git clone && docker compose up --build`
+# from a fresh checkout MUST come up healthy with a single public origin at
+# `http://localhost:8080`, against which `python -m scripts.smoke` passes.
+#
+# Topology mirrors a typical CP/DP split. The public/private network
+# isolation is provided by the Docker compose network (or your container
+# orchestrator — Docker network, k8s namespace, etc.):
+#
+#   redis           Reliable queue + ephemeral result store + (when enabled)
+#                   rate-limiter coordination. `redis:7-alpine`.
+#   minio           S3-compatible object storage for landing data + FAISS index
+#                   shards. Any S3-compatible store (MinIO for local/CI;
+#                   AWS S3, GCS, R2, etc. in other environments).
+#   createbuckets   One-shot mc bootstrap (`vectors` bucket + public policy).
+#   postgres        The catalog (any Postgres). Local dev uses the bundled
+#                   `postgres:15` container.
+#   migrator        One-shot `python -m scripts.migrate` that runs the schema
+#                   migration to completion before any app container starts.
+#                   Replaces the in-process auto-migrate pattern that required
+#                   `RB_SKIP_MIGRATE=1` workarounds in earlier configurations.
+#   cp              `services.control_plane.cp_app:app`. The ONLY service with
+#                   a host port — the single public origin a self-hoster's
+#                   client points at. Hosts auth, `/v1/datasets*`, ingest, the
+#                   bulk-import surface, and reverse-proxies `/v1/query` to
+#                   `query_dp`. Stateless.
+#   query_dp        `services.query_api.dp_app:app`. PRIVATE to the compose
+#                   network (no host port) — reachable only via the CP proxy.
+#                   Runs the FAISS search.
+#   validator       `services.validator_worker.run`. Queue-driven, private.
+#   index_builder   `services.index_builder.run`. Queue-driven, private.
+#   ephemeral_runner `services.ephemeral_runner.run`. Queue-driven, private.
+#
+# All Python services build from the root `Dockerfile`; per-service
+# `command:` overrides select the process role.
+#
+# Dev defaults below (postgres/postgres, minio/minio123, JWT_SECRET=dev-secret)
+# are for LOCAL DEVELOPMENT ONLY. For a real self-host install, override via
+# an `.env` file or a compose override — never deploy these to a public host.
+#
+# Quotas are opt-in via `RB_ENABLE_QUOTAS`. Default is OFF (this file does NOT
+# set it) so a self-hoster's own queries are never throttled. A deployment that
+# wants per-tenant limits turns it on by exporting `RB_ENABLE_QUOTAS=true`.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+      # CORS for the bulk-import flow: a browser client POSTs the
+      # staged file *directly* to MinIO via a presigned upload, so MinIO must
+      # answer the cross-origin preflight. In dev the Next.js dev server
+      # picks a localhost port, so the whole localhost origin range is
+      # allowed. In production set this to your client origin(s).
+      MINIO_API_CORS_ALLOW_ORIGIN: "http://localhost:3000,http://localhost:3001,http://localhost:3002"
+    command: server /data --console-address :9001
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./data/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh -c
+    command: >
+      "mc alias set local http://minio:9000 minio minio123 &&
+       mc mb -p local/vectors || true &&
+       mc anonymous set public local/vectors || true"
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: vectors
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vectors"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot schema migrator. Runs once on `docker compose up`, applies the
+  # schema, exits 0. Every long-running app service waits on this via
+  # `depends_on: { migrator: { condition: service_completed_successfully } }`
+  # so the app never boots against an un-migrated catalog. Replaces the
+  # in-process auto-migrate that needed `RB_SKIP_MIGRATE=1` workarounds.
+  migrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    # Cold-boot race: on a fresh volume Postgres flips between "accepting
+    # connections" / "rejecting connections" during its first-time initdb /
+    # superuser-create phase, so `pg_isready` (the healthcheck) can report
+    # healthy before the catalog can actually serve a real query. Sleep for
+    # the first connection to land, then run migrate. `migrate()` itself is
+    # idempotent (pg_advisory_xact_lock + version ledger) so a re-run is a
+    # cheap no-op once the schema is current.
+    command:
+      - "sh"
+      - "-c"
+      - |
+        echo "migrator: waiting for postgres to accept connections..."
+        for i in $$(seq 1 30); do
+          python -c "import psycopg2, os; psycopg2.connect(os.environ['DATABASE_URL']).close()" 2>/dev/null && break
+          sleep 1
+        done
+        exec python -m scripts.migrate
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # Control Plane — the single public origin. Auth, /v1/datasets*, ingest,
+  # the bulk-import surface, and the /v1/query reverse proxy live here.
+  # Self-hoster's client (CLI, SDK, dashboard) points at http://localhost:8080.
+  cp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command:
+      [
+        "uvicorn",
+        "services.control_plane.cp_app:app",
+        "--host", "0.0.0.0",
+        "--port", "8080",
+      ]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      # OSS-vs-SaaS gates. Pass through from the shell / .env so a
+      # self-hoster can flip them with `RB_REQUIRE_AUTH=true docker compose up`
+      # without editing this file. Defaults match the OSS-friendly story:
+      # auth OFF, quotas OFF, JWT secret a known dev value (a real deploy
+      # MUST override JWT_SECRET — see .env.example).
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      RB_REQUIRE_AUTH: "${RB_REQUIRE_AUTH:-false}"
+      RB_ENABLE_QUOTAS: "${RB_ENABLE_QUOTAS:-false}"
+      # The CP reverse-proxies POST /v1/query to this DP base URL. The DP has
+      # no host port — it is reachable only by service name on the compose
+      # network.
+      QUERY_DP_URL: http://query_dp:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Query Data Plane — private to the compose network (no host port). The CP
+  # is the only thing that talks to this; a self-hoster's traffic always
+  # arrives via the CP at :8080.
+  query_dp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command:
+      [
+        "uvicorn",
+        "services.query_api.dp_app:app",
+        "--host", "0.0.0.0",
+        "--port", "8080",
+      ]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      RB_REQUIRE_AUTH: "${RB_REQUIRE_AUTH:-false}"
+      RB_ENABLE_QUOTAS: "${RB_ENABLE_QUOTAS:-false}"
+      # Shard read-through cache. Points at a path that is writable by the
+      # image's uid 10001 (`/home/rosalind/cache` is chown'd in the
+      # Dockerfile). The cache is ephemeral by design: it lives inside the
+      # container filesystem, gets warmed on first cold query, and is gone
+      # on `docker compose down`. Re-warm takes seconds.
+      CACHE_DIR: /home/rosalind/cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  validator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command: ["python", "-m", "services.validator_worker.run"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      RB_REQUIRE_AUTH: "${RB_REQUIRE_AUTH:-false}"
+      RB_ENABLE_QUOTAS: "${RB_ENABLE_QUOTAS:-false}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  index_builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command: ["python", "-m", "services.index_builder.run"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      RB_REQUIRE_AUTH: "${RB_REQUIRE_AUTH:-false}"
+      RB_ENABLE_QUOTAS: "${RB_ENABLE_QUOTAS:-false}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ephemeral_runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command: ["python", "-m", "services.ephemeral_runner.run"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      RB_REQUIRE_AUTH: "${RB_REQUIRE_AUTH:-false}"
+      RB_ENABLE_QUOTAS: "${RB_ENABLE_QUOTAS:-false}"
+      # Shard read-through cache. Points at the path the Dockerfile chowns
+      # to uid 10001; see the matching comment on `query_dp` above.
+      CACHE_DIR: /home/rosalind/cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped

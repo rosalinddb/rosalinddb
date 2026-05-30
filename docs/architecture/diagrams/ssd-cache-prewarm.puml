@@ -1,0 +1,117 @@
+@startuml ssd-cache-prewarm
+' Admission control under N prewarm requests with capacity N-1.
+' The LRU end is younger than MIN_RESIDENT_S for some entries and older
+' for others; the policy is evict-the-coldest-if-old-enough, else
+' reject with cache_capacity_exceeded.
+
+title Prewarm admission control: N requests, capacity N-1
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+actor "index_builder\n(or admin)" as caller
+participant "query_dp\n/admin/prewarm" as dp
+participant "shard_tier\n(in-process)" as tier
+database "SSD\n(RB_SHARD_TIER_DIR)" as ssd
+participant "object_store" as os
+
+== Initial state ==
+
+note over tier #LightYellow
+  Capacity: 5 shards (15 GB budget, 3 GB each).
+  Resident, MRU -> LRU:
+    S5 (admitted 2s ago)
+    S4 (admitted 10s ago)
+    S3 (admitted 35s ago)
+    S2 (admitted 90s ago)
+    S1 (admitted 600s ago)
+  MIN_RESIDENT_S = 30
+end note
+
+== N prewarm requests arrive ==
+
+caller -> dp : PREWARM_SHARD S6
+caller -> dp : PREWARM_SHARD S7
+caller -> dp : PREWARM_SHARD S8
+
+dp -> tier : prewarm(S6, uri6)
+activate tier
+tier -> tier : single-flight registry:\nclaim S6
+tier -> tier : admission check:\nis_capacity_full? yes
+tier -> tier : pick LRU end: S1\nage = 600s >= MIN_RESIDENT_S
+tier -> ssd : unlink S1
+note right of tier #LightGreen
+  S1 evicted (old enough).
+  S6 admission OK.
+end note
+tier -> os : GET uri6
+activate os
+os --> tier : bytes
+deactivate os
+tier -> ssd : write tmp + rename to S6 file
+tier -> tier : update LRU + last_admit_at
+tier --> dp : 200 OK, local_path
+deactivate tier
+dp --> caller : 200 OK
+
+dp -> tier : prewarm(S7, uri7)
+activate tier
+tier -> tier : claim S7
+tier -> tier : admission check: full
+tier -> tier : pick LRU end: S2\nage = 90s >= MIN_RESIDENT_S
+tier -> ssd : unlink S2
+tier -> os : GET uri7
+activate os
+os --> tier : bytes
+deactivate os
+tier -> ssd : write S7 file
+tier --> dp : 200 OK
+deactivate tier
+dp --> caller : 200 OK
+
+dp -> tier : prewarm(S8, uri8)
+activate tier
+tier -> tier : claim S8
+tier -> tier : admission check: full
+tier -> tier : pick LRU end: S3\nage = 35s >= MIN_RESIDENT_S
+tier -> ssd : unlink S3
+tier -> os : GET uri8
+activate os
+os --> tier : bytes
+deactivate os
+tier -> ssd : write S8 file
+tier --> dp : 200 OK
+deactivate tier
+dp --> caller : 200 OK
+
+== A fourth, contending prewarm arrives ==
+
+caller -> dp : PREWARM_SHARD S9 (same burst)
+dp -> tier : prewarm(S9, uri9)
+activate tier
+tier -> tier : claim S9
+tier -> tier : admission check: full
+tier -> tier : pick LRU end: S4\nage = 10s < MIN_RESIDENT_S
+note right of tier #LightSalmon
+  Every remaining entry younger
+  than MIN_RESIDENT_S. No safe
+  eviction candidate.
+end note
+tier --> dp : raise CacheCapacityExceeded
+deactivate tier
+dp --> caller : 503 cache_capacity_exceeded\nRetry-After: 30
+
+note over caller, tier #LightYellow
+  Caller's options:
+   - retry after MIN_RESIDENT_S
+     (oldest will have aged out),
+   - raise RB_SHARD_TIER_BYTES,
+   - accept that S9 stays cold until
+     its first query triggers a fetch.
+end note
+
+@enduml

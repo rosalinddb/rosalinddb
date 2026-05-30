@@ -1,0 +1,21 @@
+# Prometheus — scrapes the OTEL collector's `/metrics` (where the collector
+# republishes the OTLP metrics it received from the backend services), plus
+# the collector's own self-metrics.
+#
+# The backend services do NOT expose /metrics directly; they emit OTLP to
+# the collector, which is the only thing prometheus needs to know about.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: otel-collector-self
+    static_configs:
+      - targets:
+          - "otel-collector:8888"
+
+  - job_name: otel-collector-republished
+    static_configs:
+      - targets:
+          - "otel-collector:8889"

@@ -1,0 +1,112 @@
+@startuml ssd-cache-versioning
+' End-to-end sequence: builder writes v2 (new content-addressed key),
+' updates the catalog (NOTIFY in the same txn), DPs receive the
+' invalidation via LISTEN (push) or the 5-second TTL pull fallback,
+' and a query lands on v2 while an in-flight query on v1 completes
+' against v1's mmap (POSIX guarantee).
+
+title Shard v2 rollout: build -> catalog -> DP invalidation -> next query
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+actor "client" as client
+participant "index_builder" as builder
+participant "object_store" as os
+database "shard_catalog\n(Postgres)" as catalog
+participant "query_dp\n(holds v1 warm)" as dp
+database "shard_tier\n(SSD)" as ssd
+participant "kernel" as kern
+
+== Build v2 ==
+
+builder -> builder : content_hash =\nsha256(serialised_index)[:16]
+builder -> os : PUT s3://{bucket}/{tenant}/{dataset}/\n  {shard_id}-{content_hash_v2}.bin
+activate os
+os --> builder : 200 OK
+deactivate os
+note over builder, os #LightYellow
+  Content-addressed key.
+  Never overwrites v1's key.
+  Idempotent: same bytes -> same hash.
+  Gated on RB_SHARD_VERSIONED_URIS;
+  flag-off path writes the legacy
+  {INDEXES_PREFIX}/.../indexes/{date}/
+  layout instead.
+end note
+
+== Publish ==
+
+builder -> catalog : BEGIN
+builder -> catalog : INSERT shard_catalog (..., shard_uri=v2_uri)
+builder -> catalog : NOTIFY catalog_updates\n  {tenant, dataset, shard_id, shard_uri}
+builder -> catalog : COMMIT
+note right of catalog
+  NOTIFY rides the same transaction.
+  If COMMIT fails, the NOTIFY is
+  also discarded -> never inconsistent.
+end note
+
+== Push invalidation ==
+
+catalog -> dp : LISTEN delivers {shard_id, shard_uri}
+note right of dp
+  DP invalidates its cached
+  list_shards result for the dataset.
+  v1's SSD-tier entry stays cached
+  (no eviction) until W-TinyLFU
+  decides it.
+end note
+
+== Mid-query consistency (in-flight on v1) ==
+
+client -> dp : (earlier) POST /v1/query
+activate dp
+dp -> dp : _cache_get(shard_id_v1) HIT
+dp -> kern : index.search() -> page faults on v1
+note over dp, kern #LightBlue
+  v1's open fd pins the inode.
+  The mmap stays valid even if
+  the SSD tier later unlinks the file.
+end note
+kern --> dp : pages from v1
+dp --> client : results from v1
+deactivate dp
+
+== Next query, after NOTIFY ==
+
+client -> dp : POST /v1/query
+activate dp
+dp -> catalog : list_shards (newest first)
+catalog --> dp : v2 (newest), v1, ...
+dp -> dp : _cache_get(shard_id_v2) MISS
+dp -> ssd : shard_tier.fetch(shard_id_v2, v2_uri)
+activate ssd
+ssd -> os : GET v2_uri
+activate os
+os --> ssd : bytes
+deactivate os
+ssd -> ssd : write tmp + atomic rename
+ssd --> dp : local_path for v2
+deactivate ssd
+dp -> kern : faiss.read_index(v2, IO_FLAG_MMAP)
+dp -> dp : index.search() -> page faults on v2
+dp --> client : results from v2
+deactivate dp
+
+== TTL fallback (push lost) ==
+
+note over catalog, dp #LightYellow
+  If the LISTEN connection dropped
+  between BEGIN and the next query,
+  the DP re-reads list_shards anyway
+  whenever its cached result is older
+  than RB_CATALOG_FRESHNESS_S (5s).
+  Worst-case staleness is bounded.
+end note
+
+@enduml

@@ -1,0 +1,51 @@
+name: backend tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: unit suite (memory://, no Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Run unit suite
+        run: PYTHONPATH=. pytest -m unit -q
+
+  integration:
+    name: integration suite (real MinIO via testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      # GitHub-hosted Ubuntu runners ship Docker, so testcontainers can spin
+      # up its own ephemeral MinIO container — no service container needed.
+      - name: Run integration suite
+        run: PYTHONPATH=. pytest -m integration -q

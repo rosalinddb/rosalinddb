@@ -1,0 +1,113 @@
+@startuml ssd-cache-coherence
+' Mid-query consistency: a query is mid-search on v1 when v2's catalog
+' update lands. The POSIX unlink-with-open-fd guarantee lets the in-flight
+' query complete against v1's bytes; the next query lands on v2.
+
+title Mid-query consistency: v2 lands while a v1 query is in flight
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+actor "client A\n(early query)" as a
+actor "client B\n(later query)" as b
+participant "query_dp" as dp
+participant "shard_tier\n(SSD)" as tier
+participant "kernel\n(VFS + page cache)" as kern
+participant "_SHARD_CACHE\n(RAM)" as ram
+database "shard_catalog\n(Postgres)" as catalog
+participant "index_builder" as builder
+
+== t=0 ms: client A starts a query against v1 ==
+
+a -> dp : POST /v1/query
+activate dp
+dp -> catalog : list_shards
+catalog --> dp : v1 (newest)
+dp -> ram : _cache_get(shard_id_v1)
+ram --> dp : HIT (FAISS handle + sidecar)
+dp -> kern : index.search() begins\n(holds open fd on v1 file)
+note right of dp #LightBlue
+  v1's open file descriptor pins the
+  inode. Even an unlink during this
+  search leaves the bytes addressable
+  via the existing mapping.
+end note
+
+== t=20 ms: builder publishes v2 ==
+
+builder -> catalog : INSERT v2; NOTIFY catalog_updates
+note over builder, catalog #LightYellow
+  Same transaction. NOTIFY fires
+  on commit; lost on rollback.
+end note
+catalog -> dp : LISTEN delivers {shard_id_v2}
+dp -> dp : invalidate cached list_shards\nfor (tenant, dataset)
+note right of dp
+  v1's _cache_get entry is NOT touched.
+  v1's SSD-tier file is NOT unlinked yet.
+  Invalidation only affects the next
+  list_shards call.
+end note
+
+== t=40 ms: client A's search completes against v1 ==
+
+kern --> dp : pages from v1 inode
+dp -> dp : map hits via v1 sidecar
+dp --> a : results from v1
+deactivate dp
+
+note over a, dp #LightBlue
+  Client A sees v1 results.
+  Within-query consistency holds.
+end note
+
+== t=50 ms: SSD tier may evict v1 (W-TinyLFU decision) ==
+
+tier -> tier : eviction check
+alt v1 is the LRU end AND age >= MIN_RESIDENT_S
+  tier -> kern : unlink v1 file
+  note right of tier
+    Unlink is safe. Any open fd on
+    v1 (none after t=40 ms) keeps the
+    inode alive; future opens fail.
+  end note
+else v1 is not the LRU end yet
+  note right of tier
+    v1 stays on SSD. Future queries
+    against v1's shard_id still find it,
+    but no query path resolves v1 as
+    "newest" anymore.
+  end note
+end
+
+== t=100 ms: client B's query ==
+
+b -> dp : POST /v1/query
+activate dp
+dp -> catalog : list_shards
+catalog --> dp : v2 (newest), v1
+dp -> ram : _cache_get(shard_id_v2)
+ram --> dp : MISS
+dp -> tier : shard_tier.fetch(shard_id_v2, v2_uri)
+activate tier
+tier -> tier : GET v2 + write file
+tier --> dp : local_path for v2
+deactivate tier
+dp -> kern : faiss.read_index(v2, IO_FLAG_MMAP)
+dp -> kern : index.search()
+kern --> dp : pages from v2
+dp --> b : results from v2
+deactivate dp
+
+note over a, b #LightBlue
+  Client A: v1 result (consistent, complete).
+  Client B: v2 result (the now-current version).
+  Between-query consistency is intentionally
+  eventual; within-query consistency is strict.
+end note
+
+@enduml

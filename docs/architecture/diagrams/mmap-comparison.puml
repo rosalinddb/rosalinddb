@@ -1,0 +1,92 @@
+@startuml mmap-comparison
+title read_index vs mmap load path comparison\n(reference shard: 1M x 1536-dim IVFFlat, ~6.3 GB on disk)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+box "RB_FAISS_MMAP=false (legacy)" #FDF3E7
+  participant "query_dp\n(legacy)" as dpL
+  participant "filesystem\n(CACHE_DIR)" as fsL
+  participant "kernel" as kernL
+end box
+
+box "RB_FAISS_MMAP=true (new)" #E7F3FD
+  participant "query_dp\n(mmap)" as dpR
+  participant "filesystem\n(CACHE_DIR)" as fsR
+  participant "kernel" as kernR
+end box
+
+== Open ==
+
+dpL -> fsL : open shard.bin
+dpL -> fsL : read(2) — pulls ALL bytes into RAM
+activate fsL
+fsL --> dpL : full file (~6.3 GB)
+deactivate fsL
+dpL -> dpL : faiss.read_index(path)\n(deserialise into Python object)
+note left of dpL #FFD9B0
+  RAM cost on open: ~6.3 GB resident.
+  Cache cannot admit one shard above
+  RB_SHARD_CACHE_BYTES (default 512 MB)
+  without immediately evicting itself.
+end note
+
+dpR -> fsR : open shard.bin
+dpR -> kernR : mmap(fd, MAP_SHARED | PROT_READ)
+note right of dpR #B0D9FF
+  Cheap — no I/O.
+  Returns a virtual address.
+end note
+dpR -> dpR : faiss.read_index(path,\n  IO_FLAG_MMAP | IO_FLAG_READ_ONLY)
+note right of dpR #B0D9FF
+  Python object holds the offset table
+  + centroid quantizer only.
+  RAM cost on open: ~32 MB.
+end note
+
+== First search ==
+
+dpL -> dpL : index.search(vector)
+note left of dpL #FFD9B0
+  All distance math hits already-resident
+  RAM. No page faults; no disk I/O.
+end note
+
+dpR -> dpR : index.search(vector)
+note right of dpR #B0D9FF
+  First touch of each probed IVF cell
+  triggers a major page fault.
+end note
+kernR -> fsR : read ~96 MB of pages\n(nprobe=64 of 4096 cells)
+activate fsR
+fsR --> kernR : pages
+deactivate fsR
+kernR --> dpR : pages now in page cache
+note right of dpR #B0D9FF
+  RAM cost steady-state: ~200 MB
+  (centroid quantizer + Zipfian top
+  of the touched cells).
+end note
+
+== Subsequent searches on the same cells ==
+
+dpL -> dpL : index.search(vector)
+note left of dpL #FFD9B0
+  Same ~6.3 GB resident.
+  Sub-ms FAISS time.
+end note
+
+dpR -> dpR : index.search(vector)
+note right of dpR #B0D9FF
+  Page-cache hits, no I/O.
+  Sub-ms FAISS time.
+  Cold cells get evicted by the kernel
+  LRU under memory pressure exactly like
+  any other file-backed cache page.
+end note
+
+@enduml

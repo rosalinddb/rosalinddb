@@ -1,0 +1,68 @@
+@startuml mmap-cold-query
+title Cold first query with FAISS mmap (RB_FAISS_MMAP=true)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign center
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+
+actor "client" as client
+participant "cp" as cp
+participant "query_dp" as dp
+database "cache_dir\n(filesystem)" as fs
+participant "object_store" as os
+participant "kernel" as kern
+
+client -> cp : POST /v1/query\n(api_key, dataset, vector)
+activate cp
+cp -> dp : proxied POST\n(X-RB-Tenant-Id)
+activate dp
+
+dp -> dp : _cache_get(shard_id)
+note right of dp : miss — cold path
+
+dp -> os : GET shard_uri
+activate os
+os --> dp : bytes
+deactivate os
+
+dp -> fs : write file (atomic rename)
+
+dp -> dp : faiss.read_index(path,\n  IO_FLAG_MMAP | IO_FLAG_READ_ONLY)
+dp -> kern : mmap(fd, MAP_SHARED | PROT_READ)
+note over dp, kern #LightYellow
+  NEW under RB_FAISS_MMAP=true.
+  mmap is cheap — no I/O here.
+  Only the offset table + centroid
+  quantizer end up resident.
+end note
+kern --> dp : virtual address
+
+dp -> dp : _read_major_faults()\n=> maj_before
+dp -> dp : index.search(vector)
+note over dp, kern #LightYellow
+  NEW under RB_FAISS_MMAP=true.
+  First touch of each probed IVF cell
+  triggers a major page fault.
+end note
+kern -> fs : read pages from disk
+activate fs
+fs --> kern : pages
+deactivate fs
+kern --> dp : pages in page cache,\nsearch returns
+dp -> dp : _read_major_faults()\n=> maj_after
+dp -> dp : record_shard_page_faults(\n  max(0, maj_after - maj_before))
+note right of dp #LightYellow
+  Bumps the rosalinddb.shard.page_faults
+  counter so a Prometheus chart of
+  cold/warm ratio is visible per process.
+end note
+
+dp --> cp : top-K results
+deactivate dp
+cp --> client : response
+deactivate cp
+
+@enduml

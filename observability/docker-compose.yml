@@ -1,0 +1,92 @@
+# Local observability stack: Tempo, OTEL collector, Prometheus, Grafana, Loki.
+#
+# Backend services in the bench compose project join this stack's network
+# and emit OTLP/HTTP to otel-collector:4318.
+#
+# Host port map:
+#   3030  Grafana UI
+#   3100  Loki
+#   3200  Tempo (query API + OTLP receiver)
+#   9091  Prometheus
+#
+# The OTEL collector listens internally only; backend services reach it
+# by service name on the docker network.
+
+name: rosalinddb-observability
+
+services:
+  tempo:
+    # Pinned to the latest 2.x; 3.x reworked the top-level config schema.
+    image: grafana/tempo:2.7.2
+    container_name: rosalinddb-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3200/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    container_name: rosalinddb-otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    depends_on:
+      tempo:
+        condition: service_healthy
+    # No host ports — backend services on the same docker network reach this
+    # at `rosalinddb-otel-collector:4317` (gRPC) or `:4318` (HTTP).
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    container_name: rosalinddb-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=24h"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"
+
+  loki:
+    image: grafana/loki:3.3.0
+    container_name: rosalinddb-loki
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: rosalinddb-grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3030:3000"
+    depends_on:
+      - tempo
+      - prometheus
+      - loki
+
+volumes:
+  tempo-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:
