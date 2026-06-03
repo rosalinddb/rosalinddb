@@ -203,7 +203,7 @@ def _landing_prefix(dataset: str, tenant: str) -> str:
 
 
 # `_id_to_int64` is the shared SHA1->int64 hash, now sourced from
-# `adapters.landing.parquet_reader` (imported above) so the cold-tier CRUD
+# `adapters.landing.parquet_reader` (imported above) so the consolidated-tier CRUD
 # surface in `source_registry` hashes ids to the EXACT same int64 the builder
 # stamps onto FAISS vectors. Re-exported under the private name so the build
 # path's many call sites stay unchanged.
@@ -862,11 +862,11 @@ def _run_once_locked(dataset: str, tenant: str) -> int:
         return added
 
 
-# --- DELETE_VECTORS (cold-tier delete-by-id) ------------------------------
+# --- DELETE_VECTORS (consolidated-tier delete-by-id) ----------------------
 
 
 def run_delete_once(dataset: str, tenant: str, vector_id: str) -> int:
-    """Apply a single delete-by-id to a dataset's newest cold shard.
+    """Apply a single delete-by-id to a dataset's newest consolidated shard.
 
     Loads the newest shard's FAISS index + sidecar, removes the hashed
     `vector_id`, drops it from the sidecar, and writes a NEW superseded shard
@@ -902,7 +902,7 @@ def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
     with build_index_span(tenant=tenant, dataset=dataset):
         latest_shard = get_latest_shard(tenant, dataset)
         if latest_shard is None:
-            # No cold shard for this dataset — nothing to delete. Clean no-op:
+            # No consolidated shard for this dataset — nothing to delete. Clean no-op:
             # leave the dataset status UNTOUCHED. The CP only flips to
             # `indexing` when a shard exists, so a never-ingested (`empty`) or
             # failed (`error`) dataset is still in its real state here — forcing
@@ -1068,7 +1068,7 @@ def main_loop():
     """Blocking loop that builds shards and applies deletes from the queue.
 
     Consumes TWO topics: `DATASET_READY` (an ingest needs folding into a
-    shard) and `DELETE_VECTORS` (a cold-tier delete-by-id needs applying to
+    shard) and `DELETE_VECTORS` (a consolidated-tier delete-by-id needs applying to
     the newest shard). Each iteration drains one message from each topic so a
     steady stream of one never starves the other; `DATASET_READY` is polled
     with a short block so the loop still parks when both are idle.

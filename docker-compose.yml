@@ -16,11 +16,11 @@
 #   createbuckets   One-shot mc bootstrap (`vectors` bucket + public policy).
 #   postgres        The catalog (any Postgres). Local dev uses the bundled
 #                   `postgres:15` container.
-#   pgvector        Delta-tier (hot tier) data-plane instance — a SEPARATE
+#   pgvector        Recall-tier data-plane instance — a SEPARATE
 #                   `pgvector/pgvector:pg15` Postgres, isolated from `postgres`
 #                   above. DEFAULT OFF: starts healthy but nothing connects to
-#                   it unless `RB_HOT_DSN` is set (host port 5433). See
-#                   docs/architecture/delta-tier.md.
+#                   it unless `RB_RECALL_DSN` is set (host port 5433). See
+#                   docs/architecture/recall-consolidate.md.
 #   migrator        One-shot `python -m scripts.migrate` that runs the schema
 #                   migration to completion before any app container starts.
 #                   Replaces the in-process auto-migrate pattern that required
@@ -109,22 +109,23 @@ services:
       timeout: 3s
       retries: 10
 
-  # Hot tier (delta tier) — a SEPARATE data-plane pgvector instance, NOT the
-  # control-plane `postgres` above. The delta tier ships behind `RB_DELTA_TIER`
-  # / `RB_HOT_DSN`, both DEFAULT OFF (see docs/architecture/delta-tier.md). This
-  # container is kept off the control-plane Postgres on purpose: a tenant
-  # write-storm against the hot tier must not starve the metadata reads on every
-  # query's critical path ("Blast radius & control/data-plane isolation").
+  # Recall tier — a SEPARATE data-plane pgvector instance, NOT the
+  # control-plane `postgres` above. The recall tier ships behind `RB_RECALL`
+  # / `RB_RECALL_DSN`, both DEFAULT OFF (see docs/architecture/recall-consolidate.md).
+  # This container is kept off the control-plane Postgres on purpose: a tenant
+  # write-storm against the recall tier must not starve the metadata reads on
+  # every query's critical path ("Blast radius & control/data-plane isolation").
   #
   # DEFAULT-OFF SAFETY: this service starts and goes healthy, but NOTHING
-  # connects to it unless `RB_HOT_DSN` is set — every app service below defaults
-  # `RB_HOT_DSN` to empty (`${RB_HOT_DSN:-}`), and the code treats blank/unset as
-  # "delta tier off" (no connection opened). So a flag-off `docker compose up`
-  # and all existing services behave byte-identically to today; this is just an
-  # extra idle, healthy container that no service depends on. To enable the hot
-  # tier, export `RB_HOT_DSN=postgresql://postgres:postgres@pgvector:5432/hot`
-  # (the value commented in `.env.example`). Distinct host port (5433) so it
-  # never clashes with the control-plane Postgres on 5432.
+  # connects to it unless `RB_RECALL_DSN` is set — every app service below
+  # defaults `RB_RECALL_DSN` to empty (`${RB_RECALL_DSN:-}`), and the code treats
+  # blank/unset as "recall tier off" (no connection opened). So a flag-off
+  # `docker compose up` and all existing services behave byte-identically to
+  # today; this is just an extra idle, healthy container that no service depends
+  # on. To enable the recall tier, export
+  # `RB_RECALL_DSN=postgresql://postgres:postgres@pgvector:5432/recall` (the value
+  # commented in `.env.example`). Distinct host port (5433) so it never clashes
+  # with the control-plane Postgres on 5432.
   #
   # Dev defaults (postgres/postgres) are for LOCAL DEVELOPMENT ONLY, identical to
   # the control-plane `postgres` service — override for any real deploy.
@@ -133,13 +134,13 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_USER: postgres
-      POSTGRES_DB: hot
+      POSTGRES_DB: recall
     ports:
       - "5433:5432"
     volumes:
       - ./data/pgvector:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d hot"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d recall"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -170,26 +171,26 @@ services:
           python -c "import psycopg2, os; psycopg2.connect(os.environ['DATABASE_URL']).close()" 2>/dev/null && break
           sleep 1
         done
-        if [ -n "$$RB_HOT_DSN" ]; then
-          echo "migrator: RB_HOT_DSN set — waiting for the hot pgvector instance..."
-          hot_ok=0
+        if [ -n "$$RB_RECALL_DSN" ]; then
+          echo "migrator: RB_RECALL_DSN set — waiting for the recall pgvector instance..."
+          recall_ok=0
           for i in $$(seq 1 30); do
-            python -c "import psycopg2, os; psycopg2.connect(os.environ['RB_HOT_DSN']).close()" 2>/dev/null && hot_ok=1 && break
+            python -c "import psycopg2, os; psycopg2.connect(os.environ['RB_RECALL_DSN']).close()" 2>/dev/null && recall_ok=1 && break
             sleep 1
           done
-          if [ "$$hot_ok" != "1" ]; then
-            echo "migrator: RB_HOT_DSN is set but the hot pgvector instance was unreachable after 30 tries — failing loudly." >&2
+          if [ "$$recall_ok" != "1" ]; then
+            echo "migrator: RB_RECALL_DSN is set but the recall pgvector instance was unreachable after 30 tries — failing loudly." >&2
             exit 1
           fi
         fi
         exec python -m scripts.migrate
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
-      # Hot-tier DSN. DEFAULT EMPTY -> the delta tier is OFF: `migrate_hot()` is
-      # a pure no-op (no connection opened, schema untouched), so a flag-off
-      # `docker compose up` is byte-identical to today. Set `RB_HOT_DSN` (see
+      # Recall-tier DSN. DEFAULT EMPTY -> the recall tier is OFF: `migrate_recall()`
+      # is a pure no-op (no connection opened, schema untouched), so a flag-off
+      # `docker compose up` is byte-identical to today. Set `RB_RECALL_DSN` (see
       # `.env.example`) to point at the `pgvector` service and migrate its schema.
-      RB_HOT_DSN: "${RB_HOT_DSN:-}"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -231,12 +232,13 @@ services:
       # no host port — it is reachable only by service name on the compose
       # network.
       QUERY_DP_URL: http://query_dp:8080
-      # Hot tier (delta tier) DSN — the synchronous read-your-writes path will
-      # UPSERT here. DEFAULT EMPTY -> delta tier OFF: the code treats blank/unset
+      # Recall tier DSN — the synchronous read-your-writes path will
+      # UPSERT here. DEFAULT EMPTY -> recall tier OFF: the code treats blank/unset
       # as "off" and never connects, so the CP behaves byte-identically to today.
-      # Set `RB_HOT_DSN` (see `.env.example`) to enable. The flush worker that
-      # later drains this also reads `RB_DELTA_TIER` (master switch, default off).
-      RB_HOT_DSN: "${RB_HOT_DSN:-}"
+      # Set `RB_RECALL_DSN` (see `.env.example`) to enable. The consolidation
+      # worker that later drains this also reads `RB_RECALL` (master switch,
+      # default off).
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-}"
     ports:
       - "8080:8080"
     depends_on:
@@ -279,11 +281,12 @@ services:
       JWT_SECRET: "${JWT_SECRET:-dev-secret}"
       RB_REQUIRE_AUTH: "${RB_REQUIRE_AUTH:-false}"
       RB_ENABLE_QUOTAS: "${RB_ENABLE_QUOTAS:-false}"
-      # Hot tier (delta tier) DSN — the query union will brute-force-search here
+      # Recall tier DSN — the query union will brute-force-search here
       # for rows newer than the resolved shard's watermark. DEFAULT EMPTY ->
-      # delta tier OFF: the DP never connects and the query path is the pure cold
-      # path, byte-identical to today. Set `RB_HOT_DSN` (see `.env.example`).
-      RB_HOT_DSN: "${RB_HOT_DSN:-}"
+      # recall tier OFF: the DP never connects and the query path is the pure
+      # consolidated path, byte-identical to today. Set `RB_RECALL_DSN` (see
+      # `.env.example`).
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-}"
       # Shard read-through cache. Points at a path that is writable by the
       # image's uid 10001 (`/home/rosalind/cache` is chown'd in the
       # Dockerfile). The cache is ephemeral by design: it lives inside the
@@ -352,12 +355,12 @@ services:
       JWT_SECRET: "${JWT_SECRET:-dev-secret}"
       RB_REQUIRE_AUTH: "${RB_REQUIRE_AUTH:-false}"
       RB_ENABLE_QUOTAS: "${RB_ENABLE_QUOTAS:-false}"
-      # Hot tier (delta tier) DSN — the flush (= compaction) will drain rows from
-      # here into a FAISS shard, then advance the shard's `durable_lsn` watermark.
-      # DEFAULT EMPTY -> delta tier OFF: the builder never connects and runs its
-      # existing landing->shard path unchanged, byte-identical to today. Set
-      # `RB_HOT_DSN` (see `.env.example`) to enable the flush.
-      RB_HOT_DSN: "${RB_HOT_DSN:-}"
+      # Recall tier DSN — consolidation (= compaction) will drain rows from
+      # here into a FAISS shard, then advance the shard's `consolidated_lsn`
+      # watermark. DEFAULT EMPTY -> recall tier OFF: the builder never connects
+      # and runs its existing landing->shard path unchanged, byte-identical to
+      # today. Set `RB_RECALL_DSN` (see `.env.example`) to enable consolidation.
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-}"
     depends_on:
       postgres:
         condition: service_healthy

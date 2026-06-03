@@ -1,4 +1,4 @@
-"""Unit tests for the cold-tier vector get/list/delete-by-id surface.
+"""Unit tests for the consolidated-tier vector get/list/delete-by-id surface.
 
 These cover the `source_registry` HTTP handlers for:
 
@@ -382,7 +382,7 @@ def test_delete_vector_publishes_and_202(env):
 def test_delete_vector_no_shard_keeps_empty_status(env):
     """Delete on a never-ingested (`empty`) dataset must NOT flip the status.
 
-    With no shard the delete is a guaranteed no-op against the cold tier, so
+    With no shard the delete is a guaranteed no-op against the consolidated tier, so
     the CP leaves the status untouched. Flipping to `indexing`/`indexed` here
     would falsely report a vacant dataset as built (`status=indexed,
     row_count=0`) and mask its real `empty` state.

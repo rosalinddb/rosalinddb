@@ -30,7 +30,7 @@ def id_to_int64(raw_id: str) -> int:
     irrelevant at MVP scale (<1M vectors per dataset).
 
     Shared by the index builder (which stamps these ids onto every FAISS
-    vector) and the cold-tier CRUD surface in `source_registry`
+    vector) and the consolidated-tier CRUD surface in `source_registry`
     (get/delete-by-id, which must hash a customer's string id to the same
     int64 the builder used as the sidecar key). It lives here, beside
     `read_shard_sidecar`, because this module already owns the int64<->record

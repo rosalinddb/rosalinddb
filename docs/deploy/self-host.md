@@ -76,8 +76,8 @@ The ~10 most useful knobs. Every other env var lives in the source — grep
 | `CORS_ALLOW_ORIGINS` | Comma-separated extra CORS origins for browser clients | `""` (localhost dev range always allowed) |
 | `QUERY_DP_URL` | CP→DP reverse-proxy base URL | `http://localhost:8090` |
 | `RB_PROXY_SECRET` | Shared secret CP sends on every CP→DP call | unset → DP relies on network isolation |
-| `RB_HOT_DSN` | Delta-tier (hot tier) pgvector DSN | unset → **delta tier off** (see [§3i](#i-delta-tier-hot-tier-read-your-writes)) |
-| `RB_DELTA_TIER` | Master switch for delta-tier behaviour | `false` |
+| `RB_RECALL_DSN` | Recall-tier pgvector DSN | unset → **recall tier off** (see [§3i](#i-recall-tier-read-your-writes)) |
+| `RB_RECALL` | Master switch for recall-tier behaviour | `false` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint | `http://localhost:4318` |
 | `OTEL_SDK_DISABLED` | Opt out of telemetry entirely | `false` |
 
@@ -314,18 +314,18 @@ The DP has **no** `Authorization` parsing and **no** quota check — it trusts
 the verified `X-RB-Tenant-Id` header the CP sends. Do not expose the DP
 directly to users; route everything via the CP.
 
-### i. Delta tier (hot tier) — read-your-writes
+### i. Recall tier — read-your-writes
 
 **Default OFF.** RosalindDB is eventually consistent on writes by default
 (`POST /vectors` lands data that an async build later folds into a shard). The
-**delta tier** adds a small, synchronously-writable, immediately-queryable
-**hot tier** in front of the immutable shards and unions the two at query time
+**recall tier** adds a small, synchronously-writable, immediately-queryable
+tier in front of the immutable shards and unions the two at query time
 — so a just-written vector is visible on the very next query. The full design
-is in [`docs/architecture/delta-tier.md`](../architecture/delta-tier.md).
+is in [`docs/architecture/recall-consolidate.md`](../architecture/recall-consolidate.md).
 
-The hot tier is a **separate data-plane pgvector instance**, deliberately *not*
+The recall tier is a **separate data-plane pgvector instance**, deliberately *not*
 the control-plane Postgres: it is kept off the metadata DB so a tenant write
-storm against the hot tier can never starve the catalog reads that sit on every
+storm against the recall tier can never starve the catalog reads that sit on every
 query's critical path ("blast-radius isolation"). The bundled compose stack
 ships a `pgvector` service (image `pgvector/pgvector:pg15`, on host port `5433`)
 for exactly this.
@@ -334,19 +334,19 @@ It is entirely opt-in, controlled by two env vars:
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `RB_HOT_DSN` | DSN of the hot pgvector instance. Setting it makes the migrator apply the hot schema and lets services connect. | unset → off |
-| `RB_DELTA_TIER` | Master switch for delta-tier behaviour (sync hot write, query union, flush). | `false` |
+| `RB_RECALL_DSN` | DSN of the recall pgvector instance. Setting it makes the migrator apply the recall schema and lets services connect. | unset → off |
+| `RB_RECALL` | Master switch for recall-tier behaviour (sync recall write, query union, consolidation). | `false` |
 
-**Flag-off is byte-identical to today.** With `RB_HOT_DSN` unset (the default):
+**Flag-off is byte-identical to today.** With `RB_RECALL_DSN` unset (the default):
 
 - The `pgvector` container starts and goes healthy, but **nothing connects to
-  it** — `RB_HOT_DSN` defaults to empty on every service and the code treats
+  it** — `RB_RECALL_DSN` defaults to empty on every service and the code treats
   blank/unset as "off" (no connection opened).
 - `python -m scripts.migrate` applies the control-plane schema exactly as
-  before, then prints `hot tier off (RB_HOT_DSN unset); skipping hot schema`
-  and applies no hot migrations.
-- Every existing shard carries `durable_lsn = 0` (the migration 008 default),
-  so the query path takes the pure cold path and existing logic is untouched.
+  before, then prints `recall tier off (RB_RECALL_DSN unset); skipping recall schema`
+  and applies no recall migrations.
+- Every existing shard carries `consolidated_lsn = 0` (the migration 008 default),
+  so the query path takes the pure consolidated path and existing logic is untouched.
 
 If you do not want the extra idle container at all, simply do not start it:
 `docker compose up` brings up everything, or scope it with
@@ -355,34 +355,34 @@ If you do not want the extra idle container at all, simply do not start it:
 **Enabling it** (bundled pgvector):
 
 ```bash
-export RB_HOT_DSN=postgresql://postgres:postgres@pgvector:5432/hot
-export RB_DELTA_TIER=true
+export RB_RECALL_DSN=postgresql://postgres:postgres@pgvector:5432/recall
+export RB_RECALL=true
 docker compose up
 ```
 
-The migrator waits for the hot instance, then applies the hot schema
-(`CREATE EXTENSION vector` + `hot_vectors` + the per-(tenant,dataset) LSN
-sequence table). For a non-compose deploy, point `RB_HOT_DSN` at any pgvector
+The migrator waits for the recall instance, then applies the recall schema
+(`CREATE EXTENSION vector` + `recall_vectors` + the per-(tenant,dataset) LSN
+sequence table). For a non-compose deploy, point `RB_RECALL_DSN` at any pgvector
 instance and run `python -m scripts.migrate` — it migrates both the control
-plane and (when `RB_HOT_DSN` is set) the hot instance. The embedding dimension
-is **per-dataset**: the `hot_vectors.embedding` column is an unparameterised
-pgvector `vector`, so one hot instance serves datasets of differing dimensions.
+plane and (when `RB_RECALL_DSN` is set) the recall instance. The embedding dimension
+is **per-dataset**: the `recall_vectors.embedding` column is an unparameterised
+pgvector `vector`, so one recall instance serves datasets of differing dimensions.
 
-When `RB_DELTA_TIER=true` (with `RB_HOT_DSN` set), `POST /v1/datasets/{name}/vectors`
+When `RB_RECALL=true` (with `RB_RECALL_DSN` set), `POST /v1/datasets/{name}/vectors`
 becomes **synchronous**: each accepted record is assigned a per-(tenant,dataset)
-LSN and UPSERTed into the hot store (last-write-wins), then the endpoint returns
+LSN and UPSERTed into the recall store (last-write-wins), then the endpoint returns
 **`200`** instead of `202` — the vector is durable and immediately queryable. In
 this mode the write does **not** land an object or publish a `VALIDATE_DATASET`
-build (those are the eventually-consistent cold path). The status code is the
+build (those are the eventually-consistent consolidated path). The status code is the
 only client-visible change; the response body shape is unchanged (`job_id` is
 omitted since there is no async job). See
 [`docs/api/v1.md`](../api/v1.md#post-v1datasetsnamevectors).
 
-> The remaining hot-tier *behaviour* (the query union that merges hot + cold,
-> and the hot→cold flush/compaction) lands in later PRs behind `RB_DELTA_TIER`.
-> Until the flush ships, flag-on writes live in the hot tier only. This is
-> acceptable because the flag defaults off and the full delta tier is not
-> user-complete until those PRs land.
+> The remaining recall-tier *behaviour* (the query union that merges recall +
+> consolidated, and the recall→consolidated consolidation/compaction) lands in
+> later PRs behind `RB_RECALL`. Until consolidation ships, flag-on writes live in
+> the recall tier only. This is acceptable because the flag defaults off and the
+> full recall tier is not user-complete until those PRs land.
 
 ---
 

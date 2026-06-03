@@ -1,17 +1,17 @@
-"""Unit coverage for the synchronous hot-tier write path + `RB_DELTA_TIER`.
+"""Unit coverage for the synchronous recall-tier write path + `RB_RECALL`.
 
-The delta tier ships behind `RB_DELTA_TIER` (master switch) AND `RB_HOT_DSN`
-(the hot store), both default off. This PR adds the WRITE path only — the query
-union, flush, and hot-delete are later PRs.
+The recall tier ships behind `RB_RECALL` (master switch) AND `RB_RECALL_DSN`
+(the recall store), both default off. This PR adds the WRITE path only — the
+query union, consolidation, and recall-delete are later PRs.
 
 Two headline properties, both proven hermetically here (no Docker, no pgvector):
 
   - FLAG OFF (default): `post_vectors` is byte-identical to today — 202, a
-    landing write, a `VALIDATE_DATASET` publish, and NO hot connection ever
+    landing write, a `VALIDATE_DATASET` publish, and NO recall connection ever
     opened (asserted with the `psycopg2.connect`-raises trick from PR2).
-  - FLAG ON: `delta_tier_enabled()` flips on only with BOTH env vars; the write
-    logic allocates a monotonic LSN per record and UPSERTs into `hot_vectors`
-    with last-write-wins, against a FAKED hot connection (so the call SHAPE is
+  - FLAG ON: `recall_enabled()` flips on only with BOTH env vars; the write
+    logic allocates a monotonic LSN per record and UPSERTs into `recall_vectors`
+    with last-write-wins, against a FAKED recall connection (so the call SHAPE is
     asserted without a real database).
 """
 from __future__ import annotations
@@ -24,64 +24,64 @@ import pytest
 
 @pytest.fixture
 def state(monkeypatch):
-    """Fresh state module with both delta-tier env vars cleared (tier off)."""
-    monkeypatch.delenv("RB_DELTA_TIER", raising=False)
-    monkeypatch.delenv("RB_HOT_DSN", raising=False)
+    """Fresh state module with both recall-tier env vars cleared (tier off)."""
+    monkeypatch.delenv("RB_RECALL", raising=False)
+    monkeypatch.delenv("RB_RECALL_DSN", raising=False)
     import adapters.state.state as state_mod
     importlib.reload(state_mod)
     yield state_mod
-    monkeypatch.delenv("RB_DELTA_TIER", raising=False)
-    monkeypatch.delenv("RB_HOT_DSN", raising=False)
+    monkeypatch.delenv("RB_RECALL", raising=False)
+    monkeypatch.delenv("RB_RECALL_DSN", raising=False)
     importlib.reload(state_mod)
 
 
-# --- delta_tier_enabled() gate -------------------------------------------
+# --- recall_enabled() gate -------------------------------------------
 
 
-def test_delta_tier_off_by_default(state):
+def test_recall_tier_off_by_default(state):
     """Both env vars unset -> tier off (the self-host default)."""
-    assert state.delta_tier_enabled() is False
+    assert state.recall_enabled() is False
 
 
-def test_delta_tier_needs_flag_and_dsn(state, monkeypatch):
-    """The tier is on ONLY when `RB_DELTA_TIER` is truthy AND `RB_HOT_DSN` is set."""
+def test_recall_tier_needs_flag_and_dsn(state, monkeypatch):
+    """The tier is on ONLY when `RB_RECALL` is truthy AND `RB_RECALL_DSN` is set."""
     # Flag alone (no DSN) -> still off: a deploy that forgets the DSN stays on
     # the byte-identical flag-off path rather than erroring on every write.
-    monkeypatch.setenv("RB_DELTA_TIER", "true")
+    monkeypatch.setenv("RB_RECALL", "true")
     importlib.reload(state)
-    assert state.delta_tier_enabled() is False
+    assert state.recall_enabled() is False
 
-    # DSN alone (no flag) -> off: provisioning a hot store does not auto-enable.
-    monkeypatch.delenv("RB_DELTA_TIER", raising=False)
-    monkeypatch.setenv("RB_HOT_DSN", "postgresql://u:p@hot:5432/hot")
+    # DSN alone (no flag) -> off: provisioning a recall store does not auto-enable.
+    monkeypatch.delenv("RB_RECALL", raising=False)
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
     importlib.reload(state)
-    assert state.delta_tier_enabled() is False
+    assert state.recall_enabled() is False
 
     # Both -> on.
-    monkeypatch.setenv("RB_DELTA_TIER", "true")
+    monkeypatch.setenv("RB_RECALL", "true")
     importlib.reload(state)
-    assert state.delta_tier_enabled() is True
+    assert state.recall_enabled() is True
 
 
 @pytest.mark.parametrize("truthy", ["1", "true", "TRUE", "yes", "on"])
-def test_delta_tier_truthy_values(state, monkeypatch, truthy):
-    """`RB_DELTA_TIER` accepts the same truthy set as `quotas_enabled()`."""
-    monkeypatch.setenv("RB_HOT_DSN", "postgresql://u:p@hot:5432/hot")
-    monkeypatch.setenv("RB_DELTA_TIER", truthy)
+def test_recall_tier_truthy_values(state, monkeypatch, truthy):
+    """`RB_RECALL` accepts the same truthy set as `quotas_enabled()`."""
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    monkeypatch.setenv("RB_RECALL", truthy)
     importlib.reload(state)
-    assert state.delta_tier_enabled() is True
+    assert state.recall_enabled() is True
 
 
 @pytest.mark.parametrize("falsy", ["", "0", "false", "no", "off", "  "])
-def test_delta_tier_falsy_values(state, monkeypatch, falsy):
-    """A blank/false `RB_DELTA_TIER` keeps the tier off even with a DSN set."""
-    monkeypatch.setenv("RB_HOT_DSN", "postgresql://u:p@hot:5432/hot")
-    monkeypatch.setenv("RB_DELTA_TIER", falsy)
+def test_recall_tier_falsy_values(state, monkeypatch, falsy):
+    """A blank/false `RB_RECALL` keeps the tier off even with a DSN set."""
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    monkeypatch.setenv("RB_RECALL", falsy)
     importlib.reload(state)
-    assert state.delta_tier_enabled() is False
+    assert state.recall_enabled() is False
 
 
-# --- hot_upsert_vectors(): LSN assignment + UPSERT call shape -------------
+# --- recall_upsert_vectors(): LSN assignment + UPSERT call shape -------------
 
 
 class _FakeCursor:
@@ -108,7 +108,7 @@ class _FakeCursor:
 
     def execute(self, sql, params=None):
         self.calls.append((sql, params))
-        if "hot_lsn_seq" in sql and "RETURNING" in sql:
+        if "recall_lsn_seq" in sql and "RETURNING" in sql:
             # The block size N is bound as the 3rd positional param
             # (VALUES (tenant, dataset, N) ...). Advance by N and return the
             # last lsn in the freshly-reserved block.
@@ -157,12 +157,12 @@ def _on_state(state, monkeypatch):
     call shape the test asserts. `upserts` is the list of recorded
     `(sql, rows, template)` tuples.
     """
-    monkeypatch.setenv("RB_HOT_DSN", "postgresql://u:p@hot:5432/hot")
-    monkeypatch.setenv("RB_DELTA_TIER", "true")
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    monkeypatch.setenv("RB_RECALL", "true")
     importlib.reload(state)
     cur = _FakeCursor()
     conn = _FakeConn(cur)
-    monkeypatch.setattr(state, "_hot_conn", lambda: conn)
+    monkeypatch.setattr(state, "_recall_conn", lambda: conn)
     upserts: list[tuple] = []
 
     def _fake_execute_values(c, sql, rows, template=None, **kw):
@@ -173,7 +173,7 @@ def _on_state(state, monkeypatch):
     return conn, cur, upserts
 
 
-def test_hot_upsert_allocates_lsn_block_and_single_upsert(state, monkeypatch):
+def test_recall_upsert_allocates_lsn_block_and_single_upsert(state, monkeypatch):
     """N LSNs are allocated in ONE statement; the batch is ONE multi-row UPSERT.
 
     Round-trip count is now ~2 (one seq block-allocation + one multi-row UPSERT),
@@ -185,11 +185,11 @@ def test_hot_upsert_allocates_lsn_block_and_single_upsert(state, monkeypatch):
         {"id": "a", "values": [1.0, 2.0, 3.0], "metadata": {"k": "v"}},
         {"id": "b", "values": [4.0, 5.0, 6.0], "metadata": {}},
     ]
-    written = state.hot_upsert_vectors("t1", "ds", records)
+    written = state.recall_upsert_vectors("t1", "ds", records)
     assert written == 2
 
     # ONE seq allocation for the whole batch (not one per record).
-    seq_calls = [c for c in cur.calls if "hot_lsn_seq" in c[0]]
+    seq_calls = [c for c in cur.calls if "recall_lsn_seq" in c[0]]
     assert len(seq_calls) == 1, "the LSN block is allocated in a single statement"
     # The block size N is bound (VALUES (tenant, dataset, N); +N on conflict).
     assert seq_calls[0][1] == ("t1", "ds", 2, 2)
@@ -219,7 +219,7 @@ def test_hot_upsert_allocates_lsn_block_and_single_upsert(state, monkeypatch):
     assert conn.closed is True
 
 
-def test_hot_upsert_intra_batch_duplicate_id_last_write_wins(state, monkeypatch):
+def test_recall_upsert_intra_batch_duplicate_id_last_write_wins(state, monkeypatch):
     """A duplicate id in one batch collapses to one row; the LAST input wins.
 
     Postgres rejects a multi-row UPSERT that lists the same conflict key twice,
@@ -232,10 +232,10 @@ def test_hot_upsert_intra_batch_duplicate_id_last_write_wins(state, monkeypatch)
         {"id": "other", "values": [2.0, 2.0, 2.0], "metadata": {}},
         {"id": "dup", "values": [9.0, 9.0, 9.0], "metadata": {"v": 2}},
     ]
-    written = state.hot_upsert_vectors("t1", "ds", records)
+    written = state.recall_upsert_vectors("t1", "ds", records)
     # Two distinct ids -> two rows written, two LSNs allocated.
     assert written == 2
-    seq_calls = [c for c in cur.calls if "hot_lsn_seq" in c[0]]
+    seq_calls = [c for c in cur.calls if "recall_lsn_seq" in c[0]]
     assert seq_calls[0][1] == ("t1", "ds", 2, 2), "block size is the distinct count"
 
     sql, rows, template = upserts[0]
@@ -250,27 +250,27 @@ def test_hot_upsert_intra_batch_duplicate_id_last_write_wins(state, monkeypatch)
     assert by_id["other"][5] == 1
 
 
-def test_hot_upsert_empty_is_noop_no_connection(state, monkeypatch):
-    """An empty record list never opens a hot connection."""
-    monkeypatch.setenv("RB_HOT_DSN", "postgresql://u:p@hot:5432/hot")
-    monkeypatch.setenv("RB_DELTA_TIER", "true")
+def test_recall_upsert_empty_is_noop_no_connection(state, monkeypatch):
+    """An empty record list never opens a recall connection."""
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    monkeypatch.setenv("RB_RECALL", "true")
     importlib.reload(state)
 
     def _boom():  # pragma: no cover - must never be called
-        raise AssertionError("opened a hot connection for an empty batch")
+        raise AssertionError("opened a recall connection for an empty batch")
 
-    monkeypatch.setattr(state, "_hot_conn", _boom)
-    assert state.hot_upsert_vectors("t1", "ds", []) == 0
+    monkeypatch.setattr(state, "_recall_conn", _boom)
+    assert state.recall_upsert_vectors("t1", "ds", []) == 0
 
 
-def test_hot_conn_raises_when_dsn_unset(state):
-    """`_hot_conn()` refuses to connect with `RB_HOT_DSN` unset (off path).
+def test_recall_conn_raises_when_dsn_unset(state):
+    """`_recall_conn()` refuses to connect with `RB_RECALL_DSN` unset (off path).
 
     Reaching here with the tier off is a programming error — it raises rather
     than silently connecting to a default DSN.
     """
     with pytest.raises(RuntimeError):
-        state._hot_conn()
+        state._recall_conn()
 
 
 def test_to_pgvector_literal_format(state):

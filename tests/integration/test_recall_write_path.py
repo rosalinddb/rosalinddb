@@ -1,19 +1,19 @@
-"""Integration coverage for the synchronous hot-tier write path (PR3).
+"""Integration coverage for the synchronous recall-tier write path (PR3).
 
 Runs `POST /v1/datasets/{name}/vectors` end-to-end through the real FastAPI app
-against a REAL pgvector container (`RB_HOT_DSN`) for the hot tier and the
+against a REAL pgvector container (`RB_RECALL_DSN`) for the recall tier and the
 session MinIO for landing. Proves both flag modes:
 
-  - FLAG ON (`RB_DELTA_TIER=true` + `RB_HOT_DSN`): 200, rows land in
-    `hot_vectors` with strictly-monotonic `lsn` and `deleted=false`, NO
+  - FLAG ON (`RB_RECALL=true` + `RB_RECALL_DSN`): 200, rows land in
+    `recall_vectors` with strictly-monotonic `lsn` and `deleted=false`, NO
     `VALIDATE_DATASET` is published, NO landing object is written; a re-send of
     the same id is last-write-wins (a single, updated row).
   - FLAG OFF (default): 202, a landing object IS written, a `VALIDATE_DATASET`
-    IS published, and NO hot row exists.
+    IS published, and NO recall row exists.
 
-The control plane stays on the default `memory://` state adapter — the hot path
-is gated on `RB_HOT_DSN`, not the control-plane DSN. Each test reloads the app
-modules so the patched env (`RB_HOT_DSN`, `RB_DELTA_TIER`, `LANDING_PREFIX`) is
+The control plane stays on the default `memory://` state adapter — the recall path
+is gated on `RB_RECALL_DSN`, not the control-plane DSN. Each test reloads the app
+modules so the patched env (`RB_RECALL_DSN`, `RB_RECALL`, `LANDING_PREFIX`) is
 picked up.
 """
 from __future__ import annotations
@@ -34,50 +34,50 @@ else:
 
 
 @pytest.fixture(scope="module")
-def hot_url():
+def recall_url():
     """One pgvector container for this module; yield a psycopg2 DSN.
 
     Same `pgvector/pgvector:pg15` image the compose `pgvector` service uses.
     """
     if PostgresContainer is None:  # pragma: no cover
         pytest.fail(
-            "testcontainers is required for the hot-write suite. "
+            "testcontainers is required for the recall-write suite. "
             f"Import error: {_IMPORT_ERROR}"
         )
     with PostgresContainer("pgvector/pgvector:pg15", driver=None) as pg:
         yield pg.get_connection_url()
 
 
-def _truncate_hot(dsn: str) -> None:
-    """Drop all hot rows + reset the LSN sequence (per-test isolation)."""
+def _truncate_recall(dsn: str) -> None:
+    """Drop all recall rows + reset the LSN sequence (per-test isolation)."""
     conn = psycopg2.connect(dsn)
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT to_regclass('public.hot_vectors'), "
-                "to_regclass('public.hot_lsn_seq')"
+                "SELECT to_regclass('public.recall_vectors'), "
+                "to_regclass('public.recall_lsn_seq')"
             )
             hv, seq = cur.fetchone()
             if hv is not None:
-                cur.execute("TRUNCATE hot_vectors")
+                cur.execute("TRUNCATE recall_vectors")
             if seq is not None:
-                cur.execute("TRUNCATE hot_lsn_seq")
+                cur.execute("TRUNCATE recall_lsn_seq")
     finally:
         conn.close()
 
 
-def _on_client(monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path):
-    """Build a TestClient with the delta tier ON, pointed at the hot container."""
-    monkeypatch.setenv("RB_HOT_DSN", hot_url)
-    monkeypatch.setenv("RB_DELTA_TIER", "true")
+def _on_client(monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path):
+    """Build a TestClient with the recall tier ON, pointed at the recall container."""
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
+    monkeypatch.setenv("RB_RECALL", "true")
     return _build_client(monkeypatch, s3_landing_prefix, s3_indexes_prefix, tmp_path)
 
 
 def _off_client(monkeypatch, s3_landing_prefix, s3_indexes_prefix, tmp_path):
-    """Build a TestClient with the delta tier OFF (default)."""
-    monkeypatch.delenv("RB_HOT_DSN", raising=False)
-    monkeypatch.delenv("RB_DELTA_TIER", raising=False)
+    """Build a TestClient with the recall tier OFF (default)."""
+    monkeypatch.delenv("RB_RECALL_DSN", raising=False)
+    monkeypatch.delenv("RB_RECALL", raising=False)
     return _build_client(monkeypatch, s3_landing_prefix, s3_indexes_prefix, tmp_path)
 
 
@@ -89,7 +89,7 @@ def _build_client(monkeypatch, s3_landing_prefix, s3_indexes_prefix, tmp_path):
 
     import adapters.state.state as state_mod
     importlib.reload(state_mod)
-    state_mod._HOT_MIGRATED = False
+    state_mod._RECALL_MIGRATED = False
     for attr in ("_MEM_TENANTS", "_MEM_TENANTS_BY_EMAIL", "_MEM_API_KEYS", "_MEM_DATASETS"):
         obj = getattr(state_mod, attr, None)
         if isinstance(obj, dict):
@@ -139,12 +139,12 @@ def _drain_validate():
     return msgs
 
 
-def _hot_rows(dsn, tenant, dataset):
+def _recall_rows(dsn, tenant, dataset):
     conn = psycopg2.connect(dsn)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, lsn, deleted FROM hot_vectors "
+                "SELECT id, lsn, deleted FROM recall_vectors "
                 "WHERE tenant_id=%s AND dataset=%s ORDER BY lsn",
                 (tenant, dataset),
             )
@@ -156,21 +156,21 @@ def _hot_rows(dsn, tenant, dataset):
 # --- flag ON --------------------------------------------------------------
 
 
-def test_flag_on_writes_hot_rows_returns_200(
-    monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+def test_flag_on_writes_recall_rows_returns_200(
+    monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
 ):
-    """Flag on: 200, rows in hot_vectors with monotonic lsn + deleted=false,
+    """Flag on: 200, rows in recall_vectors with monotonic lsn + deleted=false,
     NO VALIDATE_DATASET, NO landing object."""
     import adapters.state.state as state_mod
     importlib.reload(state_mod)
-    monkeypatch.setenv("RB_HOT_DSN", hot_url)
-    state_mod._HOT_MIGRATED = False
-    state_mod.migrate_hot(force=True)
-    _truncate_hot(hot_url)
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
+    state_mod._RECALL_MIGRATED = False
+    state_mod.migrate_recall(force=True)
+    _truncate_recall(recall_url)
     _drain_validate()
 
     client, _ = _on_client(
-        monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+        monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
     )
     s = _signup(client)
     client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4})
@@ -192,7 +192,7 @@ def test_flag_on_writes_hot_rows_returns_200(
 
     # Tenant id is the bootstrap principal when auth is on -> the JWT's sub.
     tenant = _tenant_of(s)
-    rows = _hot_rows(hot_url, tenant, "v")
+    rows = _recall_rows(recall_url, tenant, "v")
     assert len(rows) == 3, rows
     lsns = [row[1] for row in rows]
     assert lsns == sorted(lsns) and len(set(lsns)) == 3, f"non-monotonic lsn: {lsns}"
@@ -206,18 +206,18 @@ def test_flag_on_writes_hot_rows_returns_200(
 
 
 def test_flag_on_last_write_wins_on_reupsert(
-    monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+    monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
 ):
     """Re-sending an id overwrites the row (single row, new higher lsn)."""
     import adapters.state.state as state_mod
     importlib.reload(state_mod)
-    monkeypatch.setenv("RB_HOT_DSN", hot_url)
-    state_mod._HOT_MIGRATED = False
-    state_mod.migrate_hot(force=True)
-    _truncate_hot(hot_url)
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
+    state_mod._RECALL_MIGRATED = False
+    state_mod.migrate_recall(force=True)
+    _truncate_recall(recall_url)
 
     client, _ = _on_client(
-        monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+        monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
     )
     s = _signup(client, email="bob@example.com")
     client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "w", "dimension": 4})
@@ -233,17 +233,17 @@ def test_flag_on_last_write_wins_on_reupsert(
     assert _send([1.0, 0, 0, 0]).status_code == 200
     assert _send([9.0, 0, 0, 0]).status_code == 200
 
-    rows = _hot_rows(hot_url, tenant, "w")
+    rows = _recall_rows(recall_url, tenant, "w")
     assert len(rows) == 1, f"re-upsert must collapse to one row: {rows}"
     # The surviving row carries the second (higher) LSN.
     assert rows[0][1] == 2, rows
 
     # The stored embedding is the second write's value.
-    conn = psycopg2.connect(hot_url)
+    conn = psycopg2.connect(recall_url)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT embedding FROM hot_vectors "
+                "SELECT embedding FROM recall_vectors "
                 "WHERE tenant_id=%s AND dataset=%s AND id='same'",
                 (tenant, "w"),
             )
@@ -254,7 +254,7 @@ def test_flag_on_last_write_wins_on_reupsert(
 
 
 def test_flag_on_intra_batch_duplicate_id_last_write_wins(
-    monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+    monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
 ):
     """A duplicate id WITHIN one POST collapses to one row; the LAST input wins.
 
@@ -264,13 +264,13 @@ def test_flag_on_intra_batch_duplicate_id_last_write_wins(
     """
     import adapters.state.state as state_mod
     importlib.reload(state_mod)
-    monkeypatch.setenv("RB_HOT_DSN", hot_url)
-    state_mod._HOT_MIGRATED = False
-    state_mod.migrate_hot(force=True)
-    _truncate_hot(hot_url)
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
+    state_mod._RECALL_MIGRATED = False
+    state_mod.migrate_recall(force=True)
+    _truncate_recall(recall_url)
 
     client, _ = _on_client(
-        monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+        monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
     )
     s = _signup(client, email="dup@example.com")
     client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "d", "dimension": 4})
@@ -288,26 +288,26 @@ def test_flag_on_intra_batch_duplicate_id_last_write_wins(
         data=body,
     )
     assert r.status_code == 200, r.text
-    # All three lines validated; the service reports them accepted, the hot
+    # All three lines validated; the service reports them accepted, the recall
     # write collapses the duplicate id to one row.
     assert r.json()["accepted"] == 3
 
-    rows = _hot_rows(hot_url, tenant, "d")
+    rows = _recall_rows(recall_url, tenant, "d")
     ids = sorted(row[0] for row in rows)
     assert ids == ["k", "other"], f"duplicate id must collapse to one row: {rows}"
 
     # The surviving "k" carries the second write's embedding + the higher LSN.
-    conn = psycopg2.connect(hot_url)
+    conn = psycopg2.connect(recall_url)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT embedding, lsn FROM hot_vectors "
+                "SELECT embedding, lsn FROM recall_vectors "
                 "WHERE tenant_id=%s AND dataset=%s AND id='k'",
                 (tenant, "d"),
             )
             emb, lsn_k = cur.fetchone()
             cur.execute(
-                "SELECT lsn FROM hot_vectors "
+                "SELECT lsn FROM recall_vectors "
                 "WHERE tenant_id=%s AND dataset=%s AND id='other'",
                 (tenant, "d"),
             )
@@ -319,25 +319,25 @@ def test_flag_on_intra_batch_duplicate_id_last_write_wins(
 
 
 def test_flag_on_batch_rollback_persists_nothing(
-    monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+    monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
 ):
-    """A mid-batch hot-write failure rolls back the WHOLE POST — no partial rows.
+    """A mid-batch recall-write failure rolls back the WHOLE POST — no partial rows.
 
     A dimension-correct-but-out-of-float4-range value is caught by validation
     now, so to exercise the TRANSACTION rollback we inject a failure into the
-    hot UPSERT directly (the real `execute_values` is wrapped to raise after the
-    LSN block is allocated). The single transaction must leave hot_vectors AND
+    recall UPSERT directly (the real `execute_values` is wrapped to raise after the
+    LSN block is allocated). The single transaction must leave recall_vectors AND
     the LSN sequence unchanged, and the endpoint returns the 503 envelope.
     """
     import adapters.state.state as state_mod
     importlib.reload(state_mod)
-    monkeypatch.setenv("RB_HOT_DSN", hot_url)
-    state_mod._HOT_MIGRATED = False
-    state_mod.migrate_hot(force=True)
-    _truncate_hot(hot_url)
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
+    state_mod._RECALL_MIGRATED = False
+    state_mod.migrate_recall(force=True)
+    _truncate_recall(recall_url)
 
     client, live_state = _on_client(
-        monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+        monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
     )
     s = _signup(client, email="rollback@example.com")
     client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "rb", "dimension": 4})
@@ -347,7 +347,7 @@ def test_flag_on_batch_rollback_persists_nothing(
     # the same transaction. The connection-level rollback must then undo the
     # seq increment too, so the failed POST leaves zero footprint.
     def _boom(*a, **k):
-        raise psycopg2.OperationalError("simulated hot-store failure")
+        raise psycopg2.OperationalError("simulated recall-store failure")
 
     monkeypatch.setattr(live_state, "execute_values", _boom)
 
@@ -360,16 +360,16 @@ def test_flag_on_batch_rollback_persists_nothing(
         data=body,
     )
     assert r.status_code == 503, r.text
-    assert r.json()["error"]["code"] == "hot_write_failed"
+    assert r.json()["error"]["code"] == "recall_write_failed"
 
     # No partial rows persisted...
-    assert _hot_rows(hot_url, tenant, "rb") == [], "rollback must persist NO rows"
+    assert _recall_rows(recall_url, tenant, "rb") == [], "rollback must persist NO rows"
     # ...and the LSN sequence was rolled back too (no row, or last_lsn == 0).
-    conn = psycopg2.connect(hot_url)
+    conn = psycopg2.connect(recall_url)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT last_lsn FROM hot_lsn_seq WHERE tenant_id=%s AND dataset=%s",
+                "SELECT last_lsn FROM recall_lsn_seq WHERE tenant_id=%s AND dataset=%s",
                 (tenant, "rb"),
             )
             row = cur.fetchone()
@@ -379,7 +379,7 @@ def test_flag_on_batch_rollback_persists_nothing(
 
 
 def test_flag_on_concurrent_writers_keep_lsn_monotonic(
-    monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+    monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
 ):
     """Concurrent POSTs to one (tenant, dataset) yield a gap-free, unique LSN set.
 
@@ -391,19 +391,19 @@ def test_flag_on_concurrent_writers_keep_lsn_monotonic(
 
     import adapters.state.state as state_mod
     importlib.reload(state_mod)
-    monkeypatch.setenv("RB_HOT_DSN", hot_url)
-    state_mod._HOT_MIGRATED = False
-    state_mod.migrate_hot(force=True)
-    _truncate_hot(hot_url)
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
+    state_mod._RECALL_MIGRATED = False
+    state_mod.migrate_recall(force=True)
+    _truncate_recall(recall_url)
 
     client, _ = _on_client(
-        monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+        monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
     )
     s = _signup(client, email="concurrent@example.com")
     client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "c", "dimension": 4})
     tenant = _tenant_of(s)
 
-    # `hot_upsert_vectors` opens its own dedicated connection per call, so it is
+    # `recall_upsert_vectors` opens its own dedicated connection per call, so it is
     # safe to call from multiple threads concurrently against the same dataset.
     n_writers = 6
     per_writer = 5
@@ -413,7 +413,7 @@ def test_flag_on_concurrent_writers_keep_lsn_monotonic(
             {"id": f"w{w}-r{i}", "values": [float(w), float(i), 0.0, 0.0], "metadata": {}}
             for i in range(per_writer)
         ]
-        state_mod.hot_upsert_vectors(tenant, "c", recs)
+        state_mod.recall_upsert_vectors(tenant, "c", recs)
 
     threads = [threading.Thread(target=_writer, args=(w,)) for w in range(n_writers)]
     for t in threads:
@@ -421,7 +421,7 @@ def test_flag_on_concurrent_writers_keep_lsn_monotonic(
     for t in threads:
         t.join()
 
-    rows = _hot_rows(hot_url, tenant, "c")
+    rows = _recall_rows(recall_url, tenant, "c")
     lsns = sorted(row[1] for row in rows)
     total = n_writers * per_writer
     assert len(rows) == total, f"every record persisted exactly once: {len(rows)}"
@@ -433,15 +433,15 @@ def test_flag_on_concurrent_writers_keep_lsn_monotonic(
 # --- flag OFF -------------------------------------------------------------
 
 
-def test_flag_off_returns_202_lands_no_hot_row(
-    monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+def test_flag_off_returns_202_lands_no_recall_row(
+    monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
 ):
-    """Flag off (default): 202, landing object written, no hot row.
+    """Flag off (default): 202, landing object written, no recall row.
 
     The pgvector container is up (migrated by other tests) but the off path must
-    not touch it — proven by asserting the hot table has no row for this dataset.
+    not touch it — proven by asserting the recall table has no row for this dataset.
     """
-    _truncate_hot(hot_url)
+    _truncate_recall(recall_url)
     _drain_validate()
 
     client, _ = _off_client(
@@ -466,5 +466,5 @@ def test_flag_off_returns_202_lands_no_hot_row(
     assert len(msgs) == 1 and msgs[0]["dataset"] == "x"
     assert storage_mod.exists(msgs[0]["uri"]), "flag-off must write a landing object"
 
-    # No hot row (the off path never touched the hot store).
-    assert _hot_rows(hot_url, tenant, "x") == []
+    # No recall row (the off path never touched the recall store).
+    assert _recall_rows(recall_url, tenant, "x") == []

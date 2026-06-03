@@ -1,4 +1,4 @@
-# Vectors API (cold-tier CRUD)
+# Vectors API (consolidated-tier CRUD)
 
 Get, list, and delete individual vectors by their customer-supplied string id.
 This page documents the implementation details the [v1 contract](./v1.md)
@@ -11,16 +11,16 @@ consistency model).
 - `GET    /v1/datasets/{name}/vectors` — list vectors (filter + pagination)
 - `DELETE /v1/datasets/{name}/vectors/{id}` — delete one vector by id
 
-See the **Vectors (cold-tier CRUD)** section of [`v1.md`](./v1.md) for the
+See the **Vectors (consolidated-tier CRUD)** section of [`v1.md`](./v1.md) for the
 request/response schemas and error codes.
 
 ## Flag-independent
 
-This surface is **not** gated by `RB_DELTA_TIER`. It serves data from today's
-asynchronously-built cold shards and works with the shipping pipeline. The
-hot↔cold union for these operations (so a just-written-but-not-yet-flushed
+This surface is **not** gated by `RB_RECALL`. It serves data from today's
+asynchronously-built consolidated shards and works with the shipping pipeline. The
+recall↔consolidated union for these operations (so a just-written-but-not-yet-consolidated
 vector is visible to get/list/delete) is a later step in the
-[delta-tier plan](../architecture/delta-tier.md) (PR6) and does not change
+[recall & consolidate plan](../architecture/recall-consolidate.md) (PR6) and does not change
 this contract — it only widens what these endpoints can see.
 
 ## How a vector is resolved (the sidecar)
@@ -73,7 +73,7 @@ snapshot taken when pagination began. A concurrent rebuild — an ingest
 generation between pages can add, remove, or re-order rows under a stable
 offset, so a long pagination run can miss or repeat a row that was inserted or
 deleted while it was in progress. This is the expected behaviour of a simple
-offset cursor over an eventually-consistent cold tier. v1 keeps the offset
+offset cursor over an eventually-consistent consolidated tier. v1 keeps the offset
 cursor deliberately (a keyset cursor that is stable across rebuilds is a
 possible later change, enabled by the cursor being opaque); callers that need a
 strictly consistent full scan should page quickly and tolerate the small

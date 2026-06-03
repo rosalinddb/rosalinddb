@@ -608,16 +608,16 @@ def migrate(force: bool = False):
     incremental-indexing columns), 004 (import_jobs for async bulk ingest),
     005 (dataset `status_updated_at` for the reconciliation reaper), 006
     (`tenants.dp_pool` routing), 007 (`dp_shard_residency` SSD-cache registry),
-    008 (`shard_catalog.durable_lsn`, the delta-tier watermark — default 0, so
-    it is a no-op for behaviour until the delta tier is enabled).
+    008 (`shard_catalog.consolidated_lsn`, the recall-tier watermark — default 0,
+    so it is a no-op for behaviour until the recall tier is enabled).
     002 references the `tenants` table for FKs so it must run after 001; 003
     recreates `shard_catalog` so it must run after 002; 004 FKs to
     `dataset_catalog` so it must run after 002. All files live under
     `adapters/state/migrations/`. Memory mode is a no-op.
 
-    This migrates ONLY the control-plane Postgres. The hot-tier (pgvector)
-    instance has its own DSN (`RB_HOT_DSN`) and a separate runner, `migrate_hot()`
-    — see that function and `scripts/migrate.py`.
+    This migrates ONLY the control-plane Postgres. The recall-tier (pgvector)
+    instance has its own DSN (`RB_RECALL_DSN`) and a separate runner,
+    `migrate_recall()` — see that function and `scripts/migrate.py`.
 
     `_MIGRATE_LOCK` is a `threading.Lock` — it serialises migration *within* a
     single process only. Cross-process safety is provided by a Postgres
@@ -730,17 +730,18 @@ _MIGRATION_VERSIONS = (
     "005_dataset_status_updated_at",
     "006_tenants_dp_pool",
     "007_dp_shard_residency",
-    "008_shard_durable_lsn",
+    "008_shard_consolidated_lsn",
 )
 
 
-# Ordered list of HOT-instance migration versions. These run against the
-# SEPARATE data-plane pgvector instance (RB_HOT_DSN), NOT the control-plane
-# Postgres above (see docs/architecture/delta-tier.md, "Blast radius"). They
-# live under `migrations/hot/` and are applied by `migrate_hot()` with the same
-# advisory-lock + version-ledger discipline as the control-plane set. The two
-# ledgers live in different databases by design and never share a connection.
-_HOT_MIGRATION_VERSIONS = ("001_hot_vectors",)
+# Ordered list of RECALL-instance migration versions. These run against the
+# SEPARATE data-plane pgvector instance (RB_RECALL_DSN), NOT the control-plane
+# Postgres above (see docs/architecture/recall-consolidate.md, "Blast radius").
+# They live under `migrations/recall/` and are applied by `migrate_recall()`
+# with the same advisory-lock + version-ledger discipline as the control-plane
+# set. The two ledgers live in different databases by design and never share a
+# connection.
+_RECALL_MIGRATION_VERSIONS = ("001_recall_vectors",)
 
 
 def _apply_migrations() -> None:
@@ -861,125 +862,127 @@ ON CONFLICT (id) DO NOTHING
         )
 
 
-# --- Hot-tier (delta tier) schema migration -------------------------------
+# --- Recall-tier schema migration -----------------------------------------
 #
-# The hot tier is a SEPARATE data-plane pgvector instance (RB_HOT_DSN), kept off
-# the control-plane Postgres so a tenant write-storm cannot starve the metadata
-# reads on every query's critical path (docs/architecture/delta-tier.md, "Blast
-# radius & control/data-plane isolation"). Its schema is migrated independently
-# from the control-plane schema above, with the same advisory-lock + ledger
-# discipline, against its own DSN. The whole hot path is DEFAULT-OFF: when
-# RB_HOT_DSN is unset `migrate_hot()` is a no-op, so a flag-off deploy behaves
-# byte-identically to today and nothing ever connects to a hot instance.
+# The recall tier is a SEPARATE data-plane pgvector instance (RB_RECALL_DSN),
+# kept off the control-plane Postgres so a tenant write-storm cannot starve the
+# metadata reads on every query's critical path
+# (docs/architecture/recall-consolidate.md, "Blast radius & control/data-plane
+# isolation"). Its schema is migrated independently from the control-plane
+# schema above, with the same advisory-lock + ledger discipline, against its own
+# DSN. The whole recall path is DEFAULT-OFF: when RB_RECALL_DSN is unset
+# `migrate_recall()` is a no-op, so a flag-off deploy behaves byte-identically to
+# today and nothing ever connects to a recall instance.
 
-# Distinct advisory-lock key for the hot ledger. It lives in a different
+# Distinct advisory-lock key for the recall ledger. It lives in a different
 # database from `_MIGRATE_LOCK_KEY`, so collision is impossible either way, but
 # a separate constant keeps the intent clear. Fixed forever once deployed.
-_HOT_MIGRATE_LOCK_KEY = 0x726F73685F686F74  # ASCII "rosh_hot", a stable constant
+_RECALL_MIGRATE_LOCK_KEY = 0x726F73685F686F74  # ASCII "rosh_hot", a stable constant
 
-# Process-local serialisation for hot migrations, mirroring the control-plane
+# Process-local serialisation for recall migrations, mirroring the control-plane
 # `_MIGRATE_LOCK` / `_MIGRATED` pair (cross-process safety is the Postgres
-# advisory lock inside `_apply_hot_migrations`).
-_HOT_MIGRATE_LOCK = threading.Lock()
-_HOT_MIGRATED = False
+# advisory lock inside `_apply_recall_migrations`).
+_RECALL_MIGRATE_LOCK = threading.Lock()
+_RECALL_MIGRATED = False
 
 
-def _hot_dsn() -> Optional[str]:
-    """Return the hot-tier (pgvector) DSN from `RB_HOT_DSN`, or None if unset.
+def _recall_dsn() -> Optional[str]:
+    """Return the recall-tier (pgvector) DSN from `RB_RECALL_DSN`, or None if unset.
 
-    `None` means the delta tier is not configured — every hot path is a no-op
-    and the deploy behaves exactly as it does today. A blank/whitespace value is
-    treated as unset so an empty compose default cannot accidentally enable it.
+    `None` means the recall tier is not configured — every recall path is a
+    no-op and the deploy behaves exactly as it does today. A blank/whitespace
+    value is treated as unset so an empty compose default cannot accidentally
+    enable it.
     """
-    raw = os.getenv("RB_HOT_DSN")
+    raw = os.getenv("RB_RECALL_DSN")
     if raw is None:
         return None
     raw = raw.strip()
     return raw or None
 
 
-def migrate_hot(force: bool = False) -> bool:
-    """Apply the hot-tier (pgvector) schema against `RB_HOT_DSN`.
+def migrate_recall(force: bool = False) -> bool:
+    """Apply the recall-tier (pgvector) schema against `RB_RECALL_DSN`.
 
-    Returns True if migrations were applied (or would have been — i.e. a hot DSN
-    is configured), False if the hot tier is OFF (no `RB_HOT_DSN`) and nothing
-    was done. The boolean lets the migration entrypoint print an accurate
-    "skipped (delta tier off)" vs "applied" line.
+    Returns True if migrations were applied (or would have been — i.e. a recall
+    DSN is configured), False if the recall tier is OFF (no `RB_RECALL_DSN`) and
+    nothing was done. The boolean lets the migration entrypoint print an accurate
+    "skipped (recall tier off)" vs "applied" line.
 
-    DEFAULT-OFF: with no `RB_HOT_DSN` this is a pure no-op — it never opens a
+    DEFAULT-OFF: with no `RB_RECALL_DSN` this is a pure no-op — it never opens a
     connection, never imports a pgvector dependency, and leaves behaviour
     identical to today. This is the property that keeps a flag-off
     `docker compose up` byte-identical.
 
-    Memory mode (`DATABASE_URL=memory://...`) does NOT suppress this: the hot
+    Memory mode (`DATABASE_URL=memory://...`) does NOT suppress this: the recall
     tier is a wholly separate instance addressed by its own DSN, so a test or a
-    deploy can point `RB_HOT_DSN` at a real pgvector while the control plane runs
-    in memory. The gate is `RB_HOT_DSN`, not `DATABASE_URL`.
+    deploy can point `RB_RECALL_DSN` at a real pgvector while the control plane
+    runs in memory. The gate is `RB_RECALL_DSN`, not `DATABASE_URL`.
 
-    The `_HOT_MIGRATE_LOCK` / `_HOT_MIGRATED` pair serialises within a process;
-    `_apply_hot_migrations()` takes a Postgres `pg_advisory_xact_lock` so several
-    processes booting at once serialise in the hot database instead of racing the
-    DDL locks — identical discipline to `migrate()`.
+    The `_RECALL_MIGRATE_LOCK` / `_RECALL_MIGRATED` pair serialises within a
+    process; `_apply_recall_migrations()` takes a Postgres `pg_advisory_xact_lock`
+    so several processes booting at once serialise in the recall database instead
+    of racing the DDL locks — identical discipline to `migrate()`.
 
     `force=True` mirrors `migrate(force=True)`: it bypasses the `RB_SKIP_MIGRATE`
     early-return so the dedicated migration entrypoint always applies the schema
     even when it inherits that flag from the service env.
     """
-    dsn = _hot_dsn()
+    dsn = _recall_dsn()
     if dsn is None:
-        # Delta tier off — nothing to migrate, nothing connects to a hot store.
+        # Recall tier off — nothing to migrate, nothing connects to a recall store.
         return False
     if not force and os.getenv("RB_SKIP_MIGRATE", "").lower() in ("1", "true", "yes"):
         # Schema applied out-of-band (same contract as the control-plane
-        # migrate()); a hot DSN IS configured, so report True.
+        # migrate()); a recall DSN IS configured, so report True.
         return True
-    global _HOT_MIGRATED
-    with _HOT_MIGRATE_LOCK:
-        if _HOT_MIGRATED:
+    global _RECALL_MIGRATED
+    with _RECALL_MIGRATE_LOCK:
+        if _RECALL_MIGRATED:
             return True
-        _apply_hot_migrations(dsn)
-        _HOT_MIGRATED = True
+        _apply_recall_migrations(dsn)
+        _RECALL_MIGRATED = True
     return True
 
 
-def _apply_hot_migrations(dsn: str) -> None:
-    """Apply the ordered hot migration files exactly once each (version-tracked).
+def _apply_recall_migrations(dsn: str) -> None:
+    """Apply the ordered recall migration files exactly once each (version-tracked).
 
     A faithful copy of `_apply_migrations()`'s cross-process-safe pattern, but
-    against the hot DSN and the `hot_schema_migrations` ledger:
+    against the recall DSN and the `recall_schema_migrations` ledger:
 
-      - a dedicated (non-pooled) connection to `dsn` — the hot instance has no
+      - a dedicated (non-pooled) connection to `dsn` — the recall instance has no
         application connection pool;
-      - `pg_advisory_xact_lock(_HOT_MIGRATE_LOCK_KEY)` first, so concurrent
-        migrators serialise in the hot database rather than deadlocking on the
+      - `pg_advisory_xact_lock(_RECALL_MIGRATE_LOCK_KEY)` first, so concurrent
+        migrators serialise in the recall database rather than deadlocking on the
         `CREATE EXTENSION` / `CREATE TABLE` locks;
-      - a `hot_schema_migrations(version, applied_at)` ledger so a re-run applies
-        only un-applied versions. The hot migrations are all `IF NOT EXISTS`
-        (additive, non-destructive), so even a direct re-execute is safe; the
-        ledger keeps the common path a clean skip.
+      - a `recall_schema_migrations(version, applied_at)` ledger so a re-run
+        applies only un-applied versions. The recall migrations are all
+        `IF NOT EXISTS` (additive, non-destructive), so even a direct re-execute
+        is safe; the ledger keeps the common path a clean skip.
 
-    There is no legacy-bootstrap branch (unlike the control plane): the hot
-    instance is brand new with the delta tier, so there is never a pre-existing
-    hot schema without a ledger to reconcile.
+    There is no legacy-bootstrap branch (unlike the control plane): the recall
+    instance is brand new with the recall tier, so there is never a pre-existing
+    recall schema without a ledger to reconcile.
     """
-    migrations_dir = Path(__file__).parent / "migrations" / "hot"
+    migrations_dir = Path(__file__).parent / "migrations" / "recall"
     conn = psycopg2.connect(dsn)
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT pg_advisory_xact_lock(%s)", (_HOT_MIGRATE_LOCK_KEY,)
+                "SELECT pg_advisory_xact_lock(%s)", (_RECALL_MIGRATE_LOCK_KEY,)
             )
             cur.execute(
                 """
-CREATE TABLE IF NOT EXISTS hot_schema_migrations (
+CREATE TABLE IF NOT EXISTS recall_schema_migrations (
   version    TEXT PRIMARY KEY,
   applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
 )
                 """
             )
-            cur.execute("SELECT version FROM hot_schema_migrations")
+            cur.execute("SELECT version FROM recall_schema_migrations")
             applied = {row[0] for row in cur.fetchall()}
-            for version in _HOT_MIGRATION_VERSIONS:
+            for version in _RECALL_MIGRATION_VERSIONS:
                 if version in applied:
                     continue
                 sql = (migrations_dir / f"{version}.sql").read_text(
@@ -987,7 +990,7 @@ CREATE TABLE IF NOT EXISTS hot_schema_migrations (
                 )
                 cur.execute(sql)
                 cur.execute(
-                    "INSERT INTO hot_schema_migrations(version) VALUES (%s) "
+                    "INSERT INTO recall_schema_migrations(version) VALUES (%s) "
                     "ON CONFLICT (version) DO NOTHING",
                     (version,),
                 )
@@ -995,66 +998,69 @@ CREATE TABLE IF NOT EXISTS hot_schema_migrations (
         conn.close()
 
 
-# --- Hot-tier (delta tier) synchronous write path -------------------------
+# --- Recall-tier synchronous write path -----------------------------------
 #
 # The flag-gated, default-off write path that makes a `POST /vectors` durable
-# and immediately queryable. It writes ONLY to the separate data-plane hot
-# pgvector instance (`RB_HOT_DSN`) — never the control-plane Postgres — so a
+# and immediately queryable. It writes ONLY to the separate data-plane recall
+# pgvector instance (`RB_RECALL_DSN`) — never the control-plane Postgres — so a
 # tenant write-storm cannot starve the catalog reads on every query's critical
-# path (docs/architecture/delta-tier.md, "Blast radius"). Everything here is a
-# no-op unless `delta_tier_enabled()` is True, which the service checks before
-# calling in; so a flag-off deploy never opens a hot connection.
+# path (docs/architecture/recall-consolidate.md, "Blast radius"). Everything
+# here is a no-op unless `recall_enabled()` is True, which the service checks
+# before calling in; so a flag-off deploy never opens a recall connection.
 #
-# Scope note: this is the WRITE path only — the query union, the hot→cold
-# flush, and hot-delete tombstoning are later PRs.
+# Scope note: this is the WRITE path only — the query union, the
+# recall→consolidated consolidation, and recall-delete tombstoning are later PRs.
 
 
-def delta_tier_enabled() -> bool:
-    """Whether the synchronous hot-tier write path is active.
+def recall_enabled() -> bool:
+    """Whether the synchronous recall-tier write path is active.
 
     Mirrors `quotas_enabled()` (the OSS opt-in idiom): defaults OFF and reads
     the env fresh on every call so a test can flip it via monkeypatch without a
-    module reload. It is the MASTER switch for delta-tier behaviour.
+    module reload. It is the MASTER switch for recall-tier behaviour.
 
     Two conditions must BOTH hold for it to be on:
-      - `RB_DELTA_TIER` is truthy (`1`/`true`/`yes`/`on`, case-insensitive), and
-      - `RB_HOT_DSN` is configured (non-empty) — there is a hot store to write to.
+      - `RB_RECALL` is truthy (`1`/`true`/`yes`/`on`, case-insensitive), and
+      - `RB_RECALL_DSN` is configured (non-empty) — there is a recall store to
+        write to.
 
     Requiring the DSN as well as the flag means a deploy that flips
-    `RB_DELTA_TIER=true` but forgets to point `RB_HOT_DSN` at an instance stays
+    `RB_RECALL=true` but forgets to point `RB_RECALL_DSN` at an instance stays
     on the byte-identical flag-off path rather than erroring on every write.
     """
-    if os.getenv("RB_DELTA_TIER", "").strip().lower() not in (
+    if os.getenv("RB_RECALL", "").strip().lower() not in (
         "1",
         "true",
         "yes",
         "on",
     ):
         return False
-    return _hot_dsn() is not None
+    return _recall_dsn() is not None
 
 
-def _hot_conn() -> "psycopg2.extensions.connection":
-    """Return a fresh, DEDICATED psycopg2 connection to the hot store.
+def _recall_conn() -> "psycopg2.extensions.connection":
+    """Return a fresh, DEDICATED psycopg2 connection to the recall store.
 
-    A brand-new connection to `RB_HOT_DSN` per call (NOT pooled): the hot tier
-    is a separate data-plane instance with no application pool of its own, and
-    the per-write path is short — allocate an LSN, UPSERT, commit. The caller
-    owns the connection and MUST close it (see `hot_upsert_vectors`, which uses
-    `contextlib.closing`).
+    A brand-new connection to `RB_RECALL_DSN` per call (NOT pooled): the recall
+    tier is a separate data-plane instance with no application pool of its own,
+    and the per-write path is short — allocate an LSN, UPSERT, commit. The caller
+    owns the connection and MUST close it (see `recall_upsert_vectors`, which
+    uses `contextlib.closing`).
 
-    Lazy by construction: this is only ever reached from `hot_upsert_vectors`,
-    which the service calls only when `delta_tier_enabled()` is True. With the
-    flag off no caller reaches here, so no connection to a hot instance is ever
+    Lazy by construction: this is only ever reached from `recall_upsert_vectors`,
+    which the service calls only when `recall_enabled()` is True. With the flag
+    off no caller reaches here, so no connection to a recall instance is ever
     opened — the property that keeps a flag-off deploy byte-identical.
 
-    Raises `RuntimeError` if `RB_HOT_DSN` is unset — that is a programming error
-    (a caller reached the hot path with the tier off), not an expected runtime
-    state.
+    Raises `RuntimeError` if `RB_RECALL_DSN` is unset — that is a programming
+    error (a caller reached the recall path with the tier off), not an expected
+    runtime state.
     """
-    dsn = _hot_dsn()
+    dsn = _recall_dsn()
     if dsn is None:
-        raise RuntimeError("hot tier is off (RB_HOT_DSN unset); no hot connection")
+        raise RuntimeError(
+            "recall tier is off (RB_RECALL_DSN unset); no recall connection"
+        )
     return psycopg2.connect(dsn)
 
 
@@ -1070,25 +1076,25 @@ def _to_pgvector_literal(values: List[float]) -> str:
     return "[" + ",".join(repr(float(v)) for v in values) + "]"
 
 
-def hot_upsert_vectors(
+def recall_upsert_vectors(
     tenant_id: str,
     dataset: str,
     records: List[dict],
 ) -> int:
-    """Synchronously UPSERT validated records into the hot tier; return the count.
+    """Synchronously UPSERT validated records into the recall tier; return the count.
 
     For each record (`{"id", "values", "metadata"}`, already validated by the
-    service): the row is UPSERTed into `hot_vectors` with last-write-wins on
+    service): the row is UPSERTed into `recall_vectors` with last-write-wins on
     `(tenant_id, dataset, id)` and `deleted = false`, stamped with a strictly-
-    monotonic per-`(tenant, dataset)` LSN from the hot store's `hot_lsn_seq`. A
-    re-sent id overwrites the prior row (new embedding, metadata, and a fresh
+    monotonic per-`(tenant, dataset)` LSN from the recall store's `recall_lsn_seq`.
+    A re-sent id overwrites the prior row (new embedding, metadata, and a fresh
     higher LSN) — never a duplicate.
 
-    The LSN is generated in the HOT store, so this path never touches the
-    control-plane Postgres (docs/architecture/delta-tier.md, "The watermark").
-    All records for one call share a single hot connection + transaction: the
-    whole batch commits atomically, so a mid-batch failure leaves the hot tier
-    unchanged rather than half-applied.
+    The LSN is generated in the RECALL store, so this path never touches the
+    control-plane Postgres (docs/architecture/recall-consolidate.md, "The
+    watermark"). All records for one call share a single recall connection +
+    transaction: the whole batch commits atomically, so a mid-batch failure
+    leaves the recall tier unchanged rather than half-applied.
 
     Set-based round-trips (was 2N, now ~2): the prior implementation allocated
     one LSN and ran one UPSERT *per record* (2N round-trips on the read-your-
@@ -1105,7 +1111,7 @@ def hot_upsert_vectors(
     distinct ids, and a single multi-row UPSERT never lists the same conflict
     key twice (which Postgres would reject as "cannot affect row a second time").
 
-    Only ever called when `delta_tier_enabled()` is True (the service gates it),
+    Only ever called when `recall_enabled()` is True (the service gates it),
     so it never runs — and never opens a connection — with the flag off.
     """
     if not records:
@@ -1127,11 +1133,11 @@ def hot_upsert_vectors(
     winners = list(deduped.values())
     n = len(winners)
 
-    # One dedicated hot connection for the whole batch. `contextlib.closing`
+    # One dedicated recall connection for the whole batch. `contextlib.closing`
     # guarantees the socket is closed on every exit path; the `with conn` block
     # manages the transaction (commit on success, rollback on error) so the
     # batch is all-or-nothing.
-    with contextlib.closing(_hot_conn()) as conn, conn, conn.cursor() as cur:
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
         # 1. Allocate the whole LSN block in ONE statement. The upsert-increment
         #    is serialised by Postgres on the single seq row, so `last_lsn` is
         #    strictly monotonic with no cross-dataset contention. Bumping by N at
@@ -1139,10 +1145,10 @@ def hot_upsert_vectors(
         #    in the block, and the block is `last_lsn-N+1 .. last_lsn`.
         cur.execute(
             """
-INSERT INTO hot_lsn_seq (tenant_id, dataset, last_lsn)
+INSERT INTO recall_lsn_seq (tenant_id, dataset, last_lsn)
 VALUES (%s, %s, %s)
 ON CONFLICT (tenant_id, dataset)
-DO UPDATE SET last_lsn = hot_lsn_seq.last_lsn + %s
+DO UPDATE SET last_lsn = recall_lsn_seq.last_lsn + %s
 RETURNING last_lsn
             """,
             (tenant_id, dataset, n, n),
@@ -1167,7 +1173,7 @@ RETURNING last_lsn
         execute_values(
             cur,
             """
-INSERT INTO hot_vectors (tenant_id, dataset, id, embedding, metadata, lsn, deleted)
+INSERT INTO recall_vectors (tenant_id, dataset, id, embedding, metadata, lsn, deleted)
 VALUES %s
 ON CONFLICT (tenant_id, dataset, id)
 DO UPDATE SET

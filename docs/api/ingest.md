@@ -74,7 +74,7 @@ object-storage bytes are reclaimed by a background sweep.
 ## Get / list / delete individual vectors
 
 Operate on a single vector by its customer-supplied string id, served from
-the cold shards. Full reference: [`vectors.md`](./vectors.md).
+the consolidated shards. Full reference: [`vectors.md`](./vectors.md).
 
 ```bash
 # get one vector's id + metadata
