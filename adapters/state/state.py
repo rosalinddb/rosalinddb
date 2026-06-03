@@ -27,7 +27,7 @@ from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 import psycopg2
 import psycopg2.pool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 from adapters.observability.tracing import state_connect_span
 
@@ -1078,11 +1078,11 @@ def hot_upsert_vectors(
     """Synchronously UPSERT validated records into the hot tier; return the count.
 
     For each record (`{"id", "values", "metadata"}`, already validated by the
-    service): allocate a strictly-monotonic per-`(tenant, dataset)` LSN from the
-    hot store's `hot_lsn_seq` (the atomic upsert-increment), then UPSERT the row
-    into `hot_vectors` with last-write-wins on `(tenant_id, dataset, id)` and
-    `deleted = false`. A re-sent id overwrites the prior row (new embedding,
-    metadata, and a fresh higher LSN) — never a duplicate.
+    service): the row is UPSERTed into `hot_vectors` with last-write-wins on
+    `(tenant_id, dataset, id)` and `deleted = false`, stamped with a strictly-
+    monotonic per-`(tenant, dataset)` LSN from the hot store's `hot_lsn_seq`. A
+    re-sent id overwrites the prior row (new embedding, metadata, and a fresh
+    higher LSN) — never a duplicate.
 
     The LSN is generated in the HOT store, so this path never touches the
     control-plane Postgres (docs/architecture/delta-tier.md, "The watermark").
@@ -1090,62 +1090,96 @@ def hot_upsert_vectors(
     whole batch commits atomically, so a mid-batch failure leaves the hot tier
     unchanged rather than half-applied.
 
-    The LSN per record is allocated one statement at a time (not a single bulk
-    statement) because the upsert-increment `RETURNING last_lsn` is what makes
-    the value monotonic and visible; for the small, flush-bounded ingest batch
-    the hot tier targets this is cheap. Returns the number of rows written.
+    Set-based round-trips (was 2N, now ~2): the prior implementation allocated
+    one LSN and ran one UPSERT *per record* (2N round-trips on the read-your-
+    writes path). Instead this allocates ALL N LSNs in a SINGLE upsert-increment
+    (`last_lsn = last_lsn + N RETURNING last_lsn`) and applies the batch in a
+    SINGLE multi-row UPSERT. The seq-row upsert is still serialised by Postgres,
+    so `last_lsn` stays strictly monotonic per (tenant, dataset) with no
+    cross-dataset contention; the allocated block is `last_lsn-N+1 .. last_lsn`,
+    assigned in input order.
+
+    Intra-batch duplicate ids: if the same id appears more than once in one
+    batch, only the LAST occurrence is written (last input wins), so the batch
+    is collapsed to one row per id BEFORE allocation — N is the number of
+    distinct ids, and a single multi-row UPSERT never lists the same conflict
+    key twice (which Postgres would reject as "cannot affect row a second time").
 
     Only ever called when `delta_tier_enabled()` is True (the service gates it),
     so it never runs — and never opens a connection — with the flag off.
     """
     if not records:
         return 0
-    written = 0
+
+    # Collapse intra-batch duplicate ids: later input wins (last-write-wins,
+    # consistent with the cross-batch ON CONFLICT below). Preserve input order
+    # of each surviving id — its position is that of its LAST occurrence, so the
+    # LSN block is assigned in the order the winning records were sent. A dict
+    # keeps insertion order (Python 3.7+); re-assigning an existing key updates
+    # the value but NOT its position, so we del-then-set to move a repeated id
+    # to the end (its latest occurrence).
+    deduped: dict[str, dict] = {}
+    for rec in records:
+        rid = rec["id"]
+        if rid in deduped:
+            del deduped[rid]
+        deduped[rid] = rec
+    winners = list(deduped.values())
+    n = len(winners)
+
     # One dedicated hot connection for the whole batch. `contextlib.closing`
     # guarantees the socket is closed on every exit path; the `with conn` block
     # manages the transaction (commit on success, rollback on error) so the
     # batch is all-or-nothing.
     with contextlib.closing(_hot_conn()) as conn, conn, conn.cursor() as cur:
-        for rec in records:
-            # 1. Allocate the next LSN for this (tenant, dataset). The upsert-
-            #    increment is serialised by Postgres on the single seq row, so
-            #    `last_lsn` is strictly monotonic with no cross-dataset contention.
-            cur.execute(
-                """
+        # 1. Allocate the whole LSN block in ONE statement. The upsert-increment
+        #    is serialised by Postgres on the single seq row, so `last_lsn` is
+        #    strictly monotonic with no cross-dataset contention. Bumping by N at
+        #    once reserves a contiguous block: the returned value is the LAST LSN
+        #    in the block, and the block is `last_lsn-N+1 .. last_lsn`.
+        cur.execute(
+            """
 INSERT INTO hot_lsn_seq (tenant_id, dataset, last_lsn)
-VALUES (%s, %s, 1)
+VALUES (%s, %s, %s)
 ON CONFLICT (tenant_id, dataset)
-DO UPDATE SET last_lsn = hot_lsn_seq.last_lsn + 1
+DO UPDATE SET last_lsn = hot_lsn_seq.last_lsn + %s
 RETURNING last_lsn
-                """,
-                (tenant_id, dataset),
+            """,
+            (tenant_id, dataset, n, n),
+        )
+        last_lsn = cur.fetchone()[0]
+        first_lsn = last_lsn - n + 1
+        # 2. SINGLE multi-row UPSERT. Each winner is stamped with its LSN from
+        #    the block in input order. Last-write-wins on (tenant, dataset, id):
+        #    a re-sent id overwrites embedding/metadata/lsn and clears any prior
+        #    tombstone (deleted -> false), so an upserted id is live.
+        rows = [
+            (
+                tenant_id,
+                dataset,
+                rec["id"],
+                _to_pgvector_literal(rec["values"]),
+                json.dumps(rec.get("metadata") or {}),
+                first_lsn + offset,
             )
-            lsn = cur.fetchone()[0]
-            # 2. UPSERT the vector. Last-write-wins on (tenant, dataset, id):
-            #    a re-sent id overwrites embedding/metadata/lsn and clears any
-            #    prior tombstone (deleted -> false), so an upserted id is live.
-            cur.execute(
-                """
+            for offset, rec in enumerate(winners)
+        ]
+        execute_values(
+            cur,
+            """
 INSERT INTO hot_vectors (tenant_id, dataset, id, embedding, metadata, lsn, deleted)
-VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+VALUES %s
 ON CONFLICT (tenant_id, dataset, id)
 DO UPDATE SET
   embedding = EXCLUDED.embedding,
   metadata  = EXCLUDED.metadata,
   lsn       = EXCLUDED.lsn,
   deleted   = FALSE
-                """,
-                (
-                    tenant_id,
-                    dataset,
-                    rec["id"],
-                    _to_pgvector_literal(rec["values"]),
-                    json.dumps(rec.get("metadata") or {}),
-                    lsn,
-                ),
-            )
-            written += 1
-    return written
+            """,
+            rows,
+            template="(%s, %s, %s, %s, %s, %s, FALSE)",
+        )
+    return n
 
 
 # --- Per-dataset build advisory lock (multi-worker safety) ----------------

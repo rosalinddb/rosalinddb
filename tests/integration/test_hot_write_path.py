@@ -253,6 +253,183 @@ def test_flag_on_last_write_wins_on_reupsert(
     assert emb.startswith("[9"), f"last write did not win: {emb}"
 
 
+def test_flag_on_intra_batch_duplicate_id_last_write_wins(
+    monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+):
+    """A duplicate id WITHIN one POST collapses to one row; the LAST input wins.
+
+    The set-based UPSERT cannot list the same conflict key twice, so the batch
+    is deduped to the latest occurrence per id before the write. The surviving
+    row carries the later embedding and the later (higher) LSN.
+    """
+    import adapters.state.state as state_mod
+    importlib.reload(state_mod)
+    monkeypatch.setenv("RB_HOT_DSN", hot_url)
+    state_mod._HOT_MIGRATED = False
+    state_mod.migrate_hot(force=True)
+    _truncate_hot(hot_url)
+
+    client, _ = _on_client(
+        monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+    )
+    s = _signup(client, email="dup@example.com")
+    client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "d", "dimension": 4})
+    tenant = _tenant_of(s)
+
+    # Same id "k" sent twice in one body, plus a distinct id "other".
+    body = "\n".join([
+        json.dumps({"id": "k", "values": [1.0, 0, 0, 0]}),
+        json.dumps({"id": "other", "values": [5.0, 0, 0, 0]}),
+        json.dumps({"id": "k", "values": [9.0, 0, 0, 0]}),
+    ])
+    r = client.post(
+        "/v1/datasets/d/vectors",
+        headers={**_auth(s["token"]), "Content-Type": "application/x-ndjson"},
+        data=body,
+    )
+    assert r.status_code == 200, r.text
+    # All three lines validated; the service reports them accepted, the hot
+    # write collapses the duplicate id to one row.
+    assert r.json()["accepted"] == 3
+
+    rows = _hot_rows(hot_url, tenant, "d")
+    ids = sorted(row[0] for row in rows)
+    assert ids == ["k", "other"], f"duplicate id must collapse to one row: {rows}"
+
+    # The surviving "k" carries the second write's embedding + the higher LSN.
+    conn = psycopg2.connect(hot_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT embedding, lsn FROM hot_vectors "
+                "WHERE tenant_id=%s AND dataset=%s AND id='k'",
+                (tenant, "d"),
+            )
+            emb, lsn_k = cur.fetchone()
+            cur.execute(
+                "SELECT lsn FROM hot_vectors "
+                "WHERE tenant_id=%s AND dataset=%s AND id='other'",
+                (tenant, "d"),
+            )
+            lsn_other = cur.fetchone()[0]
+    finally:
+        conn.close()
+    assert emb.startswith("[9"), f"last write did not win: {emb}"
+    assert lsn_k > lsn_other, f"surviving dup must carry the later LSN: {lsn_k} {lsn_other}"
+
+
+def test_flag_on_batch_rollback_persists_nothing(
+    monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+):
+    """A mid-batch hot-write failure rolls back the WHOLE POST — no partial rows.
+
+    A dimension-correct-but-out-of-float4-range value is caught by validation
+    now, so to exercise the TRANSACTION rollback we inject a failure into the
+    hot UPSERT directly (the real `execute_values` is wrapped to raise after the
+    LSN block is allocated). The single transaction must leave hot_vectors AND
+    the LSN sequence unchanged, and the endpoint returns the 503 envelope.
+    """
+    import adapters.state.state as state_mod
+    importlib.reload(state_mod)
+    monkeypatch.setenv("RB_HOT_DSN", hot_url)
+    state_mod._HOT_MIGRATED = False
+    state_mod.migrate_hot(force=True)
+    _truncate_hot(hot_url)
+
+    client, live_state = _on_client(
+        monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+    )
+    s = _signup(client, email="rollback@example.com")
+    client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "rb", "dimension": 4})
+    tenant = _tenant_of(s)
+
+    # Make the multi-row UPSERT fail AFTER the LSN block has been allocated in
+    # the same transaction. The connection-level rollback must then undo the
+    # seq increment too, so the failed POST leaves zero footprint.
+    def _boom(*a, **k):
+        raise psycopg2.OperationalError("simulated hot-store failure")
+
+    monkeypatch.setattr(live_state, "execute_values", _boom)
+
+    body = "\n".join(
+        json.dumps({"id": f"r{i}", "values": [0.1 * i, 0.2, 0.3, 0.4]}) for i in range(3)
+    )
+    r = client.post(
+        "/v1/datasets/rb/vectors",
+        headers={**_auth(s["token"]), "Content-Type": "application/x-ndjson"},
+        data=body,
+    )
+    assert r.status_code == 503, r.text
+    assert r.json()["error"]["code"] == "hot_write_failed"
+
+    # No partial rows persisted...
+    assert _hot_rows(hot_url, tenant, "rb") == [], "rollback must persist NO rows"
+    # ...and the LSN sequence was rolled back too (no row, or last_lsn == 0).
+    conn = psycopg2.connect(hot_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT last_lsn FROM hot_lsn_seq WHERE tenant_id=%s AND dataset=%s",
+                (tenant, "rb"),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    assert row is None or row[0] == 0, f"LSN seq must roll back with the batch: {row}"
+
+
+def test_flag_on_concurrent_writers_keep_lsn_monotonic(
+    monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+):
+    """Concurrent POSTs to one (tenant, dataset) yield a gap-free, unique LSN set.
+
+    The seq-row upsert-increment is serialised by Postgres, so even with writers
+    racing, the union of all assigned LSNs over the dataset is a contiguous,
+    duplicate-free range 1..total — strict per-(tenant, dataset) monotonicity.
+    """
+    import threading
+
+    import adapters.state.state as state_mod
+    importlib.reload(state_mod)
+    monkeypatch.setenv("RB_HOT_DSN", hot_url)
+    state_mod._HOT_MIGRATED = False
+    state_mod.migrate_hot(force=True)
+    _truncate_hot(hot_url)
+
+    client, _ = _on_client(
+        monkeypatch, hot_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+    )
+    s = _signup(client, email="concurrent@example.com")
+    client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "c", "dimension": 4})
+    tenant = _tenant_of(s)
+
+    # `hot_upsert_vectors` opens its own dedicated connection per call, so it is
+    # safe to call from multiple threads concurrently against the same dataset.
+    n_writers = 6
+    per_writer = 5
+
+    def _writer(w):
+        recs = [
+            {"id": f"w{w}-r{i}", "values": [float(w), float(i), 0.0, 0.0], "metadata": {}}
+            for i in range(per_writer)
+        ]
+        state_mod.hot_upsert_vectors(tenant, "c", recs)
+
+    threads = [threading.Thread(target=_writer, args=(w,)) for w in range(n_writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    rows = _hot_rows(hot_url, tenant, "c")
+    lsns = sorted(row[1] for row in rows)
+    total = n_writers * per_writer
+    assert len(rows) == total, f"every record persisted exactly once: {len(rows)}"
+    # Strict monotonicity: the LSN set is the contiguous range 1..total with no
+    # gaps and no duplicates, despite the concurrent allocation.
+    assert lsns == list(range(1, total + 1)), f"LSNs not gap-free/unique: {lsns}"
+
+
 # --- flag OFF -------------------------------------------------------------
 
 

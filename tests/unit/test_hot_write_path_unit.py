@@ -87,9 +87,13 @@ def test_delta_tier_falsy_values(state, monkeypatch, falsy):
 class _FakeCursor:
     """A psycopg2-cursor stand-in that records executed SQL + params.
 
-    `RETURNING last_lsn` is faked by handing back a monotonically increasing
-    integer per `hot_lsn_seq` upsert, so the write path's LSN allocation can be
-    asserted without a real Postgres.
+    The write path now allocates the whole LSN block in ONE upsert-increment
+    (`last_lsn = last_lsn + N`) and applies the batch in ONE multi-row UPSERT
+    (via `psycopg2.extras.execute_values`, which renders the rows into a single
+    `cur.execute`). `RETURNING last_lsn` is faked by advancing a running counter
+    by the requested block size (the 3rd param of the seq upsert), so the
+    returned value is the LAST lsn in the block — exactly the contract the
+    production code assigns the range `last_lsn-N+1 .. last_lsn` from.
     """
 
     def __init__(self):
@@ -105,7 +109,11 @@ class _FakeCursor:
     def execute(self, sql, params=None):
         self.calls.append((sql, params))
         if "hot_lsn_seq" in sql and "RETURNING" in sql:
-            self._lsn += 1
+            # The block size N is bound as the 3rd positional param
+            # (VALUES (tenant, dataset, N) ...). Advance by N and return the
+            # last lsn in the freshly-reserved block.
+            block = params[2] if params else 1
+            self._lsn += block
 
     def fetchone(self):
         return (self._lsn,)
@@ -140,19 +148,39 @@ class _FakeConn:
 
 
 def _on_state(state, monkeypatch):
-    """Turn the tier on and return a fake hot connection bound into the module."""
+    """Turn the tier on and return (conn, cur, upserts).
+
+    The set-based write applies the batch in ONE multi-row UPSERT via
+    `psycopg2.extras.execute_values` (imported by-name into `state`). Driving the
+    real `execute_values` needs a live connection encoding, so stub it with a
+    recorder that captures the rendered SQL + the per-row params — that is the
+    call shape the test asserts. `upserts` is the list of recorded
+    `(sql, rows, template)` tuples.
+    """
     monkeypatch.setenv("RB_HOT_DSN", "postgresql://u:p@hot:5432/hot")
     monkeypatch.setenv("RB_DELTA_TIER", "true")
     importlib.reload(state)
     cur = _FakeCursor()
     conn = _FakeConn(cur)
     monkeypatch.setattr(state, "_hot_conn", lambda: conn)
-    return conn, cur
+    upserts: list[tuple] = []
+
+    def _fake_execute_values(c, sql, rows, template=None, **kw):
+        assert c is cur
+        upserts.append((sql, list(rows), template))
+
+    monkeypatch.setattr(state, "execute_values", _fake_execute_values)
+    return conn, cur, upserts
 
 
-def test_hot_upsert_assigns_monotonic_lsn_and_upserts(state, monkeypatch):
-    """Each record gets the next LSN and an UPSERT into hot_vectors."""
-    conn, cur = _on_state(state, monkeypatch)
+def test_hot_upsert_allocates_lsn_block_and_single_upsert(state, monkeypatch):
+    """N LSNs are allocated in ONE statement; the batch is ONE multi-row UPSERT.
+
+    Round-trip count is now ~2 (one seq block-allocation + one multi-row UPSERT),
+    NOT 2N. Each record is stamped with its LSN from the contiguous block in
+    input order.
+    """
+    conn, cur, upserts = _on_state(state, monkeypatch)
     records = [
         {"id": "a", "values": [1.0, 2.0, 3.0], "metadata": {"k": "v"}},
         {"id": "b", "values": [4.0, 5.0, 6.0], "metadata": {}},
@@ -160,30 +188,66 @@ def test_hot_upsert_assigns_monotonic_lsn_and_upserts(state, monkeypatch):
     written = state.hot_upsert_vectors("t1", "ds", records)
     assert written == 2
 
+    # ONE seq allocation for the whole batch (not one per record).
     seq_calls = [c for c in cur.calls if "hot_lsn_seq" in c[0]]
-    upserts = [c for c in cur.calls if "INSERT INTO hot_vectors" in c[0]]
-    assert len(seq_calls) == 2, "one LSN allocation per record"
-    assert len(upserts) == 2, "one UPSERT per record"
+    assert len(seq_calls) == 1, "the LSN block is allocated in a single statement"
+    # The block size N is bound (VALUES (tenant, dataset, N); +N on conflict).
+    assert seq_calls[0][1] == ("t1", "ds", 2, 2)
 
-    # LSNs are strictly monotonic (1, 2) and stamped onto the matching UPSERT.
-    # UPSERT params: (tenant, dataset, id, embedding_literal, metadata_json, lsn).
-    assert upserts[0][1][0] == "t1" and upserts[0][1][1] == "ds"
-    assert upserts[0][1][2] == "a"
-    assert upserts[0][1][5] == 1
-    assert upserts[1][1][2] == "b"
-    assert upserts[1][1][5] == 2
+    # ONE multi-row UPSERT for the whole batch.
+    assert len(upserts) == 1, "the batch is applied in a single multi-row UPSERT"
+    sql, rows, template = upserts[0]
+    assert len(rows) == 2, "both records in one UPSERT"
+
+    # Rows are (tenant, dataset, id, embedding_literal, metadata_json, lsn).
+    assert rows[0][0] == "t1" and rows[0][1] == "ds"
+    assert rows[0][2] == "a" and rows[0][5] == 1
+    assert rows[1][2] == "b" and rows[1][5] == 2
 
     # The embedding is bound as a pgvector literal; metadata as JSON.
-    assert upserts[0][1][3] == "[1.0,2.0,3.0]"
-    assert json.loads(upserts[0][1][4]) == {"k": "v"}
+    assert rows[0][3] == "[1.0,2.0,3.0]"
+    assert json.loads(rows[0][4]) == {"k": "v"}
 
     # Last-write-wins + tombstone-clear on conflict, scoped to (tenant,ds,id).
-    assert "ON CONFLICT (tenant_id, dataset, id)" in upserts[0][0]
-    assert "deleted   = FALSE" in upserts[0][0]
+    assert "ON CONFLICT (tenant_id, dataset, id)" in sql
+    assert "deleted   = FALSE" in sql
+    # `deleted` is set FALSE for every row via the row template, not per-row.
+    assert template == "(%s, %s, %s, %s, %s, %s, FALSE)"
 
     # The batch committed once and the connection was closed.
     assert conn.committed is True
     assert conn.closed is True
+
+
+def test_hot_upsert_intra_batch_duplicate_id_last_write_wins(state, monkeypatch):
+    """A duplicate id in one batch collapses to one row; the LAST input wins.
+
+    Postgres rejects a multi-row UPSERT that lists the same conflict key twice,
+    so the batch must be deduped before the UPSERT — keeping the latest
+    occurrence (last-write-wins) and giving it a single LSN from the block.
+    """
+    conn, cur, upserts = _on_state(state, monkeypatch)
+    records = [
+        {"id": "dup", "values": [1.0, 1.0, 1.0], "metadata": {"v": 1}},
+        {"id": "other", "values": [2.0, 2.0, 2.0], "metadata": {}},
+        {"id": "dup", "values": [9.0, 9.0, 9.0], "metadata": {"v": 2}},
+    ]
+    written = state.hot_upsert_vectors("t1", "ds", records)
+    # Two distinct ids -> two rows written, two LSNs allocated.
+    assert written == 2
+    seq_calls = [c for c in cur.calls if "hot_lsn_seq" in c[0]]
+    assert seq_calls[0][1] == ("t1", "ds", 2, 2), "block size is the distinct count"
+
+    sql, rows, template = upserts[0]
+    by_id = {r[2]: r for r in rows}
+    assert set(by_id) == {"dup", "other"}, "exactly one row per distinct id"
+
+    # The surviving `dup` row is the LATEST occurrence (values [9,9,9], v=2)...
+    assert by_id["dup"][3] == "[9.0,9.0,9.0]"
+    assert json.loads(by_id["dup"][4]) == {"v": 2}
+    # ...and it carries the LATER LSN (its winning position is last in input).
+    assert by_id["dup"][5] == 2
+    assert by_id["other"][5] == 1
 
 
 def test_hot_upsert_empty_is_noop_no_connection(state, monkeypatch):
