@@ -53,6 +53,11 @@ from services.auth.quota import (
     vector_quota_429,
 )
 
+# Delta-tier (hot tier) flag + sync write path. Default OFF — when off, nothing
+# below is reached and `post_vectors` behaves byte-identically to today (202,
+# landing write, VALIDATE_DATASET). See docs/architecture/delta-tier.md.
+from adapters.state.state import delta_tier_enabled, hot_upsert_vectors
+
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +396,14 @@ async def post_vectors(
     Returns 202 with `{accepted, rejected, errors, job_id}`. The dataset's
     `status` flips through `validating` -> `indexing` -> `indexed` as the
     pipeline progresses; the caller polls via `GET /v1/datasets/{name}`.
+
+    Delta tier (`RB_DELTA_TIER`, default OFF): when on, the write is instead
+    SYNCHRONOUS — each accepted record is UPSERTed into the hot pgvector store
+    (durable + immediately queryable) and the endpoint returns **200** with
+    `{accepted, rejected, errors}` (no `job_id`, no landing write, no
+    `VALIDATE_DATASET`). Validation is identical in both modes. The status code
+    is the only flag-conditional difference; see docs/api/v1.md and
+    docs/architecture/delta-tier.md.
     """
     dataset = state_mod.get_dataset(tenant_id, name)
     if dataset is None:
@@ -458,6 +471,44 @@ async def post_vectors(
             obs_metrics.record_upload("rejected")
             obs_metrics.record_quota_rejection("vector")
             return vector_quota_429(usage)
+
+    # --- delta tier (RB_DELTA_TIER): synchronous hot-tier write path ------
+    #
+    # When the delta tier is on, the write is SYNCHRONOUS: each accepted record
+    # is assigned a per-(tenant, dataset) LSN and UPSERTed into the hot pgvector
+    # store (last-write-wins), making it durable and immediately queryable. We
+    # then return 200 — NOT 202 — because there is nothing async to wait for.
+    #
+    # In this mode we deliberately do NOT write a landing object and do NOT
+    # publish `VALIDATE_DATASET`: the hot→cold flush is a later PR, so until then
+    # flag-on data lives in the hot tier only (acceptable — the flag defaults off
+    # and the full delta tier is not user-complete until the flush ships). The
+    # per-line validation above is identical to the flag-off path, so dimension /
+    # id / metadata rules are unchanged. Body shape is unchanged; `job_id` is
+    # omitted (no async job exists). See docs/architecture/delta-tier.md,
+    # "Write path".
+    if delta_tier_enabled():
+        if accepted_count > 0:
+            # `accepted_lines` are canonical, already-validated NDJSON strings
+            # (id/values/metadata). Parse them back to records for the UPSERT —
+            # the hot write needs the structured embedding, not the wire line.
+            records = [json.loads(line) for line in accepted_lines]
+            # The hot UPSERT is a SYNC psycopg2 round-trip per record against the
+            # separate hot instance; offload it so the CP event loop stays
+            # responsive under a burst (same discipline as the landing write).
+            await run_in_threadpool(
+                hot_upsert_vectors, tenant_id, name, records
+            )
+        obs_metrics.record_upload("accepted" if accepted_count > 0 else "rejected")
+        obs_metrics.record_vectors_ingested(accepted_count)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "accepted": accepted_count,
+                "rejected": rejected_count,
+                "errors": errors,
+            },
+        )
 
     if accepted_count > 0:
         # Persist as a uniquely-named JSONL so successive uploads coexist

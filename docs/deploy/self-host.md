@@ -368,10 +368,21 @@ plane and (when `RB_HOT_DSN` is set) the hot instance. The embedding dimension
 is **per-dataset**: the `hot_vectors.embedding` column is an unparameterised
 pgvector `vector`, so one hot instance serves datasets of differing dimensions.
 
-> The hot-tier *behaviour* (sync write path, query union, flush) lands in
-> later PRs behind `RB_DELTA_TIER`. This release ships only the schema and the
-> separate instance — enabling `RB_HOT_DSN` today provisions and migrates the
-> store but does not yet change request behaviour.
+When `RB_DELTA_TIER=true` (with `RB_HOT_DSN` set), `POST /v1/datasets/{name}/vectors`
+becomes **synchronous**: each accepted record is assigned a per-(tenant,dataset)
+LSN and UPSERTed into the hot store (last-write-wins), then the endpoint returns
+**`200`** instead of `202` — the vector is durable and immediately queryable. In
+this mode the write does **not** land an object or publish a `VALIDATE_DATASET`
+build (those are the eventually-consistent cold path). The status code is the
+only client-visible change; the response body shape is unchanged (`job_id` is
+omitted since there is no async job). See
+[`docs/api/v1.md`](../api/v1.md#post-v1datasetsnamevectors).
+
+> The remaining hot-tier *behaviour* (the query union that merges hot + cold,
+> and the hot→cold flush/compaction) lands in later PRs behind `RB_DELTA_TIER`.
+> Until the flush ships, flag-on writes live in the hot tier only. This is
+> acceptable because the flag defaults off and the full delta tier is not
+> user-complete until those PRs land.
 
 ---
 
