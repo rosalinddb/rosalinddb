@@ -1,9 +1,9 @@
-"""End-to-end integration test for cold-tier vector get/list/delete-by-id.
+"""End-to-end integration test for consolidated-tier vector get/list/delete-by-id.
 
 Drives the full pipeline against real MinIO (testcontainers): ingest -> index
 -> get/list -> delete -> drive the builder's DELETE_VECTORS consumer -> poll
 status -> confirm the id is gone from get, list, AND query. This is the
-flag-independent cold CRUD surface (no `RB_DELTA_TIER`), so it exercises the
+flag-independent consolidated CRUD surface (no `RB_RECALL`), so it exercises the
 shard rewrite + sidecar drop + sweep path the builder's delete handler runs.
 """
 from __future__ import annotations

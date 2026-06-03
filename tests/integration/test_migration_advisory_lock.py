@@ -321,7 +321,7 @@ def test_migration_006_is_idempotent(state):
     assert state.get_tenant_dp_pool("ten_idem") == "dedicated-ten_idem"
 
 
-# --- Migration 008: shard_catalog.durable_lsn column (delta-tier watermark) ---
+# --- Migration 008: shard_catalog.consolidated_lsn column (recall-tier watermark) ---
 
 
 def _shard_catalog_columns(state) -> set:
@@ -334,19 +334,19 @@ def _shard_catalog_columns(state) -> set:
         return {row[0] for row in cur.fetchall()}
 
 
-def test_migration_008_adds_durable_lsn_column_default_zero(state):
-    """Migration 008 adds `shard_catalog.durable_lsn` with a `0` default.
+def test_migration_008_adds_consolidated_lsn_column_default_zero(state):
+    """Migration 008 adds `shard_catalog.consolidated_lsn` with a `0` default.
 
-    A shard inserted after the migration lands on `durable_lsn = 0` with no
-    backfill — the delta tier's watermark is dormant until the tier is enabled,
-    so existing shard logic is unaffected (the cold path is `lsn <= 0` empty hot).
+    A shard inserted after the migration lands on `consolidated_lsn = 0` with no
+    backfill — the recall tier's watermark is dormant until the tier is enabled,
+    so existing shard logic is unaffected (the consolidated path is `lsn <= 0` empty recall).
     """
     state.migrate()
-    assert "durable_lsn" in _shard_catalog_columns(state), (
-        "migration 008 did not add the durable_lsn column"
+    assert "consolidated_lsn" in _shard_catalog_columns(state), (
+        "migration 008 did not add the consolidated_lsn column"
     )
 
-    # A shard created through the normal path defaults to durable_lsn = 0 — no
+    # A shard created through the normal path defaults to consolidated_lsn = 0 — no
     # caller in this PR sets it, so the column is purely additive.
     if state.get_tenant_by_id("ten_lsn") is None:
         state.create_tenant("ten_lsn", "lsn@example.com", "x")
@@ -357,14 +357,14 @@ def test_migration_008_adds_durable_lsn_column_default_zero(state):
     )
     with state._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT durable_lsn FROM shard_catalog "
+            "SELECT consolidated_lsn FROM shard_catalog "
             "WHERE tenant_id=%s AND dataset_name=%s",
             ("ten_lsn", "ds_lsn"),
         )
         rows = cur.fetchall()
     assert rows, "shard row not found"
     assert all(r[0] == 0 for r in rows), (
-        f"durable_lsn default should be 0, got {rows!r}"
+        f"consolidated_lsn default should be 0, got {rows!r}"
     )
 
 
@@ -373,7 +373,7 @@ def test_migration_008_is_idempotent(state):
 
     `_apply_migrations()` skips an already-recorded version; the 008 SQL itself
     is a bare `ADD COLUMN IF NOT EXISTS`, so a direct re-execute is also safe. A
-    durable_lsn value set between passes survives the re-run.
+    consolidated_lsn value set between passes survives the re-run.
     """
     state.migrate()
     if state.get_tenant_by_id("ten_lsn_idem") is None:
@@ -385,7 +385,7 @@ def test_migration_008_is_idempotent(state):
     )
     with state._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "UPDATE shard_catalog SET durable_lsn = 42 "
+            "UPDATE shard_catalog SET consolidated_lsn = 42 "
             "WHERE tenant_id=%s AND dataset_name=%s",
             ("ten_lsn_idem", "ds"),
         )
@@ -394,27 +394,27 @@ def test_migration_008_is_idempotent(state):
     # Re-run the apply loop directly — stands in for a second process booting.
     state._apply_migrations()
 
-    assert "durable_lsn" in _shard_catalog_columns(state)
+    assert "consolidated_lsn" in _shard_catalog_columns(state)
     with state._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT durable_lsn FROM shard_catalog "
+            "SELECT consolidated_lsn FROM shard_catalog "
             "WHERE tenant_id=%s AND dataset_name=%s",
             ("ten_lsn_idem", "ds"),
         )
-        assert cur.fetchone()[0] == 42, "re-run clobbered durable_lsn"
+        assert cur.fetchone()[0] == 42, "re-run clobbered consolidated_lsn"
 
     # A direct re-execute of the 008 SQL file is also a no-op.
     from pathlib import Path
 
     sql = (
-        Path(state.__file__).parent / "migrations" / "008_shard_durable_lsn.sql"
+        Path(state.__file__).parent / "migrations" / "008_shard_consolidated_lsn.sql"
     ).read_text(encoding="utf-8")
     with state._conn() as conn, conn.cursor() as cur:
         cur.execute(sql)
         conn.commit()
     with state._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT durable_lsn FROM shard_catalog "
+            "SELECT consolidated_lsn FROM shard_catalog "
             "WHERE tenant_id=%s AND dataset_name=%s",
             ("ten_lsn_idem", "ds"),
         )

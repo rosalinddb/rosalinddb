@@ -1,15 +1,15 @@
-"""Unit coverage for `POST /vectors` under the `RB_DELTA_TIER` flag.
+"""Unit coverage for `POST /vectors` under the `RB_RECALL` flag.
 
 Hermetic (memory:// state + storage + queue; no Docker, no pgvector). Asserts
 the two flag modes at the HTTP-handler level:
 
   - FLAG OFF (default): 202, a landing object is written, a `VALIDATE_DATASET`
-    message is published, and NO hot connection is EVER attempted (the
-    `psycopg2.connect`-raises trick from PR2 — if the off path touched the hot
+    message is published, and NO recall connection is EVER attempted (the
+    `psycopg2.connect`-raises trick from PR2 — if the off path touched the recall
     store the test would fail loudly).
   - FLAG ON: 200, body `{accepted, rejected, errors}` (no `job_id`), NO landing
-    object, NO `VALIDATE_DATASET`, and the hot UPSERT was called with the
-    accepted records. The real `hot_upsert_vectors` is replaced by a recorder so
+    object, NO `VALIDATE_DATASET`, and the recall UPSERT was called with the
+    accepted records. The real `recall_upsert_vectors` is replaced by a recorder so
     the test needs no database.
 """
 from __future__ import annotations
@@ -30,9 +30,9 @@ def env(monkeypatch):
     monkeypatch.setenv("INDEXES_PREFIX", "memory://rosalinddb/indexes")
     monkeypatch.setenv("LANDING_PREFIX", "memory://rosalinddb/landing")
     monkeypatch.setenv("TENANT_PREFIX", "true")
-    # Default both delta-tier env vars off; on-tests set them explicitly.
-    monkeypatch.delenv("RB_DELTA_TIER", raising=False)
-    monkeypatch.delenv("RB_HOT_DSN", raising=False)
+    # Default both recall-tier env vars off; on-tests set them explicitly.
+    monkeypatch.delenv("RB_RECALL", raising=False)
+    monkeypatch.delenv("RB_RECALL_DSN", raising=False)
 
     import adapters.storage.storage as storage_mod
     importlib.reload(storage_mod)
@@ -123,10 +123,10 @@ def test_flag_off_returns_202_lands_and_publishes(env):
     assert len(msgs) == 1 and msgs[0]["dataset"] == "v"
 
 
-def test_flag_off_never_opens_hot_connection(env, monkeypatch):
-    """The default path must NEVER connect to a hot store (PR2 trick)."""
+def test_flag_off_never_opens_recall_connection(env, monkeypatch):
+    """The default path must NEVER connect to a recall store (PR2 trick)."""
     def _boom(*a, **k):  # pragma: no cover - must never be called
-        raise AssertionError("flag-off path connected to a hot store")
+        raise AssertionError("flag-off path connected to a recall store")
 
     monkeypatch.setattr(env.state.psycopg2, "connect", _boom)
 
@@ -142,17 +142,17 @@ def test_flag_off_never_opens_hot_connection(env, monkeypatch):
     assert r.status_code == 202, r.text
 
 
-# --- flag ON: synchronous hot write --------------------------------------
+# --- flag ON: synchronous recall write --------------------------------------
 
 
-def _enable_delta(env, monkeypatch, recorder):
-    """Flip the flag on at the handler import site and stub the hot UPSERT.
+def _enable_recall(env, monkeypatch, recorder):
+    """Flip the flag on at the handler import site and stub the recall UPSERT.
 
-    `delta_tier_enabled` / `hot_upsert_vectors` are imported by-name into the
+    `recall_enabled` / `recall_upsert_vectors` are imported by-name into the
     source_registry module, so patch the names ON THAT MODULE.
     """
-    monkeypatch.setattr(env.main, "delta_tier_enabled", lambda: True)
-    monkeypatch.setattr(env.main, "hot_upsert_vectors", recorder)
+    monkeypatch.setattr(env.main, "recall_enabled", lambda: True)
+    monkeypatch.setattr(env.main, "recall_upsert_vectors", recorder)
 
 
 def test_flag_on_returns_200_no_landing_no_publish(env, monkeypatch):
@@ -164,7 +164,7 @@ def test_flag_on_returns_200_no_landing_no_publish(env, monkeypatch):
         captured["args"] = (tenant, dataset, records)
         return len(records)
 
-    _enable_delta(env, monkeypatch, _recorder)
+    _enable_recall(env, monkeypatch, _recorder)
 
     s = _signup(env.client)
     env.client.post(
@@ -186,7 +186,7 @@ def test_flag_on_returns_200_no_landing_no_publish(env, monkeypatch):
     assert not any("/landing/" in k for k in new_objs), "flag-on must not land"
     assert _drain_validate() == [], "flag-on must not publish VALIDATE_DATASET"
 
-    # The hot UPSERT got the accepted records, tenant-/dataset-scoped.
+    # The recall UPSERT got the accepted records, tenant-/dataset-scoped.
     tenant, dataset, records = captured["args"]
     assert dataset == "v"
     assert [rec["id"] for rec in records] == ["r0", "r1", "r2"]
@@ -195,7 +195,7 @@ def test_flag_on_returns_200_no_landing_no_publish(env, monkeypatch):
 
 def test_flag_on_validation_unchanged(env, monkeypatch):
     """Flag on: per-line validation is identical — bad lines still rejected."""
-    _enable_delta(env, monkeypatch, lambda t, d, recs: len(recs))
+    _enable_recall(env, monkeypatch, lambda t, d, recs: len(recs))
     s = _signup(env.client)
     env.client.post(
         "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
@@ -220,7 +220,7 @@ def test_flag_on_validation_unchanged(env, monkeypatch):
 
 def test_flag_on_nonexistent_dataset_404(env, monkeypatch):
     """Flag on does not change the 404 contract for a missing dataset."""
-    _enable_delta(env, monkeypatch, lambda t, d, recs: len(recs))
+    _enable_recall(env, monkeypatch, lambda t, d, recs: len(recs))
     s = _signup(env.client)
     r = env.client.post(
         "/v1/datasets/missing/vectors",
@@ -237,8 +237,8 @@ def test_flag_on_nonexistent_dataset_404(env, monkeypatch):
 # default) so they reach validation as Python floats; an out-of-float4-range
 # magnitude is finite Python but overflows pgvector's float4 column. Before the
 # fix these passed source-registry validation: flag-ON then failed the all-or-
-# nothing hot transaction (bare 500, every valid row rolled back), flag-OFF
-# silently cast to float32 (Inf/NaN garbage in a cold shard, 202). Both modes
+# nothing recall transaction (bare 500, every valid row rolled back), flag-OFF
+# silently cast to float32 (Inf/NaN garbage in a consolidated shard, 202). Both modes
 # must now reject them PER-LINE — not a 500, not a silent accept.
 
 # (id, line-json) pairs whose `values` must be rejected per-line.
@@ -275,19 +275,19 @@ def test_flag_off_rejects_non_finite_and_overflow_per_line(env, kind):
 
 @pytest.mark.parametrize("kind", list(_BAD_VALUE_BODIES))
 def test_flag_on_rejects_non_finite_and_overflow_per_line(env, monkeypatch, kind):
-    """Flag ON: same rejection — per-line, never reaching the hot write as a 500.
+    """Flag ON: same rejection — per-line, never reaching the recall write as a 500.
 
-    The hot UPSERT is stubbed to BLOW UP if it is ever handed a bad value, so
-    the test proves rejection happens in validation (before the hot write), not
-    via a hot-store transaction failure.
+    The recall UPSERT is stubbed to BLOW UP if it is ever handed a bad value, so
+    the test proves rejection happens in validation (before the recall write), not
+    via a recall-store transaction failure.
     """
     def _recorder(tenant, dataset, records):
         for rec in records:
             for v in rec["values"]:
-                assert v == v and abs(v) != float("inf"), "bad value reached hot write"
+                assert v == v and abs(v) != float("inf"), "bad value reached recall write"
         return len(records)
 
-    _enable_delta(env, monkeypatch, _recorder)
+    _enable_recall(env, monkeypatch, _recorder)
     s = _signup(env.client, email=f"on-{kind}@example.com")
     env.client.post(
         "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
@@ -306,20 +306,20 @@ def test_flag_on_rejects_non_finite_and_overflow_per_line(env, monkeypatch, kind
     assert any("finite" in x for x in reasons), reasons
 
 
-# --- hot-write failure stays in the v1 error envelope ---------------------
+# --- recall-write failure stays in the v1 error envelope ---------------------
 
 
-def test_flag_on_hot_write_failure_returns_503_envelope(env, monkeypatch):
-    """A hot-store failure maps to a structured 503, not a raw 500.
+def test_flag_on_recall_write_failure_returns_503_envelope(env, monkeypatch):
+    """A recall-store failure maps to a structured 503, not a raw 500.
 
     The whole batch is one transaction, so a failure persists nothing; the
     response must be the v1 envelope `{error:{code,message}}` with code
-    `hot_write_failed`.
+    `recall_write_failed`.
     """
     def _boom(tenant, dataset, records):
-        raise RuntimeError("connection to hot store dropped")
+        raise RuntimeError("connection to recall store dropped")
 
-    _enable_delta(env, monkeypatch, _boom)
+    _enable_recall(env, monkeypatch, _boom)
     s = _signup(env.client, email="boom@example.com")
     env.client.post(
         "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
@@ -331,5 +331,5 @@ def test_flag_on_hot_write_failure_returns_503_envelope(env, monkeypatch):
     )
     assert r.status_code == 503, r.text
     body = r.json()
-    assert body["error"]["code"] == "hot_write_failed"
+    assert body["error"]["code"] == "recall_write_failed"
     assert "message" in body["error"]
