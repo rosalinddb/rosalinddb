@@ -12,9 +12,9 @@ Endpoints:
   - GET    /v1/datasets                       list the tenant's datasets
   - GET    /v1/datasets/{name}               get a single dataset
   - DELETE /v1/datasets/{name}               soft-delete
-  - GET    /v1/datasets/{name}/vectors/{id}  get one cold-tier vector by id
-  - GET    /v1/datasets/{name}/vectors       list cold-tier vectors (filter + pagination)
-  - DELETE /v1/datasets/{name}/vectors/{id}  delete one cold-tier vector by id
+  - GET    /v1/datasets/{name}/vectors/{id}  get one consolidated-tier vector by id
+  - GET    /v1/datasets/{name}/vectors       list consolidated-tier vectors (filter + pagination)
+  - DELETE /v1/datasets/{name}/vectors/{id}  delete one consolidated-tier vector by id
 """
 
 import base64
@@ -54,10 +54,10 @@ from services.auth.quota import (
     vector_quota_429,
 )
 
-# Delta-tier (hot tier) flag + sync write path. Default OFF — when off, nothing
-# below is reached and `post_vectors` behaves byte-identically to today (202,
-# landing write, VALIDATE_DATASET). See docs/architecture/delta-tier.md.
-from adapters.state.state import delta_tier_enabled, hot_upsert_vectors
+# Recall-tier flag + sync write path. Default OFF — when off, nothing below is
+# reached and `post_vectors` behaves byte-identically to today (202, landing
+# write, VALIDATE_DATASET). See docs/architecture/recall-consolidate.md.
+from adapters.state.state import recall_enabled, recall_upsert_vectors
 
 
 logger = logging.getLogger(__name__)
@@ -194,9 +194,10 @@ def how_to_connect():
 _DATASET_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 _INGEST_MAX_BYTES = int(os.getenv("INGEST_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MiB
 # Largest finite float4 (single-precision). Embeddings are stored as pgvector
-# `vector` (float4) in the hot tier and cast to float32 on the cold path, so a
-# magnitude beyond this overflows to Infinity on storage. Validation rejects
-# any value above it (or non-finite) per-line, identically in both flag modes.
+# `vector` (float4) in the recall tier and cast to float32 on the consolidated
+# path, so a magnitude beyond this overflows to Infinity on storage. Validation
+# rejects any value above it (or non-finite) per-line, identically in both flag
+# modes.
 _FLOAT4_MAX = 3.4028235e38
 _LANDING_PREFIX = os.getenv("LANDING_PREFIX", "s3://rosalinddb/landing")
 # Raw bulk-import uploads are staged OUTSIDE the dataset landing prefix so
@@ -403,13 +404,13 @@ async def post_vectors(
     `status` flips through `validating` -> `indexing` -> `indexed` as the
     pipeline progresses; the caller polls via `GET /v1/datasets/{name}`.
 
-    Delta tier (`RB_DELTA_TIER`, default OFF): when on, the write is instead
-    SYNCHRONOUS — each accepted record is UPSERTed into the hot pgvector store
+    Recall tier (`RB_RECALL`, default OFF): when on, the write is instead
+    SYNCHRONOUS — each accepted record is UPSERTed into the recall pgvector store
     (durable + immediately queryable) and the endpoint returns **200** with
     `{accepted, rejected, errors}` (no `job_id`, no landing write, no
     `VALIDATE_DATASET`). Validation is identical in both modes. The status code
     is the only flag-conditional difference; see docs/api/v1.md and
-    docs/architecture/delta-tier.md.
+    docs/architecture/recall-consolidate.md.
     """
     dataset = state_mod.get_dataset(tenant_id, name)
     if dataset is None:
@@ -478,55 +479,59 @@ async def post_vectors(
             obs_metrics.record_quota_rejection("vector")
             return vector_quota_429(usage)
 
-    # --- delta tier (RB_DELTA_TIER): synchronous hot-tier write path ------
+    # --- recall tier (RB_RECALL): synchronous recall-tier write path ------
     #
-    # When the delta tier is on, the write is SYNCHRONOUS: each accepted record
-    # is assigned a per-(tenant, dataset) LSN and UPSERTed into the hot pgvector
-    # store (last-write-wins), making it durable and immediately queryable. We
-    # then return 200 — NOT 202 — because there is nothing async to wait for.
+    # When the recall tier is on, the write is SYNCHRONOUS: each accepted record
+    # is assigned a per-(tenant, dataset) LSN and UPSERTed into the recall
+    # pgvector store (last-write-wins), making it durable and immediately
+    # queryable. We then return 200 — NOT 202 — because there is nothing async to
+    # wait for.
     #
     # In this mode we deliberately do NOT write a landing object and do NOT
-    # publish `VALIDATE_DATASET`: the hot→cold flush is a later PR, so until then
-    # flag-on data lives in the hot tier only (acceptable — the flag defaults off
-    # and the full delta tier is not user-complete until the flush ships). The
-    # per-line validation above is identical to the flag-off path, so dimension /
-    # id / metadata rules are unchanged. Body shape is unchanged; `job_id` is
-    # omitted (no async job exists). See docs/architecture/delta-tier.md,
-    # "Write path".
-    if delta_tier_enabled():
+    # publish `VALIDATE_DATASET`: the recall→consolidated consolidation is a later
+    # PR, so until then flag-on data lives in the recall tier only (acceptable —
+    # the flag defaults off and the full recall tier is not user-complete until
+    # consolidation ships). The per-line validation above is identical to the
+    # flag-off path, so dimension / id / metadata rules are unchanged. Body shape
+    # is unchanged; `job_id` is omitted (no async job exists). See
+    # docs/architecture/recall-consolidate.md, "Write path".
+    if recall_enabled():
         if accepted_count > 0:
             # `accepted_lines` are canonical, already-validated NDJSON strings
             # (id/values/metadata). Parse them back to records for the UPSERT —
-            # the hot write needs the structured embedding, not the wire line.
+            # the recall write needs the structured embedding, not the wire line.
             records = [json.loads(line) for line in accepted_lines]
-            # The hot UPSERT is a SYNC psycopg2 batch round-trip against the
-            # separate hot instance; offload it so the CP event loop stays
+            # The recall UPSERT is a SYNC psycopg2 batch round-trip against the
+            # separate recall instance; offload it so the CP event loop stays
             # responsive under a burst (same discipline as the landing write).
             #
-            # The hot store is a SEPARATE data-plane instance (RB_HOT_DSN): a
-            # connection drop, statement timeout, or constraint failure surfaces
-            # as a psycopg2 error here. Map any such failure into the v1 error
-            # envelope (503 hot_write_failed) so the contract holds instead of a
-            # raw 500 leaking outside `{error:{code,message}}`. The whole batch
-            # is one transaction, so a failure leaves the hot tier unchanged.
+            # The recall store is a SEPARATE data-plane instance (RB_RECALL_DSN):
+            # a connection drop, statement timeout, or constraint failure
+            # surfaces as a psycopg2 error here. Map any such failure into the v1
+            # error envelope (503 recall_write_failed) so the contract holds
+            # instead of a raw 500 leaking outside `{error:{code,message}}`. The
+            # whole batch is one transaction, so a failure leaves the recall tier
+            # unchanged.
             #
             # KNOWN FOLLOW-UP (quota leak): `try_consume_vectors` above already
-            # COMMITTED the quota increment before this write. If the hot write
+            # COMMITTED the quota increment before this write. If the recall write
             # fails, that quota stays consumed (no refund). Refund/compensation
             # is deliberately out of scope for this PR — tracked as a follow-up.
             try:
                 await run_in_threadpool(
-                    hot_upsert_vectors, tenant_id, name, records
+                    recall_upsert_vectors, tenant_id, name, records
                 )
-            except Exception:  # noqa: BLE001 - any hot-store failure -> 503
+            except Exception:  # noqa: BLE001 - any recall-store failure -> 503
                 logger.exception(
-                    "hot-tier write failed for tenant=%s dataset=%s", tenant_id, name
+                    "recall-tier write failed for tenant=%s dataset=%s",
+                    tenant_id,
+                    name,
                 )
                 obs_metrics.record_upload("rejected")
                 return _err(
                     503,
-                    "hot_write_failed",
-                    "Hot-tier write failed; the batch was not persisted",
+                    "recall_write_failed",
+                    "Recall-tier write failed; the batch was not persisted",
                 )
         obs_metrics.record_upload("accepted" if accepted_count > 0 else "rejected")
         obs_metrics.record_vectors_ingested(accepted_count)
@@ -586,13 +591,14 @@ async def post_vectors(
     )
 
 
-# --- cold-tier vector CRUD ------------------------------------------------
+# --- consolidated-tier vector CRUD ----------------------------------------
 #
 # Get / list / delete a single vector by its customer-supplied string id,
-# served from the immutable cold shards (the FAISS index + its `.meta.json`
-# sidecar). This surface is INDEPENDENT of the delta tier (`RB_DELTA_TIER`) —
-# it works against today's async-built shards. The hot↔cold union for these
-# operations is a later PR (see docs/architecture/delta-tier.md, PR6).
+# served from the immutable consolidated shards (the FAISS index + its
+# `.meta.json` sidecar). This surface is INDEPENDENT of the recall tier
+# (`RB_RECALL`) — it works against today's async-built shards. The
+# recall↔consolidated union for these operations is a later PR (see
+# docs/architecture/recall-consolidate.md, PR6).
 #
 # The sidecar maps each SHA1->int64 hash (the same `id_to_int64` the builder
 # stamps onto every FAISS vector) back to `{id, metadata}`. Get/delete hash
@@ -641,8 +647,8 @@ def _newest_sidecar(tenant_id: str, dataset: str) -> Optional[dict]:
     """Return the newest shard's parsed `.meta.json` sidecar, or None.
 
     None means there is no shard yet for `(tenant_id, dataset)` — the caller
-    treats that as an empty cold tier (404 for get/delete-by-id, empty list
-    for list). Tenant-scoped via `get_latest_shard`.
+    treats that as an empty consolidated tier (404 for get/delete-by-id, empty
+    list for list). Tenant-scoped via `get_latest_shard`.
     """
     shard = state_mod.get_latest_shard(tenant_id, dataset)
     if shard is None:
@@ -657,7 +663,7 @@ def get_vector_endpoint(
     tenant_id: str = Depends(current_tenant_id),
     _rl: None = Depends(rate_limit),
 ):
-    """Get one cold-tier vector by id. Returns `{id, metadata}`.
+    """Get one consolidated-tier vector by id. Returns `{id, metadata}`.
 
     Resolves the newest shard, reads its sidecar, hashes `vector_id` with the
     builder's SHA1->int64, and looks it up. `404 not_found` when there is no
@@ -686,7 +692,7 @@ def list_vectors_endpoint(
     tenant_id: str = Depends(current_tenant_id),
     _rl: None = Depends(rate_limit),
 ):
-    """List cold-tier vectors with an optional `filter` and pagination.
+    """List consolidated-tier vectors with an optional `filter` and pagination.
 
     Reads the newest shard's sidecar, applies an optional AND-of-equals
     `filter` (a JSON object, reusing the query path's `metadata_matches_filter`
@@ -773,7 +779,7 @@ def delete_vector_endpoint(
     tenant_id: str = Depends(current_tenant_id),
     _rl: None = Depends(rate_limit),
 ):
-    """Delete one cold-tier vector by id. Returns `202 {job_id}`.
+    """Delete one consolidated-tier vector by id. Returns `202 {job_id}`.
 
     Publishes a `DELETE_VECTORS` message; the index builder's `DELETE_VECTORS`
     consumer loads the newest shard, removes the hashed id, rewrites the
@@ -807,7 +813,7 @@ def delete_vector_endpoint(
         {"dataset": name, "tenant": tenant_id, "id": vector_id, "job_id": job_id},
     )
     # Only flip to `indexing` when a shard exists. With no shard the delete is
-    # a no-op against the cold tier — flipping status here would falsely report
+    # a no-op against the consolidated tier — flipping status here would falsely report
     # `indexing`/`indexed` on an `empty`/`error` dataset and mask its real state.
     if state_mod.get_latest_shard(tenant_id, name) is not None:
         state_mod.update_dataset_status(tenant_id, name, "indexing")
@@ -1144,13 +1150,13 @@ def _validate_ndjson_record(obj, expected_dim: int) -> Optional[str]:
     if len(values) != expected_dim:
         return f"dimension mismatch: got {len(values)} expected {expected_dim}"
     # Reject NaN / +-Infinity and magnitudes that overflow float4 BEFORE the
-    # write splits on the flag. The hot tier stores embeddings as pgvector
+    # write splits on the flag. The recall tier stores embeddings as pgvector
     # `vector` (float4) which rejects non-finite and out-of-range values at
     # insert time: without this guard a flag-ON batch would fail the all-or-
     # nothing transaction and roll back EVERY valid record as a bare 500, while
     # the flag-OFF path silently cast the same value to float32 and returned
-    # 202 (Inf/NaN landing as garbage in a cold shard). Rejecting per-line here
-    # makes both modes behave identically and closes the cold-path hole.
+    # 202 (Inf/NaN landing as garbage in a consolidated shard). Rejecting per-line
+    # here makes both modes behave identically and closes the consolidated-path hole.
     if not all(math.isfinite(x) and abs(x) <= _FLOAT4_MAX for x in values):
         return "values must be finite and within float4 range"
     metadata = obj.get("metadata")
