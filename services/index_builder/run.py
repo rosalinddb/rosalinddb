@@ -33,7 +33,7 @@ import time
 import threading
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional
+from typing import List, Optional
 
 import faiss  # type: ignore
 import numpy as np
@@ -60,6 +60,7 @@ from adapters.state.state import (
 )
 from adapters.storage.storage import delete as storage_delete, exists as storage_exists
 from adapters.landing.parquet_reader import (
+    id_to_int64 as _id_to_int64,
     list_landing_parts,
     read_landing_parts,
     read_shard_sidecar,
@@ -201,15 +202,11 @@ def _landing_prefix(dataset: str, tenant: str) -> str:
     return f"{base}{dataset}"
 
 
-def _id_to_int64(raw_id: str) -> int:
-    """Map a string id to a signed 63-bit int (FAISS IDMap accepts int64).
-
-    SHA1 then mask off the sign bit. FAISS rejects negative ids in IDMap so
-    we keep the top bit zero. Collisions are theoretically possible but
-    irrelevant at MVP scale (<1M vectors per dataset).
-    """
-    h = hashlib.sha1(raw_id.encode("utf-8")).digest()
-    return int.from_bytes(h[:8], "big") & 0x7FFFFFFFFFFFFFFF
+# `_id_to_int64` is the shared SHA1->int64 hash, now sourced from
+# `adapters.landing.parquet_reader` (imported above) so the cold-tier CRUD
+# surface in `source_registry` hashes ids to the EXACT same int64 the builder
+# stamps onto FAISS vectors. Re-exported under the private name so the build
+# path's many call sites stay unchanged.
 
 
 def build_ivfflat(vectors: np.ndarray, ids: np.ndarray | None = None) -> bytes:
@@ -567,6 +564,107 @@ def run_once(dataset: str, tenant: str) -> int:
         return _run_once_locked(dataset, tenant)
 
 
+def _write_shard(
+    tenant: str,
+    dataset: str,
+    blob: bytes,
+    sidecar_blob: bytes,
+    total_vectors: int,
+    index_type_str: str,
+    *,
+    build_type: str,
+    indexed_uris: List[str],
+) -> str:
+    """Write a freshly-built shard + sidecar, catalog it, reconcile, prewarm.
+
+    The shared tail of every build path: the FAISS `blob` and its JSON
+    `sidecar_blob` are written to object storage under a collision-proof URI,
+    a `shard_catalog` row is added (which supersedes the previous newest
+    shard), `dataset.row_count` is reconciled to `total_vectors`, and an
+    opt-in `PREWARM_SHARD` hint is published. Returns the shard URI.
+
+    Extracted from `_run_once_locked` so the `DELETE_VECTORS` path
+    (`run_delete_once`) reuses the EXACT same write/catalog/prewarm behaviour
+    instead of duplicating it — a delete is just another way to produce the
+    next shard generation. The caller owns the per-dataset advisory lock and
+    the status flip + sweep (which differ slightly between build and delete).
+    """
+    checksum = hashlib.sha256(blob).hexdigest()
+    # Shard filename must be collision-proof: two builds completing in the
+    # same millisecond would otherwise produce the same name and the second
+    # `write_bytes` would silently overwrite the first shard's `.bin`. A short
+    # uuid suffix makes the name unique. The filename is NOT load-bearing for
+    # ordering — `shard_catalog` orders strictly by `created_at` (Postgres) /
+    # insertion `id` (memory mode), and the `.meta.json` sidecar name is
+    # derived from this (now-unique) shard name, so a random suffix is safe.
+    shard_name = f"shard-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.bin"
+    # `_compute_shard_uri` picks the legacy vs. versioned shape based on
+    # `RB_SHARD_VERSIONED_URIS`. Default (off) is bit-identical to the inline
+    # construction this replaces.
+    shard_uri = _compute_shard_uri(tenant, dataset, shard_name, blob)
+    with landing_write_span(uri=shard_uri):
+        write_bytes(shard_uri, blob)
+        # Persist the id/metadata sidecar alongside the shard so the query
+        # path can invert FAISS's int64 hashes back to the customer's original
+        # string ids. For an incremental build this is the merged map (old
+        # shard's sidecar + new batch); for a delete it is the old sidecar
+        # minus the deleted id.
+        write_bytes(f"{shard_uri}.meta.json", sidecar_blob)
+    add_shard(
+        tenant,
+        dataset,
+        shard_uri,
+        checksum,
+        total_vectors,
+        index_type_str,
+        build_type=build_type,
+        indexed_landing_uris=indexed_uris,
+    )
+    # Reconcile dataset.row_count to the just-built shard's true unique-vector
+    # count. The validator's `increment_row_count` runs per-batch without
+    # knowing which ids already exist, so a batch that upserts existing ids
+    # over-counts (re-ingesting `id="x"` would otherwise double `row_count`
+    # every retry). `total_vectors == index.ntotal` AFTER the incremental
+    # path's `remove_ids` + `add_with_ids` (or a delete's `remove_ids`), which
+    # is the authoritative count of unique live ids in the dataset (one shard
+    # per dataset is the steady-state invariant — the sweep retains the newest
+    # shard plus one grace-buffer second-newest; older shards are purged).
+    # `set_row_count` is idempotent so a builder retry that re-commits the same
+    # shard leaves `row_count` unchanged, and self-heals any pre-existing drift.
+    try:
+        set_row_count(tenant, dataset, total_vectors)
+    except Exception as exc:  # noqa: BLE001
+        # Best-effort: a row_count reconcile failure must not fail the build —
+        # the shard is durable and queryable. The next successful build
+        # re-runs the reconcile.
+        print(f"builder: set_row_count failed for {tenant}/{dataset}: {exc}")
+    # Opt-in prewarm hint. The catalog row is now durable; publish a
+    # PREWARM_SHARD message so a DP with the consumer enabled
+    # (`RB_PREWARM_CONSUMER=true`) can speculatively admit the shard before the
+    # first query lands. Gated on `RB_PREWARM_ON_BUILD=true` so the rollback
+    # contract holds: an unset env preserves current behaviour. The publish
+    # runs AFTER `add_shard` so a queue-side failure cannot leave a PREWARM
+    # message pointing at an uncataloged shard, and is wrapped in best-effort
+    # error handling so a queue blip cannot fail an otherwise-successful build.
+    if os.getenv("RB_PREWARM_ON_BUILD", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        try:
+            publish(
+                "PREWARM_SHARD",
+                {"tenant": tenant, "dataset": dataset, "shard_uri": shard_uri},
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A queue failure on the prewarm hint must NOT fail the build — the
+            # shard is on object storage and in the catalog. The first query
+            # covers the rendezvous-elected DP via a normal cache miss.
+            print(
+                "builder: PREWARM_SHARD publish failed for "
+                f"{tenant}/{dataset} ({shard_uri}): {exc}"
+            )
+    return shard_uri
+
+
 def _run_once_locked(dataset: str, tenant: str) -> int:
     """Run the actual build — caller holds the per-dataset advisory lock.
 
@@ -708,91 +806,16 @@ def _run_once_locked(dataset: str, tenant: str) -> int:
                 total_vectors = int(vectors.shape[0])
                 indexed_uris = sorted(new_parts)
 
-            checksum = hashlib.sha256(blob).hexdigest()
-            # Shard filename must be collision-proof: two builds completing in
-            # the same millisecond would otherwise produce the same name and
-            # the second `write_bytes` would silently overwrite the first
-            # shard's `.bin`. A short uuid suffix makes the name unique. The
-            # filename is NOT load-bearing for ordering — `shard_catalog`
-            # orders strictly by `created_at` (Postgres) / insertion `id`
-            # (memory mode), and the `.meta.json` sidecar name is derived
-            # from this (now-unique) shard name, so a random suffix is safe.
-            shard_name = f"shard-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.bin"
-            # `_compute_shard_uri` picks the legacy vs. versioned shape based
-            # on `RB_SHARD_VERSIONED_URIS`. Default (off) is bit-identical to
-            # the inline construction this replaces.
-            shard_uri = _compute_shard_uri(tenant, dataset, shard_name, blob)
-            with landing_write_span(uri=shard_uri):
-                write_bytes(shard_uri, blob)
-                # Persist the id/metadata sidecar alongside the shard so the
-                # query path can invert FAISS's int64 hashes back to the
-                # customer's original string ids. For an incremental build
-                # this is the merged map (old shard's sidecar + new batch).
-                write_bytes(f"{shard_uri}.meta.json", sidecar_blob)
-            add_shard(
+            _write_shard(
                 tenant,
                 dataset,
-                shard_uri,
-                checksum,
+                blob,
+                sidecar_blob,
                 total_vectors,
                 index_type_str,
                 build_type=build_type,
-                indexed_landing_uris=indexed_uris,
+                indexed_uris=indexed_uris,
             )
-            # Reconcile dataset.row_count to the just-built shard's true
-            # unique-vector count. The validator's `increment_row_count`
-            # runs per-batch without knowing which ids already exist, so a
-            # batch that upserts existing ids over-counts (re-ingesting
-            # `id="x"` would otherwise double `row_count` every retry).
-            # `total_vectors == index.ntotal` AFTER the
-            # incremental path's `remove_ids` + `add_with_ids`, which is
-            # the authoritative count of unique live ids in the dataset
-            # (one shard per dataset is the steady-state invariant — the
-            # sweep retains the newest shard plus one grace-buffer
-            # second-newest; older shards are purged). `set_row_count` is
-            # idempotent so a builder retry that re-commits the same shard
-            # leaves `row_count` unchanged, and self-heals any pre-existing
-            # drift in the catalog.
-            try:
-                set_row_count(tenant, dataset, total_vectors)
-            except Exception as exc:  # noqa: BLE001
-                # Best-effort: a row_count reconcile failure must not fail
-                # the build — the shard is durable and queryable. The next
-                # successful build re-runs the reconcile.
-                print(
-                    "builder: set_row_count failed for "
-                    f"{tenant}/{dataset}: {exc}"
-                )
-            # Opt-in prewarm hint. The catalog row is now durable; publish a
-            # PREWARM_SHARD message so a DP with the consumer enabled
-            # (`RB_PREWARM_CONSUMER=true`) can speculatively admit the shard
-            # before the first query lands. Gated on `RB_PREWARM_ON_BUILD=true`
-            # so the rollback contract holds: an unset env preserves current
-            # behaviour. The publish runs AFTER `add_shard` so a queue-side
-            # failure cannot leave a PREWARM message pointing at an uncataloged
-            # shard, and is wrapped in best-effort error handling so a queue
-            # blip cannot fail an otherwise-successful build.
-            if os.getenv("RB_PREWARM_ON_BUILD", "false").strip().lower() in (
-                "1", "true", "yes", "on",
-            ):
-                try:
-                    publish(
-                        "PREWARM_SHARD",
-                        {
-                            "tenant": tenant,
-                            "dataset": dataset,
-                            "shard_uri": shard_uri,
-                        },
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # A queue failure on the prewarm hint must NOT fail
-                    # the build — the shard is on object storage and in
-                    # the catalog. The first query covers the
-                    # rendezvous-elected DP via a normal cache miss.
-                    print(
-                        "builder: PREWARM_SHARD publish failed for "
-                        f"{tenant}/{dataset} ({shard_uri}): {exc}"
-                    )
         except Exception as exc:  # noqa: BLE001
             update_dataset_status(tenant, dataset, "error", error_message=f"index build: {exc}")
             _LAST_BUILD["build_type"] = "error"
@@ -837,6 +860,132 @@ def _run_once_locked(dataset: str, tenant: str) -> int:
             parts_read_uris=list(new_parts),
         )
         return added
+
+
+# --- DELETE_VECTORS (cold-tier delete-by-id) ------------------------------
+
+
+def run_delete_once(dataset: str, tenant: str, vector_id: str) -> int:
+    """Apply a single delete-by-id to a dataset's newest cold shard.
+
+    Loads the newest shard's FAISS index + sidecar, removes the hashed
+    `vector_id`, drops it from the sidecar, and writes a NEW superseded shard
+    via the shared `_write_shard` tail — exactly how an incremental ingest
+    produces the next shard generation, only the operation is a removal rather
+    than an add. The query cache is evicted for the swept shards so a stale
+    index can never serve the deleted id.
+
+    Returns the number of vectors removed by this delete: `1` on a hit, or
+    `0` when there is nothing to do — no shard yet, or the id is absent from
+    the shard (a genuine no-op; the work is DONE and the message is safe to
+    ack). Returns the `BUILD_SKIPPED` sentinel if the per-dataset advisory
+    lock is held by another replica (the caller redelivers, as for a build).
+    Any failure flips the dataset to `error` and returns 0.
+
+    Tenant-scoped: every state/storage call is keyed by `(tenant, dataset)`,
+    so a cross-tenant id can never reach another tenant's shard.
+    """
+    with dataset_build_lock(tenant, dataset) as acquired:
+        if not acquired:
+            # Another replica is building/deleting this dataset — skip and let
+            # the caller redeliver, identical to the build path's contract.
+            print(
+                f"builder: dataset {tenant}/{dataset} is already being built "
+                f"by another replica — skipping delete (will be redelivered)"
+            )
+            return BUILD_SKIPPED
+        return _run_delete_locked(dataset, tenant, vector_id)
+
+
+def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
+    """Run the delete-by-id — caller holds the per-dataset advisory lock."""
+    with build_index_span(tenant=tenant, dataset=dataset):
+        latest_shard = get_latest_shard(tenant, dataset)
+        if latest_shard is None:
+            # No cold shard for this dataset — nothing to delete. Clean no-op:
+            # leave the dataset status UNTOUCHED. The CP only flips to
+            # `indexing` when a shard exists, so a never-ingested (`empty`) or
+            # failed (`error`) dataset is still in its real state here — forcing
+            # it to `indexed` (with `row_count=0`) would mask that. Nothing to
+            # reindex, so there is no status to settle.
+            return 0
+
+        try:
+            index = faiss.deserialize_index(
+                np.frombuffer(read_bytes(latest_shard["shard_uri"]), dtype=np.uint8)
+            )
+            if not hasattr(index, "id_map"):
+                raise RuntimeError(
+                    "delete: loaded shard index has no `id_map` "
+                    f"(type {type(index).__name__}); cannot remove by id"
+                )
+            target = _id_to_int64(vector_id)
+            existing_int_ids = set(faiss.vector_to_array(index.id_map).tolist())
+            if target not in existing_int_ids:
+                # The id is not in the shard (already deleted, or never landed
+                # in cold). Clean no-op — no new shard. A shard exists here, so
+                # the dataset's true state IS `indexed`; the CP flipped it to
+                # `indexing` for the in-flight delete, so settle it back to
+                # `indexed`. (Safe: with a shard present the real state can only
+                # be `indexed` — an `empty`/`error` dataset has no shard and is
+                # handled by the no-shard branch above, which leaves status as is.)
+                update_dataset_status(tenant, dataset, "indexed")
+                return 0
+
+            _remove_ids(index, [target])
+            blob = _serialize_index(index)
+
+            # Drop the deleted id from the sidecar so the id/metadata map
+            # matches the index exactly. Keyed by the str(int64) hash.
+            sidecar = dict(read_shard_sidecar(latest_shard["shard_uri"]))
+            sidecar.pop(str(target), None)
+            sidecar_blob = json.dumps(sidecar).encode("utf-8")
+
+            index_type_str = latest_shard.get("index_type", "flat")
+            total_vectors = int(getattr(index, "ntotal", 0))
+            # Carry the superseded shard's landing manifest forward unchanged —
+            # the parts are still folded in (minus one removed vector), so a
+            # later ingest still treats them as already-indexed.
+            indexed_uris = list(latest_shard.get("indexed_landing_uris", []) or [])
+
+            # Label the shard row + metric as a `delete` rebuild — distinct from
+            # an ingest's `incremental` so deletes are not miscounted as ingests
+            # in `build_type`-keyed observability (the `index_builds` metric and
+            # the `shard_catalog.build_type` column). `build_type` is a
+            # free-text column (no CHECK constraint), so a new label needs no
+            # migration.
+            _write_shard(
+                tenant,
+                dataset,
+                blob,
+                sidecar_blob,
+                total_vectors,
+                index_type_str,
+                build_type="delete",
+                indexed_uris=indexed_uris,
+            )
+        except Exception as exc:  # noqa: BLE001
+            update_dataset_status(
+                tenant, dataset, "error", error_message=f"vector delete: {exc}"
+            )
+            return 0
+
+        obs_metrics.record_index_build("delete")
+        update_dataset_status(
+            tenant,
+            dataset,
+            "indexed",
+            last_indexed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+
+        # Prune the now-superseded shard(s) and evict them from the query
+        # cache. Best-effort — the delete already succeeded and is durable.
+        try:
+            _sweep_superseded_shards(tenant, dataset)
+        except Exception as exc:  # noqa: BLE001
+            print(f"builder: shard sweep failed for {tenant}/{dataset}: {exc}")
+
+        return 1
 
 
 class MetricsHandler(BaseHTTPRequestHandler):
@@ -916,19 +1065,25 @@ def start_metrics_server():
 
 
 def main_loop():
-    """Blocking loop that builds shards upon DATASET_READY messages.
+    """Blocking loop that builds shards and applies deletes from the queue.
 
-    Reliable-queue contract: a message is `ack`-ed once the build reaches a
+    Consumes TWO topics: `DATASET_READY` (an ingest needs folding into a
+    shard) and `DELETE_VECTORS` (a cold-tier delete-by-id needs applying to
+    the newest shard). Each iteration drains one message from each topic so a
+    steady stream of one never starves the other; `DATASET_READY` is polled
+    with a short block so the loop still parks when both are idle.
+
+    Reliable-queue contract: a message is `ack`-ed once its handler reaches a
     terminal outcome (success, or a handled failure that flipped the
     dataset/import to `error`/`failed`); an UNHANDLED crash `nack`s it for
     redelivery (then dead-lettering past `QUEUE_MAX_ATTEMPTS`).
 
     Builder-skip contract: when the per-dataset advisory lock is held by
-    another replica the build does NOT run. The message must NOT be `ack`-ed
+    another replica the work does NOT run. The message must NOT be `ack`-ed
     — that would discard it, and the skipped message may carry a newer upload
-    than the in-progress build. `_handle_dataset_ready` returns `False` in
-    that case and the loop `nack`s the message with requeue so it is
-    redelivered and retried once the winning build releases the lock.
+    than the in-progress build. The handler returns `False` in that case and
+    the loop `nack`s the message with requeue so it is redelivered and retried
+    once the winning build releases the lock.
 
     The index builder also HOSTS the reconciliation reaper as a background
     thread (`start_reaper_thread`). The reaper is a periodic task rather than a
@@ -942,28 +1097,44 @@ def main_loop():
     start_metrics_server()
     start_reaper_thread(stop_event())
     while not should_stop():
-        msg = consume("DATASET_READY", block=True, timeout=1.0)
-        if not msg:
-            continue
-        try:
-            done = _handle_dataset_ready(msg)
-        except Exception as exc:  # noqa: BLE001
-            print(f"builder: unhandled error, nacking message: {exc}")
-            nack(msg, requeue=True)
-            continue
-        if done:
-            ack(msg)
-        else:
-            # The build was SKIPPED (per-dataset lock held by another
-            # replica). Redeliver — do NOT ack — so the message is retried
-            # after the in-progress build commits. Acking here would lose a
-            # genuine build if the skipped message carried newer parts.
-            print(
-                "builder: build skipped (per-dataset lock held) — "
-                "nacking message for redelivery"
-            )
-            nack(msg, requeue=True)
+        # `DATASET_READY` is the blocking poll so the loop parks when idle;
+        # `DELETE_VECTORS` is then drained non-blocking so a delete never
+        # waits a full `DATASET_READY` timeout behind an empty build queue.
+        ready_msg = consume("DATASET_READY", block=True, timeout=1.0)
+        if ready_msg:
+            _dispatch(ready_msg, _handle_dataset_ready, "build")
+        delete_msg = consume("DELETE_VECTORS", block=False)
+        if delete_msg:
+            _dispatch(delete_msg, _handle_delete_vectors, "delete")
     print("builder: shutdown signal received — exiting consume loop")
+
+
+def _dispatch(msg, handler, kind: str) -> None:
+    """Run one queue `handler` for `msg`, then ack / nack per its contract.
+
+    Shared ack/nack discipline for both the `DATASET_READY` and
+    `DELETE_VECTORS` consume paths: the handler returns `True` on a terminal
+    outcome (ack) or `False` on a per-dataset-lock skip (nack+requeue); an
+    unhandled exception also nacks for redelivery. `kind` is a label for the
+    log line only.
+    """
+    try:
+        done = handler(msg)
+    except Exception as exc:  # noqa: BLE001
+        print(f"builder: unhandled {kind} error, nacking message: {exc}")
+        nack(msg, requeue=True)
+        return
+    if done:
+        ack(msg)
+    else:
+        # SKIPPED (per-dataset lock held by another replica). Redeliver — do
+        # NOT ack — so the message is retried after the in-progress build
+        # commits. Acking here would lose genuine work.
+        print(
+            f"builder: {kind} skipped (per-dataset lock held) — "
+            "nacking message for redelivery"
+        )
+        nack(msg, requeue=True)
 
 
 def _handle_dataset_ready(msg) -> bool:
@@ -1022,6 +1193,33 @@ def _handle_dataset_ready(msg) -> bool:
             _fail_import_job(import_id, f"import finalize crashed: {exc}")
 
     # The build reached a terminal outcome — signal the caller to ack.
+    return True
+
+
+def _handle_delete_vectors(msg) -> bool:
+    """Apply one DELETE_VECTORS message to the dataset's newest shard.
+
+    Returns `True` once the delete reaches a terminal state — a hit, a clean
+    no-op (no shard / id absent), or a handled failure that flipped the
+    dataset to `error`; the caller then acks. Returns `False` if the delete
+    was SKIPPED because another replica holds the per-dataset lock; the caller
+    then `nack`s for redelivery. A missing `id` is treated as a malformed
+    message and acked away (no terminal status to set) rather than redelivered
+    forever.
+    """
+    dataset = msg["dataset"]
+    tenant = msg.get("tenant", "default")
+    vector_id = msg.get("id")
+    if not isinstance(vector_id, str) or not vector_id:
+        # Malformed message — nothing to delete. Ack it away rather than
+        # redeliver a payload that can never succeed.
+        print(f"builder: DELETE_VECTORS for {tenant}/{dataset} missing 'id' — acking")
+        return True
+    result = run_delete_once(dataset, tenant, vector_id)
+    if result == BUILD_SKIPPED:
+        # Another replica holds the per-dataset lock — signal a nack/redeliver.
+        return False
+    # Hit, no-op, or handled error all reached a terminal outcome — ack.
     return True
 
 

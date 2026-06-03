@@ -67,6 +67,7 @@ QUEUE_MAX_ATTEMPTS = int(os.getenv("QUEUE_MAX_ATTEMPTS", "5"))
 _local_queues: dict[str, queue.Queue] = {
     "VALIDATE_DATASET": queue.Queue(),
     "DATASET_READY": queue.Queue(),
+    "DELETE_VECTORS": queue.Queue(),
     "SHARD_BUILT": queue.Queue(),
     "MERGE_READY": queue.Queue(),
     "RUN_EPHEMERAL_QUERY": queue.Queue(),

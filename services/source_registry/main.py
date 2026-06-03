@@ -7,13 +7,17 @@ Datasets are tenant-scoped (the auth dependency resolves `current_tenant_id`);
 the `/how-to-connect` helper endpoint is an unauthenticated docs pointer.
 
 Endpoints:
-  - POST   /v1/datasets               create an empty dataset
-  - POST   /v1/datasets/{name}/vectors  stream NDJSON records into the dataset
-  - GET    /v1/datasets               list the tenant's datasets
-  - GET    /v1/datasets/{name}        get a single dataset
-  - DELETE /v1/datasets/{name}        soft-delete
+  - POST   /v1/datasets                      create an empty dataset
+  - POST   /v1/datasets/{name}/vectors       stream NDJSON records into the dataset
+  - GET    /v1/datasets                       list the tenant's datasets
+  - GET    /v1/datasets/{name}               get a single dataset
+  - DELETE /v1/datasets/{name}               soft-delete
+  - GET    /v1/datasets/{name}/vectors/{id}  get one cold-tier vector by id
+  - GET    /v1/datasets/{name}/vectors       list cold-tier vectors (filter + pagination)
+  - DELETE /v1/datasets/{name}/vectors/{id}  delete one cold-tier vector by id
 """
 
+import base64
 import json
 import logging
 import os
@@ -28,6 +32,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from adapters.landing.parquet_reader import id_to_int64, read_shard_sidecar
 from adapters.observability import init_observability
 from adapters.observability.otel import instrument_fastapi
 from adapters.observability import metrics as obs_metrics
@@ -499,6 +504,234 @@ async def post_vectors(
             "job_id": job_id,
         },
     )
+
+
+# --- cold-tier vector CRUD ------------------------------------------------
+#
+# Get / list / delete a single vector by its customer-supplied string id,
+# served from the immutable cold shards (the FAISS index + its `.meta.json`
+# sidecar). This surface is INDEPENDENT of the delta tier (`RB_DELTA_TIER`) —
+# it works against today's async-built shards. The hot↔cold union for these
+# operations is a later PR (see docs/architecture/delta-tier.md, PR6).
+#
+# The sidecar maps each SHA1->int64 hash (the same `id_to_int64` the builder
+# stamps onto every FAISS vector) back to `{id, metadata}`. Get/delete hash
+# the incoming string id to that int64 and look it up; list reads the whole
+# sidecar. `?include_values` (FAISS reconstruct to return the raw vector) is a
+# noted follow-up — v1 returns metadata only.
+
+# Default and max page size for the list endpoint. The cap mirrors the
+# `MAX_TOP_K`-style ceiling pattern: an unbounded `limit` would let one
+# request materialise an entire shard's sidecar into the response body.
+_VECTORS_LIST_DEFAULT_LIMIT = 100
+_VECTORS_LIST_MAX_LIMIT = 1000
+
+
+def _encode_cursor(offset: int) -> str:
+    """Encode a list offset into an opaque base64 cursor.
+
+    The cursor is deliberately opaque (a base64-encoded JSON `{"o": N}`) so
+    the offset scheme is not part of the public contract and can change later
+    (e.g. to a keyset cursor) without breaking clients. The list is stably
+    sorted by original id, so a plain offset is a correct, simple paginator at
+    MVP scale.
+    """
+    return base64.urlsafe_b64encode(json.dumps({"o": int(offset)}).encode("utf-8")).decode("ascii")
+
+
+def _decode_cursor(cursor: str) -> Optional[int]:
+    """Decode an opaque cursor back to its offset, or None if malformed.
+
+    Returns None (the caller maps it to `400 invalid_cursor`) on any decode /
+    shape error so a hand-edited or truncated cursor fails loudly rather than
+    silently restarting pagination from zero.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+        offset = int(data["o"])
+        if offset < 0:
+            return None
+        return offset
+    except Exception:  # noqa: BLE001 - any malformed cursor is a 400
+        return None
+
+
+def _newest_sidecar(tenant_id: str, dataset: str) -> Optional[dict]:
+    """Return the newest shard's parsed `.meta.json` sidecar, or None.
+
+    None means there is no shard yet for `(tenant_id, dataset)` — the caller
+    treats that as an empty cold tier (404 for get/delete-by-id, empty list
+    for list). Tenant-scoped via `get_latest_shard`.
+    """
+    shard = state_mod.get_latest_shard(tenant_id, dataset)
+    if shard is None:
+        return None
+    return read_shard_sidecar(shard["shard_uri"])
+
+
+@app.get("/v1/datasets/{name}/vectors/{vector_id}")
+def get_vector_endpoint(
+    name: str,
+    vector_id: str,
+    tenant_id: str = Depends(current_tenant_id),
+    _rl: None = Depends(rate_limit),
+):
+    """Get one cold-tier vector by id. Returns `{id, metadata}`.
+
+    Resolves the newest shard, reads its sidecar, hashes `vector_id` with the
+    builder's SHA1->int64, and looks it up. `404 not_found` when there is no
+    shard yet or the id is absent. A missing/cross-tenant dataset is
+    `404 dataset_not_found` (tenant scoping is enforced by `get_dataset` /
+    `get_latest_shard`). `?include_values` is a noted follow-up — v1 returns
+    metadata only.
+    """
+    if state_mod.get_dataset(tenant_id, name) is None:
+        return _err(404, "dataset_not_found", f"Dataset '{name}' not found")
+    sidecar = _newest_sidecar(tenant_id, name)
+    if not sidecar:
+        return _err(404, "not_found", f"Vector '{vector_id}' not found")
+    entry = sidecar.get(str(id_to_int64(vector_id)))
+    if entry is None:
+        return _err(404, "not_found", f"Vector '{vector_id}' not found")
+    return {"id": entry.get("id", vector_id), "metadata": entry.get("metadata") or {}}
+
+
+@app.get("/v1/datasets/{name}/vectors")
+def list_vectors_endpoint(
+    name: str,
+    limit: Optional[str] = None,
+    cursor: Optional[str] = None,
+    filter: Optional[str] = None,
+    tenant_id: str = Depends(current_tenant_id),
+    _rl: None = Depends(rate_limit),
+):
+    """List cold-tier vectors with an optional `filter` and pagination.
+
+    Reads the newest shard's sidecar, applies an optional AND-of-equals
+    `filter` (a JSON object, reusing the query path's `metadata_matches_filter`
+    so the semantics match `POST /v1/query`), stably sorts by original id, and
+    paginates with `limit` (default 100, capped at 1000) and an opaque
+    `cursor`. Returns `{vectors: [{id, metadata}], next_cursor}`; an empty list
+    when no shard exists. Tenant-scoped via `get_dataset` / `get_latest_shard`.
+
+    Pagination contract (offset cursor — read this before paging):
+    `next_cursor` encodes ONLY the offset into the id-sorted result; it does
+    NOT capture the active `filter` or `limit`. A continuation request MUST
+    resend the SAME `filter` and `limit` it used for the first page. Changing
+    either mid-pagination re-sorts/re-filters a different result set under the
+    old offset and silently skips or duplicates rows. The offset is also
+    resolved against the NEWEST shard at request time, so a concurrent rebuild
+    (ingest/delete) that produces a new shard generation between pages can shift
+    rows under a stable offset — pagination is eventually-consistent, not a
+    snapshot. v1 deliberately keeps the simple offset cursor (a keyset cursor is
+    a later option) and documents this contract instead. See docs/api/vectors.md.
+
+    `limit` is validated manually (not via FastAPI's typed query param) so a
+    non-integer value returns the v1 `{error:{code,message}}` envelope
+    (`400 invalid_limit`) rather than FastAPI's generic 422, mirroring how
+    `POST /v1/query` validates `top_k`/`nprobe`.
+    """
+    if state_mod.get_dataset(tenant_id, name) is None:
+        return _err(404, "dataset_not_found", f"Dataset '{name}' not found")
+
+    # Manual `limit` coercion → v1 envelope. Absent/blank → default; a
+    # non-integer or out-of-range value → 400 invalid_limit (NOT FastAPI 422).
+    if limit is None or limit == "":
+        limit_val = _VECTORS_LIST_DEFAULT_LIMIT
+    else:
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return _err(400, "invalid_limit", "limit must be a positive integer")
+    if limit_val < 1:
+        return _err(400, "invalid_limit", "limit must be a positive integer")
+    limit = min(limit_val, _VECTORS_LIST_MAX_LIMIT)
+
+    offset = 0
+    if cursor is not None:
+        decoded = _decode_cursor(cursor)
+        if decoded is None:
+            return _err(400, "invalid_cursor", "cursor is malformed")
+        offset = decoded
+
+    flt: Optional[dict] = None
+    if filter is not None:
+        try:
+            flt = json.loads(filter)
+        except (ValueError, TypeError):
+            return _err(400, "invalid_filter", "filter must be a JSON object")
+        if not isinstance(flt, dict):
+            return _err(400, "invalid_filter", "filter must be a JSON object")
+
+    sidecar = _newest_sidecar(tenant_id, name) or {}
+    # Project to {id, metadata}, optionally filter, then stable-sort by the
+    # original string id so pagination over an opaque offset is deterministic.
+    records = [
+        {"id": e.get("id"), "metadata": e.get("metadata") or {}}
+        for e in sidecar.values()
+        if e.get("id") is not None
+    ]
+    if flt:
+        # Reuse the query path's AND-of-equals predicate so list/query agree.
+        from services.query_api.v1_query import metadata_matches_filter
+
+        records = [r for r in records if metadata_matches_filter(r["metadata"], flt)]
+    records.sort(key=lambda r: r["id"])
+
+    page = records[offset : offset + limit]
+    next_cursor = (
+        _encode_cursor(offset + limit) if offset + limit < len(records) else None
+    )
+    return {"vectors": page, "next_cursor": next_cursor}
+
+
+@app.delete("/v1/datasets/{name}/vectors/{vector_id}", status_code=202)
+def delete_vector_endpoint(
+    name: str,
+    vector_id: str,
+    tenant_id: str = Depends(current_tenant_id),
+    _rl: None = Depends(rate_limit),
+):
+    """Delete one cold-tier vector by id. Returns `202 {job_id}`.
+
+    Publishes a `DELETE_VECTORS` message; the index builder's `DELETE_VECTORS`
+    consumer loads the newest shard, removes the hashed id, rewrites the
+    sidecar without it, and writes a superseded shard. Tenant-scoped — a
+    missing/cross-tenant dataset is `404 dataset_not_found`.
+
+    Status handling is shard-aware so a delete never masks a dataset's true
+    state. The status is flipped to `indexing` ONLY when a shard actually
+    exists for the dataset (the in-flight delete will then produce the next
+    shard generation and the builder flips it back to `indexed`). When there is
+    NO shard the delete is a guaranteed no-op — there is nothing to reindex —
+    so the status is left untouched: deleting on a never-ingested (`empty`) or
+    failed (`error`) dataset must keep reporting `empty`/`error`, not be
+    rewritten to `indexing`/`indexed` with `row_count=0`. The per-dataset
+    advisory lock the builder holds serializes this delete against any
+    concurrent build, so the shard-existence check is not racy in a way that
+    can clobber a real status.
+
+    The delete is accepted optimistically (202) without first proving the id
+    exists in the shard: the builder treats an absent id as a clean no-op, and
+    this keeps the endpoint a single cheap publish (plus, when a shard exists,
+    one status flip) rather than a synchronous shard read on the request path.
+    This mirrors the eventual-consistency contract of `POST .../vectors`.
+    """
+    if state_mod.get_dataset(tenant_id, name) is None:
+        return _err(404, "dataset_not_found", f"Dataset '{name}' not found")
+
+    job_id = "job_" + uuid4().hex
+    publish(
+        "DELETE_VECTORS",
+        {"dataset": name, "tenant": tenant_id, "id": vector_id, "job_id": job_id},
+    )
+    # Only flip to `indexing` when a shard exists. With no shard the delete is
+    # a no-op against the cold tier — flipping status here would falsely report
+    # `indexing`/`indexed` on an `empty`/`error` dataset and mask its real state.
+    if state_mod.get_latest_shard(tenant_id, name) is not None:
+        state_mod.update_dataset_status(tenant_id, name, "indexing")
+    return JSONResponse(status_code=202, content={"job_id": job_id})
 
 
 # --- bulk import surface --------------------------------------------------

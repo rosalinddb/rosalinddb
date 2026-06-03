@@ -235,7 +235,7 @@ def record_index_build_duration(duration_ms: float, index_type: str) -> None:
 
 
 def record_index_build(build_type: str) -> None:
-    """`rosalinddb.index_builds` +1. `build_type` is `full` or `incremental`.
+    """`rosalinddb.index_builds` +1. `build_type` is `full`, `incremental`, or `delete`.
 
     Lets the incremental-vs-full-rebuild ratio be observed without any
     per-tenant/dataset label — `build_type` is the only (low-cardinality)
