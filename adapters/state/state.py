@@ -27,7 +27,7 @@ from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 import psycopg2
 import psycopg2.pool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 from adapters.observability.tracing import state_connect_span
 
@@ -993,6 +993,193 @@ CREATE TABLE IF NOT EXISTS hot_schema_migrations (
                 )
     finally:
         conn.close()
+
+
+# --- Hot-tier (delta tier) synchronous write path -------------------------
+#
+# The flag-gated, default-off write path that makes a `POST /vectors` durable
+# and immediately queryable. It writes ONLY to the separate data-plane hot
+# pgvector instance (`RB_HOT_DSN`) — never the control-plane Postgres — so a
+# tenant write-storm cannot starve the catalog reads on every query's critical
+# path (docs/architecture/delta-tier.md, "Blast radius"). Everything here is a
+# no-op unless `delta_tier_enabled()` is True, which the service checks before
+# calling in; so a flag-off deploy never opens a hot connection.
+#
+# Scope note: this is the WRITE path only — the query union, the hot→cold
+# flush, and hot-delete tombstoning are later PRs.
+
+
+def delta_tier_enabled() -> bool:
+    """Whether the synchronous hot-tier write path is active.
+
+    Mirrors `quotas_enabled()` (the OSS opt-in idiom): defaults OFF and reads
+    the env fresh on every call so a test can flip it via monkeypatch without a
+    module reload. It is the MASTER switch for delta-tier behaviour.
+
+    Two conditions must BOTH hold for it to be on:
+      - `RB_DELTA_TIER` is truthy (`1`/`true`/`yes`/`on`, case-insensitive), and
+      - `RB_HOT_DSN` is configured (non-empty) — there is a hot store to write to.
+
+    Requiring the DSN as well as the flag means a deploy that flips
+    `RB_DELTA_TIER=true` but forgets to point `RB_HOT_DSN` at an instance stays
+    on the byte-identical flag-off path rather than erroring on every write.
+    """
+    if os.getenv("RB_DELTA_TIER", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
+    return _hot_dsn() is not None
+
+
+def _hot_conn() -> "psycopg2.extensions.connection":
+    """Return a fresh, DEDICATED psycopg2 connection to the hot store.
+
+    A brand-new connection to `RB_HOT_DSN` per call (NOT pooled): the hot tier
+    is a separate data-plane instance with no application pool of its own, and
+    the per-write path is short — allocate an LSN, UPSERT, commit. The caller
+    owns the connection and MUST close it (see `hot_upsert_vectors`, which uses
+    `contextlib.closing`).
+
+    Lazy by construction: this is only ever reached from `hot_upsert_vectors`,
+    which the service calls only when `delta_tier_enabled()` is True. With the
+    flag off no caller reaches here, so no connection to a hot instance is ever
+    opened — the property that keeps a flag-off deploy byte-identical.
+
+    Raises `RuntimeError` if `RB_HOT_DSN` is unset — that is a programming error
+    (a caller reached the hot path with the tier off), not an expected runtime
+    state.
+    """
+    dsn = _hot_dsn()
+    if dsn is None:
+        raise RuntimeError("hot tier is off (RB_HOT_DSN unset); no hot connection")
+    return psycopg2.connect(dsn)
+
+
+def _to_pgvector_literal(values: List[float]) -> str:
+    """Format a float list as a pgvector text literal, e.g. `[1.0,2.0,3.0]`.
+
+    pgvector accepts its `vector` input as a bracketed, comma-separated string;
+    psycopg2 binds it as the parameter for the unparameterised `embedding`
+    column. The dimension is NOT enforced here — the service validates each
+    record's length against `dataset.dimension` before this is called, exactly
+    as the cold path does.
+    """
+    return "[" + ",".join(repr(float(v)) for v in values) + "]"
+
+
+def hot_upsert_vectors(
+    tenant_id: str,
+    dataset: str,
+    records: List[dict],
+) -> int:
+    """Synchronously UPSERT validated records into the hot tier; return the count.
+
+    For each record (`{"id", "values", "metadata"}`, already validated by the
+    service): the row is UPSERTed into `hot_vectors` with last-write-wins on
+    `(tenant_id, dataset, id)` and `deleted = false`, stamped with a strictly-
+    monotonic per-`(tenant, dataset)` LSN from the hot store's `hot_lsn_seq`. A
+    re-sent id overwrites the prior row (new embedding, metadata, and a fresh
+    higher LSN) — never a duplicate.
+
+    The LSN is generated in the HOT store, so this path never touches the
+    control-plane Postgres (docs/architecture/delta-tier.md, "The watermark").
+    All records for one call share a single hot connection + transaction: the
+    whole batch commits atomically, so a mid-batch failure leaves the hot tier
+    unchanged rather than half-applied.
+
+    Set-based round-trips (was 2N, now ~2): the prior implementation allocated
+    one LSN and ran one UPSERT *per record* (2N round-trips on the read-your-
+    writes path). Instead this allocates ALL N LSNs in a SINGLE upsert-increment
+    (`last_lsn = last_lsn + N RETURNING last_lsn`) and applies the batch in a
+    SINGLE multi-row UPSERT. The seq-row upsert is still serialised by Postgres,
+    so `last_lsn` stays strictly monotonic per (tenant, dataset) with no
+    cross-dataset contention; the allocated block is `last_lsn-N+1 .. last_lsn`,
+    assigned in input order.
+
+    Intra-batch duplicate ids: if the same id appears more than once in one
+    batch, only the LAST occurrence is written (last input wins), so the batch
+    is collapsed to one row per id BEFORE allocation — N is the number of
+    distinct ids, and a single multi-row UPSERT never lists the same conflict
+    key twice (which Postgres would reject as "cannot affect row a second time").
+
+    Only ever called when `delta_tier_enabled()` is True (the service gates it),
+    so it never runs — and never opens a connection — with the flag off.
+    """
+    if not records:
+        return 0
+
+    # Collapse intra-batch duplicate ids: later input wins (last-write-wins,
+    # consistent with the cross-batch ON CONFLICT below). Preserve input order
+    # of each surviving id — its position is that of its LAST occurrence, so the
+    # LSN block is assigned in the order the winning records were sent. A dict
+    # keeps insertion order (Python 3.7+); re-assigning an existing key updates
+    # the value but NOT its position, so we del-then-set to move a repeated id
+    # to the end (its latest occurrence).
+    deduped: dict[str, dict] = {}
+    for rec in records:
+        rid = rec["id"]
+        if rid in deduped:
+            del deduped[rid]
+        deduped[rid] = rec
+    winners = list(deduped.values())
+    n = len(winners)
+
+    # One dedicated hot connection for the whole batch. `contextlib.closing`
+    # guarantees the socket is closed on every exit path; the `with conn` block
+    # manages the transaction (commit on success, rollback on error) so the
+    # batch is all-or-nothing.
+    with contextlib.closing(_hot_conn()) as conn, conn, conn.cursor() as cur:
+        # 1. Allocate the whole LSN block in ONE statement. The upsert-increment
+        #    is serialised by Postgres on the single seq row, so `last_lsn` is
+        #    strictly monotonic with no cross-dataset contention. Bumping by N at
+        #    once reserves a contiguous block: the returned value is the LAST LSN
+        #    in the block, and the block is `last_lsn-N+1 .. last_lsn`.
+        cur.execute(
+            """
+INSERT INTO hot_lsn_seq (tenant_id, dataset, last_lsn)
+VALUES (%s, %s, %s)
+ON CONFLICT (tenant_id, dataset)
+DO UPDATE SET last_lsn = hot_lsn_seq.last_lsn + %s
+RETURNING last_lsn
+            """,
+            (tenant_id, dataset, n, n),
+        )
+        last_lsn = cur.fetchone()[0]
+        first_lsn = last_lsn - n + 1
+        # 2. SINGLE multi-row UPSERT. Each winner is stamped with its LSN from
+        #    the block in input order. Last-write-wins on (tenant, dataset, id):
+        #    a re-sent id overwrites embedding/metadata/lsn and clears any prior
+        #    tombstone (deleted -> false), so an upserted id is live.
+        rows = [
+            (
+                tenant_id,
+                dataset,
+                rec["id"],
+                _to_pgvector_literal(rec["values"]),
+                json.dumps(rec.get("metadata") or {}),
+                first_lsn + offset,
+            )
+            for offset, rec in enumerate(winners)
+        ]
+        execute_values(
+            cur,
+            """
+INSERT INTO hot_vectors (tenant_id, dataset, id, embedding, metadata, lsn, deleted)
+VALUES %s
+ON CONFLICT (tenant_id, dataset, id)
+DO UPDATE SET
+  embedding = EXCLUDED.embedding,
+  metadata  = EXCLUDED.metadata,
+  lsn       = EXCLUDED.lsn,
+  deleted   = FALSE
+            """,
+            rows,
+            template="(%s, %s, %s, %s, %s, %s, FALSE)",
+        )
+    return n
 
 
 # --- Per-dataset build advisory lock (multi-worker safety) ----------------

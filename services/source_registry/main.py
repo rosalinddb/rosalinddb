@@ -20,6 +20,7 @@ Endpoints:
 import base64
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -52,6 +53,11 @@ from services.auth.quota import (
     rate_limit,
     vector_quota_429,
 )
+
+# Delta-tier (hot tier) flag + sync write path. Default OFF — when off, nothing
+# below is reached and `post_vectors` behaves byte-identically to today (202,
+# landing write, VALIDATE_DATASET). See docs/architecture/delta-tier.md.
+from adapters.state.state import delta_tier_enabled, hot_upsert_vectors
 
 
 logger = logging.getLogger(__name__)
@@ -187,6 +193,11 @@ def how_to_connect():
 
 _DATASET_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 _INGEST_MAX_BYTES = int(os.getenv("INGEST_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MiB
+# Largest finite float4 (single-precision). Embeddings are stored as pgvector
+# `vector` (float4) in the hot tier and cast to float32 on the cold path, so a
+# magnitude beyond this overflows to Infinity on storage. Validation rejects
+# any value above it (or non-finite) per-line, identically in both flag modes.
+_FLOAT4_MAX = 3.4028235e38
 _LANDING_PREFIX = os.getenv("LANDING_PREFIX", "s3://rosalinddb/landing")
 # Raw bulk-import uploads are staged OUTSIDE the dataset landing prefix so
 # the index builder (which scans `landing/{tenant}/{dataset}/` recursively for
@@ -391,6 +402,14 @@ async def post_vectors(
     Returns 202 with `{accepted, rejected, errors, job_id}`. The dataset's
     `status` flips through `validating` -> `indexing` -> `indexed` as the
     pipeline progresses; the caller polls via `GET /v1/datasets/{name}`.
+
+    Delta tier (`RB_DELTA_TIER`, default OFF): when on, the write is instead
+    SYNCHRONOUS — each accepted record is UPSERTed into the hot pgvector store
+    (durable + immediately queryable) and the endpoint returns **200** with
+    `{accepted, rejected, errors}` (no `job_id`, no landing write, no
+    `VALIDATE_DATASET`). Validation is identical in both modes. The status code
+    is the only flag-conditional difference; see docs/api/v1.md and
+    docs/architecture/delta-tier.md.
     """
     dataset = state_mod.get_dataset(tenant_id, name)
     if dataset is None:
@@ -458,6 +477,67 @@ async def post_vectors(
             obs_metrics.record_upload("rejected")
             obs_metrics.record_quota_rejection("vector")
             return vector_quota_429(usage)
+
+    # --- delta tier (RB_DELTA_TIER): synchronous hot-tier write path ------
+    #
+    # When the delta tier is on, the write is SYNCHRONOUS: each accepted record
+    # is assigned a per-(tenant, dataset) LSN and UPSERTed into the hot pgvector
+    # store (last-write-wins), making it durable and immediately queryable. We
+    # then return 200 — NOT 202 — because there is nothing async to wait for.
+    #
+    # In this mode we deliberately do NOT write a landing object and do NOT
+    # publish `VALIDATE_DATASET`: the hot→cold flush is a later PR, so until then
+    # flag-on data lives in the hot tier only (acceptable — the flag defaults off
+    # and the full delta tier is not user-complete until the flush ships). The
+    # per-line validation above is identical to the flag-off path, so dimension /
+    # id / metadata rules are unchanged. Body shape is unchanged; `job_id` is
+    # omitted (no async job exists). See docs/architecture/delta-tier.md,
+    # "Write path".
+    if delta_tier_enabled():
+        if accepted_count > 0:
+            # `accepted_lines` are canonical, already-validated NDJSON strings
+            # (id/values/metadata). Parse them back to records for the UPSERT —
+            # the hot write needs the structured embedding, not the wire line.
+            records = [json.loads(line) for line in accepted_lines]
+            # The hot UPSERT is a SYNC psycopg2 batch round-trip against the
+            # separate hot instance; offload it so the CP event loop stays
+            # responsive under a burst (same discipline as the landing write).
+            #
+            # The hot store is a SEPARATE data-plane instance (RB_HOT_DSN): a
+            # connection drop, statement timeout, or constraint failure surfaces
+            # as a psycopg2 error here. Map any such failure into the v1 error
+            # envelope (503 hot_write_failed) so the contract holds instead of a
+            # raw 500 leaking outside `{error:{code,message}}`. The whole batch
+            # is one transaction, so a failure leaves the hot tier unchanged.
+            #
+            # KNOWN FOLLOW-UP (quota leak): `try_consume_vectors` above already
+            # COMMITTED the quota increment before this write. If the hot write
+            # fails, that quota stays consumed (no refund). Refund/compensation
+            # is deliberately out of scope for this PR — tracked as a follow-up.
+            try:
+                await run_in_threadpool(
+                    hot_upsert_vectors, tenant_id, name, records
+                )
+            except Exception:  # noqa: BLE001 - any hot-store failure -> 503
+                logger.exception(
+                    "hot-tier write failed for tenant=%s dataset=%s", tenant_id, name
+                )
+                obs_metrics.record_upload("rejected")
+                return _err(
+                    503,
+                    "hot_write_failed",
+                    "Hot-tier write failed; the batch was not persisted",
+                )
+        obs_metrics.record_upload("accepted" if accepted_count > 0 else "rejected")
+        obs_metrics.record_vectors_ingested(accepted_count)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "accepted": accepted_count,
+                "rejected": rejected_count,
+                "errors": errors,
+            },
+        )
 
     if accepted_count > 0:
         # Persist as a uniquely-named JSONL so successive uploads coexist
@@ -1063,6 +1143,16 @@ def _validate_ndjson_record(obj, expected_dim: int) -> Optional[str]:
         return "values must be list[float]"
     if len(values) != expected_dim:
         return f"dimension mismatch: got {len(values)} expected {expected_dim}"
+    # Reject NaN / +-Infinity and magnitudes that overflow float4 BEFORE the
+    # write splits on the flag. The hot tier stores embeddings as pgvector
+    # `vector` (float4) which rejects non-finite and out-of-range values at
+    # insert time: without this guard a flag-ON batch would fail the all-or-
+    # nothing transaction and roll back EVERY valid record as a bare 500, while
+    # the flag-OFF path silently cast the same value to float32 and returned
+    # 202 (Inf/NaN landing as garbage in a cold shard). Rejecting per-line here
+    # makes both modes behave identically and closes the cold-path hole.
+    if not all(math.isfinite(x) and abs(x) <= _FLOAT4_MAX for x in values):
+        return "values must be finite and within float4 range"
     metadata = obj.get("metadata")
     if metadata is not None and not isinstance(metadata, dict):
         return "metadata must be object"
