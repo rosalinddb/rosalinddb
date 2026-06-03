@@ -902,11 +902,12 @@ def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
     with build_index_span(tenant=tenant, dataset=dataset):
         latest_shard = get_latest_shard(tenant, dataset)
         if latest_shard is None:
-            # No cold shard for this dataset — nothing to delete. Clean no-op;
-            # leave the dataset status untouched (the CP set it to `indexing`,
-            # but with no shard there is nothing to reindex). Flip it back so a
-            # poll is not stuck in `indexing` forever.
-            update_dataset_status(tenant, dataset, "indexed")
+            # No cold shard for this dataset — nothing to delete. Clean no-op:
+            # leave the dataset status UNTOUCHED. The CP only flips to
+            # `indexing` when a shard exists, so a never-ingested (`empty`) or
+            # failed (`error`) dataset is still in its real state here — forcing
+            # it to `indexed` (with `row_count=0`) would mask that. Nothing to
+            # reindex, so there is no status to settle.
             return 0
 
         try:
@@ -922,7 +923,12 @@ def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
             existing_int_ids = set(faiss.vector_to_array(index.id_map).tolist())
             if target not in existing_int_ids:
                 # The id is not in the shard (already deleted, or never landed
-                # in cold). Clean no-op — no new shard, just settle the status.
+                # in cold). Clean no-op — no new shard. A shard exists here, so
+                # the dataset's true state IS `indexed`; the CP flipped it to
+                # `indexing` for the in-flight delete, so settle it back to
+                # `indexed`. (Safe: with a shard present the real state can only
+                # be `indexed` — an `empty`/`error` dataset has no shard and is
+                # handled by the no-shard branch above, which leaves status as is.)
                 update_dataset_status(tenant, dataset, "indexed")
                 return 0
 
@@ -942,6 +948,12 @@ def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
             # later ingest still treats them as already-indexed.
             indexed_uris = list(latest_shard.get("indexed_landing_uris", []) or [])
 
+            # Label the shard row + metric as a `delete` rebuild — distinct from
+            # an ingest's `incremental` so deletes are not miscounted as ingests
+            # in `build_type`-keyed observability (the `index_builds` metric and
+            # the `shard_catalog.build_type` column). `build_type` is a
+            # free-text column (no CHECK constraint), so a new label needs no
+            # migration.
             _write_shard(
                 tenant,
                 dataset,
@@ -949,7 +961,7 @@ def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
                 sidecar_blob,
                 total_vectors,
                 index_type_str,
-                build_type="incremental",
+                build_type="delete",
                 indexed_uris=indexed_uris,
             )
         except Exception as exc:  # noqa: BLE001
@@ -958,7 +970,7 @@ def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
             )
             return 0
 
-        obs_metrics.record_index_build("incremental")
+        obs_metrics.record_index_build("delete")
         update_dataset_status(
             tenant,
             dataset,

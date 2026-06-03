@@ -1966,8 +1966,11 @@ def add_shard(
     """Insert a new shard record and return its ID.
 
     Two columns support incremental indexing:
-      - `build_type`: `'full'` (trained-from-scratch) or `'incremental'`
-        (existing index loaded, only new vectors `index.add()`-ed).
+      - `build_type`: `'full'` (trained-from-scratch), `'incremental'`
+        (existing index loaded, only new vectors `index.add()`-ed), or
+        `'delete'` (existing index loaded, one vector removed by id — a
+        delete-driven rebuild, labelled distinctly so deletes are not
+        miscounted as ingests in `build_type`-keyed metrics).
       - `indexed_landing_uris`: the manifest of landing parquet part URIs
         already folded into this shard. The index builder reads the *newest*
         shard's manifest to decide which landing parts are new, so a

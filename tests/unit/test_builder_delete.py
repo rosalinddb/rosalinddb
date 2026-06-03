@@ -122,6 +122,50 @@ def test_delete_no_shard_is_noop(builder):
     assert state_mod.get_latest_shard("t1", "ds") is None
 
 
+def test_delete_no_shard_leaves_empty_status(builder):
+    """A no-shard delete must leave a never-ingested dataset's status `empty`.
+
+    Regression for the status-integrity bug: the builder used to force
+    `indexed` in the no-shard branch, so deleting on an `empty` dataset
+    reported `status=indexed, row_count=0`, masking the true state.
+    """
+    builder_mod, state_mod, _ = builder
+    state_mod.create_dataset("t1", "ds", 4)
+    assert state_mod.get_dataset("t1", "ds")["status"] == "empty"
+
+    result = builder_mod.run_delete_once("ds", "t1", "anything")
+    assert result == 0
+    assert state_mod.get_latest_shard("t1", "ds") is None
+    # Status untouched — NOT rewritten to `indexed`.
+    assert state_mod.get_dataset("t1", "ds")["status"] == "empty"
+
+
+def test_delete_no_shard_leaves_error_status(builder):
+    """A no-shard delete must not clobber an `error` dataset's status."""
+    builder_mod, state_mod, _ = builder
+    state_mod.create_dataset("t1", "ds", 4)
+    state_mod.update_dataset_status("t1", "ds", "error", error_message="boom")
+
+    result = builder_mod.run_delete_once("ds", "t1", "anything")
+    assert result == 0
+    row = state_mod.get_dataset("t1", "ds")
+    assert row["status"] == "error"
+    assert row["error_message"] == "boom"
+
+
+def test_delete_labels_build_type_delete(builder):
+    """A delete-driven rebuild stamps `build_type='delete'` on the new shard.
+
+    Distinct from an ingest's `incremental` so deletes are not miscounted as
+    ingests in `build_type`-keyed metrics / the shard_catalog column.
+    """
+    builder_mod, state_mod, _ = builder
+    _seed_shard(builder_mod, ["a", "b", "c"])
+    builder_mod.run_delete_once("ds", "t1", "b")
+    latest = state_mod.get_latest_shard("t1", "ds")
+    assert latest["build_type"] == "delete"
+
+
 def test_handle_delete_vectors_message(builder):
     builder_mod, state_mod, _ = builder
     from adapters.landing.parquet_reader import read_shard_sidecar
