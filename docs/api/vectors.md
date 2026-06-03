@@ -50,9 +50,34 @@ a noted follow-up exposed later as `?include_values`.
 `GET /v1/datasets/{name}/vectors` returns an opaque `next_cursor`. It is a
 base64-encoded JSON offset (`{"o": N}`) into the id-sorted result — opaque on
 purpose so the scheme can change later (e.g. to a keyset cursor) without
-breaking clients. `limit` defaults to 100 and is capped at 1000. A malformed
-cursor is rejected with `400 invalid_cursor` rather than silently restarting
+breaking clients. `limit` defaults to 100 and is capped at 1000 (a larger value
+is silently clamped to 1000; a non-integer or `< 1` value is rejected with
+`400 invalid_limit`). A malformed cursor — including one whose decoded offset is
+negative — is rejected with `400 invalid_cursor` rather than silently restarting
 from the beginning.
+
+### Continuation contract (resend the same `filter` and `limit`)
+
+The cursor encodes **only the offset** — it does **not** capture the active
+`filter` or `limit`. A continuation request **MUST resend the same `filter` and
+`limit`** it used for the first page. Changing either mid-pagination applies the
+old offset to a *different* (re-filtered / re-sorted) result set, silently
+**skipping or duplicating** rows. Treat `(filter, limit)` as fixed for the
+lifetime of a pagination run; to change them, start a new run without a cursor.
+
+### Eventual-consistency caveat
+
+The offset is resolved against the **newest shard at request time**, not a
+snapshot taken when pagination began. A concurrent rebuild — an ingest
+(`DATASET_READY`) or a delete (`DELETE_VECTORS`) — that produces a new shard
+generation between pages can add, remove, or re-order rows under a stable
+offset, so a long pagination run can miss or repeat a row that was inserted or
+deleted while it was in progress. This is the expected behaviour of a simple
+offset cursor over an eventually-consistent cold tier. v1 keeps the offset
+cursor deliberately (a keyset cursor that is stable across rebuilds is a
+possible later change, enabled by the cursor being opaque); callers that need a
+strictly consistent full scan should page quickly and tolerate the small
+windows, or re-run the scan.
 
 ## Delete: asynchronous and eventually consistent
 

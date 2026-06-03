@@ -600,7 +600,7 @@ def get_vector_endpoint(
 @app.get("/v1/datasets/{name}/vectors")
 def list_vectors_endpoint(
     name: str,
-    limit: int = _VECTORS_LIST_DEFAULT_LIMIT,
+    limit: Optional[str] = None,
     cursor: Optional[str] = None,
     filter: Optional[str] = None,
     tenant_id: str = Depends(current_tenant_id),
@@ -614,13 +614,39 @@ def list_vectors_endpoint(
     paginates with `limit` (default 100, capped at 1000) and an opaque
     `cursor`. Returns `{vectors: [{id, metadata}], next_cursor}`; an empty list
     when no shard exists. Tenant-scoped via `get_dataset` / `get_latest_shard`.
+
+    Pagination contract (offset cursor — read this before paging):
+    `next_cursor` encodes ONLY the offset into the id-sorted result; it does
+    NOT capture the active `filter` or `limit`. A continuation request MUST
+    resend the SAME `filter` and `limit` it used for the first page. Changing
+    either mid-pagination re-sorts/re-filters a different result set under the
+    old offset and silently skips or duplicates rows. The offset is also
+    resolved against the NEWEST shard at request time, so a concurrent rebuild
+    (ingest/delete) that produces a new shard generation between pages can shift
+    rows under a stable offset — pagination is eventually-consistent, not a
+    snapshot. v1 deliberately keeps the simple offset cursor (a keyset cursor is
+    a later option) and documents this contract instead. See docs/api/vectors.md.
+
+    `limit` is validated manually (not via FastAPI's typed query param) so a
+    non-integer value returns the v1 `{error:{code,message}}` envelope
+    (`400 invalid_limit`) rather than FastAPI's generic 422, mirroring how
+    `POST /v1/query` validates `top_k`/`nprobe`.
     """
     if state_mod.get_dataset(tenant_id, name) is None:
         return _err(404, "dataset_not_found", f"Dataset '{name}' not found")
 
-    if limit < 1:
+    # Manual `limit` coercion → v1 envelope. Absent/blank → default; a
+    # non-integer or out-of-range value → 400 invalid_limit (NOT FastAPI 422).
+    if limit is None or limit == "":
+        limit_val = _VECTORS_LIST_DEFAULT_LIMIT
+    else:
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return _err(400, "invalid_limit", "limit must be a positive integer")
+    if limit_val < 1:
         return _err(400, "invalid_limit", "limit must be a positive integer")
-    limit = min(limit, _VECTORS_LIST_MAX_LIMIT)
+    limit = min(limit_val, _VECTORS_LIST_MAX_LIMIT)
 
     offset = 0
     if cursor is not None:
@@ -669,18 +695,28 @@ def delete_vector_endpoint(
 ):
     """Delete one cold-tier vector by id. Returns `202 {job_id}`.
 
-    Publishes a `DELETE_VECTORS` message and flips the dataset's status to
-    `indexing` so a poll reflects the in-flight delete; the index builder's
-    `DELETE_VECTORS` consumer loads the newest shard, removes the hashed id,
-    rewrites the sidecar without it, and writes a superseded shard (flipping
-    the status back to `indexed`). Tenant-scoped — a missing/cross-tenant
-    dataset is `404 dataset_not_found`.
+    Publishes a `DELETE_VECTORS` message; the index builder's `DELETE_VECTORS`
+    consumer loads the newest shard, removes the hashed id, rewrites the
+    sidecar without it, and writes a superseded shard. Tenant-scoped — a
+    missing/cross-tenant dataset is `404 dataset_not_found`.
+
+    Status handling is shard-aware so a delete never masks a dataset's true
+    state. The status is flipped to `indexing` ONLY when a shard actually
+    exists for the dataset (the in-flight delete will then produce the next
+    shard generation and the builder flips it back to `indexed`). When there is
+    NO shard the delete is a guaranteed no-op — there is nothing to reindex —
+    so the status is left untouched: deleting on a never-ingested (`empty`) or
+    failed (`error`) dataset must keep reporting `empty`/`error`, not be
+    rewritten to `indexing`/`indexed` with `row_count=0`. The per-dataset
+    advisory lock the builder holds serializes this delete against any
+    concurrent build, so the shard-existence check is not racy in a way that
+    can clobber a real status.
 
     The delete is accepted optimistically (202) without first proving the id
     exists in the shard: the builder treats an absent id as a clean no-op, and
-    this keeps the endpoint a single cheap publish rather than a synchronous
-    shard read on the request path. This mirrors the eventual-consistency
-    contract of `POST .../vectors`.
+    this keeps the endpoint a single cheap publish (plus, when a shard exists,
+    one status flip) rather than a synchronous shard read on the request path.
+    This mirrors the eventual-consistency contract of `POST .../vectors`.
     """
     if state_mod.get_dataset(tenant_id, name) is None:
         return _err(404, "dataset_not_found", f"Dataset '{name}' not found")
@@ -690,7 +726,11 @@ def delete_vector_endpoint(
         "DELETE_VECTORS",
         {"dataset": name, "tenant": tenant_id, "id": vector_id, "job_id": job_id},
     )
-    state_mod.update_dataset_status(tenant_id, name, "indexing")
+    # Only flip to `indexing` when a shard exists. With no shard the delete is
+    # a no-op against the cold tier — flipping status here would falsely report
+    # `indexing`/`indexed` on an `empty`/`error` dataset and mask its real state.
+    if state_mod.get_latest_shard(tenant_id, name) is not None:
+        state_mod.update_dataset_status(tenant_id, name, "indexing")
     return JSONResponse(status_code=202, content={"job_id": job_id})
 
 

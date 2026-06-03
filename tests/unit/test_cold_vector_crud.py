@@ -258,6 +258,88 @@ def test_list_vectors_bad_cursor_400(env):
     assert r.json()["error"]["code"] == "invalid_cursor"
 
 
+def test_list_vectors_negative_offset_cursor_400(env):
+    """A well-formed base64 cursor whose decoded offset is negative is rejected.
+
+    The decode path explicitly refuses `offset < 0` (a hand-edited cursor)
+    rather than treating it as offset 0 — that would silently restart
+    pagination from the beginning.
+    """
+    import base64
+    import json as _json
+
+    s = _signup(env.client)
+    tenant = s["tenant_id"]
+    _make_dataset(env, s["token"])
+    env.write(tenant, "ds", [("a", {})])
+
+    neg = base64.urlsafe_b64encode(_json.dumps({"o": -1}).encode("utf-8")).decode("ascii")
+    r = env.client.get(
+        "/v1/datasets/ds/vectors",
+        headers=_auth(s["token"]),
+        params={"cursor": neg},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_list_vectors_invalid_limit_400(env):
+    """A non-integer `?limit` returns the v1 envelope (400 invalid_limit), not 422."""
+    s = _signup(env.client)
+    tenant = s["tenant_id"]
+    _make_dataset(env, s["token"])
+    env.write(tenant, "ds", [("a", {})])
+
+    r = env.client.get(
+        "/v1/datasets/ds/vectors",
+        headers=_auth(s["token"]),
+        params={"limit": "abc"},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_limit"
+
+
+def test_list_vectors_limit_below_one_400(env):
+    """A `limit < 1` is rejected as invalid_limit."""
+    s = _signup(env.client)
+    tenant = s["tenant_id"]
+    _make_dataset(env, s["token"])
+    env.write(tenant, "ds", [("a", {})])
+
+    r = env.client.get(
+        "/v1/datasets/ds/vectors",
+        headers=_auth(s["token"]),
+        params={"limit": "0"},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_limit"
+
+
+def test_list_vectors_limit_cap_enforced(env):
+    """`limit` above the 1000 cap is silently clamped to 1000, not rejected.
+
+    Seed more than the cap so a request asking for a huge limit returns at
+    most `_VECTORS_LIST_MAX_LIMIT` rows and exposes a `next_cursor` for the
+    remainder.
+    """
+    s = _signup(env.client)
+    tenant = s["tenant_id"]
+    _make_dataset(env, s["token"])
+    cap = env.main._VECTORS_LIST_MAX_LIMIT
+    env.write(tenant, "ds", [(f"doc-{i:05d}", {}) for i in range(cap + 5)])
+
+    r = env.client.get(
+        "/v1/datasets/ds/vectors",
+        headers=_auth(s["token"]),
+        params={"limit": str(cap * 10)},  # way above the cap
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["vectors"]) == cap
+    # More rows remain than the cap returned, so a continuation cursor exists.
+    assert body["next_cursor"] is not None
+
+
 def test_list_vectors_cross_tenant_404(env):
     a = _signup(env.client, email="a@example.com")
     b = _signup(env.client, email="b@example.com")
@@ -295,6 +377,44 @@ def test_delete_vector_publishes_and_202(env):
     assert msg["tenant"] == tenant
     assert msg["id"] == "doc-1"
     assert msg["job_id"] == body["job_id"]
+
+
+def test_delete_vector_no_shard_keeps_empty_status(env):
+    """Delete on a never-ingested (`empty`) dataset must NOT flip the status.
+
+    With no shard the delete is a guaranteed no-op against the cold tier, so
+    the CP leaves the status untouched. Flipping to `indexing`/`indexed` here
+    would falsely report a vacant dataset as built (`status=indexed,
+    row_count=0`) and mask its real `empty` state.
+    """
+    s = _signup(env.client)
+    _make_dataset(env, s["token"])
+
+    # Freshly-created dataset, no ingest → status is `empty`, no shard.
+    before = env.client.get("/v1/datasets/ds", headers=_auth(s["token"])).json()
+    assert before["status"] == "empty"
+
+    r = env.client.delete("/v1/datasets/ds/vectors/doc-1", headers=_auth(s["token"]))
+    # Still a 202 (the delete is accepted as a no-op).
+    assert r.status_code == 202, r.text
+
+    after = env.client.get("/v1/datasets/ds", headers=_auth(s["token"])).json()
+    assert after["status"] == "empty"  # unchanged — NOT indexing/indexed.
+
+
+def test_delete_vector_error_status_not_clobbered(env):
+    """Delete on an `error` dataset (no shard) must NOT overwrite the status."""
+    s = _signup(env.client)
+    tenant = s["tenant_id"]
+    _make_dataset(env, s["token"])
+    # Simulate a failed pipeline: error status, still no shard.
+    env.state.update_dataset_status(tenant, "ds", "error", error_message="boom")
+
+    r = env.client.delete("/v1/datasets/ds/vectors/doc-1", headers=_auth(s["token"]))
+    assert r.status_code == 202, r.text
+
+    after = env.client.get("/v1/datasets/ds", headers=_auth(s["token"])).json()
+    assert after["status"] == "error"  # preserved, not rewritten to indexing.
 
 
 def test_delete_vector_missing_dataset_404(env):
