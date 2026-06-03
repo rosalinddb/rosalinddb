@@ -229,3 +229,107 @@ def test_flag_on_nonexistent_dataset_404(env, monkeypatch):
     )
     assert r.status_code == 404, r.text
     assert r.json()["error"]["code"] == "dataset_not_found"
+
+
+# --- non-finite / float4-overflow rejection (both flag modes, identical) ---
+#
+# `json.loads` accepts the JS literals `NaN`/`Infinity`/`-Infinity` (allow_nan
+# default) so they reach validation as Python floats; an out-of-float4-range
+# magnitude is finite Python but overflows pgvector's float4 column. Before the
+# fix these passed source-registry validation: flag-ON then failed the all-or-
+# nothing hot transaction (bare 500, every valid row rolled back), flag-OFF
+# silently cast to float32 (Inf/NaN garbage in a cold shard, 202). Both modes
+# must now reject them PER-LINE — not a 500, not a silent accept.
+
+# (id, line-json) pairs whose `values` must be rejected per-line.
+_BAD_VALUE_BODIES = {
+    "nan": '{"id":"x","values":[NaN,0.2,0.3,0.4]}',
+    "inf": '{"id":"x","values":[Infinity,0.2,0.3,0.4]}',
+    "neg_inf": '{"id":"x","values":[-Infinity,0.2,0.3,0.4]}',
+    "overflow": '{"id":"x","values":[1e40,0.2,0.3,0.4]}',
+}
+
+
+@pytest.mark.parametrize("kind", list(_BAD_VALUE_BODIES))
+def test_flag_off_rejects_non_finite_and_overflow_per_line(env, kind):
+    """Flag OFF: NaN/Inf/overflow are rejected per-line (not silently accepted)."""
+    s = _signup(env.client, email=f"off-{kind}@example.com")
+    env.client.post(
+        "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
+    )
+    # One bad line plus one good line: the good one is accepted, the bad one is
+    # rejected per-line (partial success), and the whole upload is NOT a 500.
+    good = '{"id":"ok","values":[0.1,0.2,0.3,0.4]}'
+    body = "\n".join([_BAD_VALUE_BODIES[kind], good])
+    r = env.client.post(
+        "/v1/datasets/v/vectors",
+        headers={**_auth(s["token"]), "Content-Type": "application/x-ndjson"},
+        data=body,
+    )
+    assert r.status_code == 202, r.text
+    out = r.json()
+    assert out["accepted"] == 1 and out["rejected"] == 1
+    reasons = [e["reason"] for e in out["errors"]]
+    assert any("finite" in x for x in reasons), reasons
+
+
+@pytest.mark.parametrize("kind", list(_BAD_VALUE_BODIES))
+def test_flag_on_rejects_non_finite_and_overflow_per_line(env, monkeypatch, kind):
+    """Flag ON: same rejection — per-line, never reaching the hot write as a 500.
+
+    The hot UPSERT is stubbed to BLOW UP if it is ever handed a bad value, so
+    the test proves rejection happens in validation (before the hot write), not
+    via a hot-store transaction failure.
+    """
+    def _recorder(tenant, dataset, records):
+        for rec in records:
+            for v in rec["values"]:
+                assert v == v and abs(v) != float("inf"), "bad value reached hot write"
+        return len(records)
+
+    _enable_delta(env, monkeypatch, _recorder)
+    s = _signup(env.client, email=f"on-{kind}@example.com")
+    env.client.post(
+        "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
+    )
+    good = '{"id":"ok","values":[0.1,0.2,0.3,0.4]}'
+    body = "\n".join([_BAD_VALUE_BODIES[kind], good])
+    r = env.client.post(
+        "/v1/datasets/v/vectors",
+        headers={**_auth(s["token"]), "Content-Type": "application/x-ndjson"},
+        data=body,
+    )
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["accepted"] == 1 and out["rejected"] == 1
+    reasons = [e["reason"] for e in out["errors"]]
+    assert any("finite" in x for x in reasons), reasons
+
+
+# --- hot-write failure stays in the v1 error envelope ---------------------
+
+
+def test_flag_on_hot_write_failure_returns_503_envelope(env, monkeypatch):
+    """A hot-store failure maps to a structured 503, not a raw 500.
+
+    The whole batch is one transaction, so a failure persists nothing; the
+    response must be the v1 envelope `{error:{code,message}}` with code
+    `hot_write_failed`.
+    """
+    def _boom(tenant, dataset, records):
+        raise RuntimeError("connection to hot store dropped")
+
+    _enable_delta(env, monkeypatch, _boom)
+    s = _signup(env.client, email="boom@example.com")
+    env.client.post(
+        "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
+    )
+    r = env.client.post(
+        "/v1/datasets/v/vectors",
+        headers={**_auth(s["token"]), "Content-Type": "application/x-ndjson"},
+        data=_BODY,
+    )
+    assert r.status_code == 503, r.text
+    body = r.json()
+    assert body["error"]["code"] == "hot_write_failed"
+    assert "message" in body["error"]
