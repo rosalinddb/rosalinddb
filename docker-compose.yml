@@ -172,10 +172,15 @@ services:
         done
         if [ -n "$$RB_HOT_DSN" ]; then
           echo "migrator: RB_HOT_DSN set — waiting for the hot pgvector instance..."
+          hot_ok=0
           for i in $$(seq 1 30); do
-            python -c "import psycopg2, os; psycopg2.connect(os.environ['RB_HOT_DSN']).close()" 2>/dev/null && break
+            python -c "import psycopg2, os; psycopg2.connect(os.environ['RB_HOT_DSN']).close()" 2>/dev/null && hot_ok=1 && break
             sleep 1
           done
+          if [ "$$hot_ok" != "1" ]; then
+            echo "migrator: RB_HOT_DSN is set but the hot pgvector instance was unreachable after 30 tries — failing loudly." >&2
+            exit 1
+          fi
         fi
         exec python -m scripts.migrate
     environment:

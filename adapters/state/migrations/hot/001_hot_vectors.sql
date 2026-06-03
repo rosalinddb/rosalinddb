@@ -34,6 +34,16 @@ CREATE EXTENSION IF NOT EXISTS vector;
 --   embedding          : the vector itself, stored UN-normalised. The query
 --                        path squares pgvector's plain-L2 `<->` distance to
 --                        align with FAISS L2-squared before merging the tiers.
+--                        NOTE: this is an UNPARAMETERISED pgvector `vector` (no
+--                        `vector(N)` typmod) so one column can serve mixed
+--                        per-dataset dimensions under brute-force exact search.
+--                        A pgvector HNSW/IVFFlat index CANNOT be built on a
+--                        mixed-dimension column — ANN indexes require a fixed
+--                        dimension. So enabling `RB_HOT_INDEX=hnsw` later is NOT
+--                        a drop-in: it first requires migrating to a
+--                        fixed-dimension layout (e.g. a table/partition per
+--                        embedding dimension). The escape hatch is real but gated
+--                        on that schema change.
 --   metadata           : arbitrary JSON metadata (AND-of-equals filtering).
 --   lsn                : the per-(tenant, dataset) monotonic log sequence
 --                        number (see hot_lsn_seq below). Partitions hot vs cold.

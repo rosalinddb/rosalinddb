@@ -241,7 +241,10 @@ vectors (in cold); hot holds only the trickle since the last flush — hundreds 
 thousand rows. Exact L2 over that is sub-millisecond and has **zero recall loss**; HNSW adds
 index-maintenance churn on a set that is about to be flushed away. This mirrors the existing
 codebase judgment in `query.md` ("the exhaustive scan is correct and fast at current dataset
-sizes"), applied one tier up.
+sizes"), applied one tier up. Note `RB_HOT_INDEX=hnsw` is not a drop-in flag: the v1
+`hot_vectors.embedding` column is an unparameterised `vector` (mixed per-dataset dims), and a
+pgvector HNSW index requires a fixed dimension — so enabling it first needs a fixed-dimension
+schema migration (e.g. a table/partition per embedding dimension).
 
 ## Config flags (all default off / current-behaviour-preserving)
 
@@ -251,7 +254,7 @@ sizes"), applied one tier up.
 | `RB_DELTA_MAX_ROWS` | `2000` | Per-(tenant,dataset) hot-row cap that forces a flush |
 | `RB_DELTA_IDLE_FLUSH_S` | `60` | Idle window after which a dataset is flushed to zero hot rows |
 | `RB_DELTA_FLUSH_MAX_AGE_S` | `30` | Max age of the oldest hot row before a flush is forced |
-| `RB_HOT_INDEX` | `bruteforce` | `hnsw` to add a pgvector ANN index (escape hatch) |
+| `RB_HOT_INDEX` | `bruteforce` | `hnsw` to add a pgvector ANN index (escape hatch — requires a fixed-dimension schema migration first, since the v1 `hot_vectors.embedding` is an unparameterised `vector` for mixed per-dataset dims) |
 | `RB_HOT_DSN` | separate hot pgvector instance | DSN of the hot tier (data-plane), isolated from the control-plane PG by default. A single-tenant self-hoster MAY point it at the control-plane DSN to accept shared-fate. |
 
 ## TDD test plan
