@@ -319,3 +319,103 @@ def test_migration_006_is_idempotent(state):
         cur.execute(sql)
         conn.commit()
     assert state.get_tenant_dp_pool("ten_idem") == "dedicated-ten_idem"
+
+
+# --- Migration 008: shard_catalog.durable_lsn column (delta-tier watermark) ---
+
+
+def _shard_catalog_columns(state) -> set:
+    """Return the set of column names on the `shard_catalog` table."""
+    with state._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = 'shard_catalog'"
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def test_migration_008_adds_durable_lsn_column_default_zero(state):
+    """Migration 008 adds `shard_catalog.durable_lsn` with a `0` default.
+
+    A shard inserted after the migration lands on `durable_lsn = 0` with no
+    backfill — the delta tier's watermark is dormant until the tier is enabled,
+    so existing shard logic is unaffected (the cold path is `lsn <= 0` empty hot).
+    """
+    state.migrate()
+    assert "durable_lsn" in _shard_catalog_columns(state), (
+        "migration 008 did not add the durable_lsn column"
+    )
+
+    # A shard created through the normal path defaults to durable_lsn = 0 — no
+    # caller in this PR sets it, so the column is purely additive.
+    if state.get_tenant_by_id("ten_lsn") is None:
+        state.create_tenant("ten_lsn", "lsn@example.com", "x")
+    state.create_dataset("ten_lsn", "ds_lsn", 4)
+    state.add_shard(
+        "ten_lsn", "ds_lsn", "s3://x/shard.bin",
+        checksum="c0", vector_count=1, index_type="flat",
+    )
+    with state._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT durable_lsn FROM shard_catalog "
+            "WHERE tenant_id=%s AND dataset_name=%s",
+            ("ten_lsn", "ds_lsn"),
+        )
+        rows = cur.fetchall()
+    assert rows, "shard row not found"
+    assert all(r[0] == 0 for r in rows), (
+        f"durable_lsn default should be 0, got {rows!r}"
+    )
+
+
+def test_migration_008_is_idempotent(state):
+    """Re-running migration 008 is a clean no-op — additive, non-destructive.
+
+    `_apply_migrations()` skips an already-recorded version; the 008 SQL itself
+    is a bare `ADD COLUMN IF NOT EXISTS`, so a direct re-execute is also safe. A
+    durable_lsn value set between passes survives the re-run.
+    """
+    state.migrate()
+    if state.get_tenant_by_id("ten_lsn_idem") is None:
+        state.create_tenant("ten_lsn_idem", "lsnidem@example.com", "x")
+    state.create_dataset("ten_lsn_idem", "ds", 4)
+    state.add_shard(
+        "ten_lsn_idem", "ds", "s3://x/shard.bin",
+        checksum="c0", vector_count=1, index_type="flat",
+    )
+    with state._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE shard_catalog SET durable_lsn = 42 "
+            "WHERE tenant_id=%s AND dataset_name=%s",
+            ("ten_lsn_idem", "ds"),
+        )
+        conn.commit()
+
+    # Re-run the apply loop directly — stands in for a second process booting.
+    state._apply_migrations()
+
+    assert "durable_lsn" in _shard_catalog_columns(state)
+    with state._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT durable_lsn FROM shard_catalog "
+            "WHERE tenant_id=%s AND dataset_name=%s",
+            ("ten_lsn_idem", "ds"),
+        )
+        assert cur.fetchone()[0] == 42, "re-run clobbered durable_lsn"
+
+    # A direct re-execute of the 008 SQL file is also a no-op.
+    from pathlib import Path
+
+    sql = (
+        Path(state.__file__).parent / "migrations" / "008_shard_durable_lsn.sql"
+    ).read_text(encoding="utf-8")
+    with state._conn() as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        conn.commit()
+    with state._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT durable_lsn FROM shard_catalog "
+            "WHERE tenant_id=%s AND dataset_name=%s",
+            ("ten_lsn_idem", "ds"),
+        )
+        assert cur.fetchone()[0] == 42

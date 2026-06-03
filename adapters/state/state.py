@@ -602,15 +602,22 @@ def request_scoped_connection(
 
 
 def migrate(force: bool = False):
-    """Apply schema migrations in order: 001 → 002 → 003 → 004 → 005.
+    """Apply control-plane schema migrations in order: 001 → … → 008.
 
     001 (tenants/keys), 002 (datasets tenant isolation), 003 (shard catalog
     incremental-indexing columns), 004 (import_jobs for async bulk ingest),
-    005 (dataset `status_updated_at` for the reconciliation reaper).
+    005 (dataset `status_updated_at` for the reconciliation reaper), 006
+    (`tenants.dp_pool` routing), 007 (`dp_shard_residency` SSD-cache registry),
+    008 (`shard_catalog.durable_lsn`, the delta-tier watermark — default 0, so
+    it is a no-op for behaviour until the delta tier is enabled).
     002 references the `tenants` table for FKs so it must run after 001; 003
     recreates `shard_catalog` so it must run after 002; 004 FKs to
     `dataset_catalog` so it must run after 002. All files live under
     `adapters/state/migrations/`. Memory mode is a no-op.
+
+    This migrates ONLY the control-plane Postgres. The hot-tier (pgvector)
+    instance has its own DSN (`RB_HOT_DSN`) and a separate runner, `migrate_hot()`
+    — see that function and `scripts/migrate.py`.
 
     `_MIGRATE_LOCK` is a `threading.Lock` — it serialises migration *within* a
     single process only. Cross-process safety is provided by a Postgres
@@ -723,7 +730,17 @@ _MIGRATION_VERSIONS = (
     "005_dataset_status_updated_at",
     "006_tenants_dp_pool",
     "007_dp_shard_residency",
+    "008_shard_durable_lsn",
 )
+
+
+# Ordered list of HOT-instance migration versions. These run against the
+# SEPARATE data-plane pgvector instance (RB_HOT_DSN), NOT the control-plane
+# Postgres above (see docs/architecture/delta-tier.md, "Blast radius"). They
+# live under `migrations/hot/` and are applied by `migrate_hot()` with the same
+# advisory-lock + version-ledger discipline as the control-plane set. The two
+# ledgers live in different databases by design and never share a connection.
+_HOT_MIGRATION_VERSIONS = ("001_hot_vectors",)
 
 
 def _apply_migrations() -> None:
@@ -842,6 +859,140 @@ VALUES ('default', 'self-host@localhost', '!disabled!', 'oss')
 ON CONFLICT (id) DO NOTHING
             """
         )
+
+
+# --- Hot-tier (delta tier) schema migration -------------------------------
+#
+# The hot tier is a SEPARATE data-plane pgvector instance (RB_HOT_DSN), kept off
+# the control-plane Postgres so a tenant write-storm cannot starve the metadata
+# reads on every query's critical path (docs/architecture/delta-tier.md, "Blast
+# radius & control/data-plane isolation"). Its schema is migrated independently
+# from the control-plane schema above, with the same advisory-lock + ledger
+# discipline, against its own DSN. The whole hot path is DEFAULT-OFF: when
+# RB_HOT_DSN is unset `migrate_hot()` is a no-op, so a flag-off deploy behaves
+# byte-identically to today and nothing ever connects to a hot instance.
+
+# Distinct advisory-lock key for the hot ledger. It lives in a different
+# database from `_MIGRATE_LOCK_KEY`, so collision is impossible either way, but
+# a separate constant keeps the intent clear. Fixed forever once deployed.
+_HOT_MIGRATE_LOCK_KEY = 0x726F73685F686F74  # ASCII "rosh_hot", a stable constant
+
+# Process-local serialisation for hot migrations, mirroring the control-plane
+# `_MIGRATE_LOCK` / `_MIGRATED` pair (cross-process safety is the Postgres
+# advisory lock inside `_apply_hot_migrations`).
+_HOT_MIGRATE_LOCK = threading.Lock()
+_HOT_MIGRATED = False
+
+
+def _hot_dsn() -> Optional[str]:
+    """Return the hot-tier (pgvector) DSN from `RB_HOT_DSN`, or None if unset.
+
+    `None` means the delta tier is not configured — every hot path is a no-op
+    and the deploy behaves exactly as it does today. A blank/whitespace value is
+    treated as unset so an empty compose default cannot accidentally enable it.
+    """
+    raw = os.getenv("RB_HOT_DSN")
+    if raw is None:
+        return None
+    raw = raw.strip()
+    return raw or None
+
+
+def migrate_hot(force: bool = False) -> bool:
+    """Apply the hot-tier (pgvector) schema against `RB_HOT_DSN`.
+
+    Returns True if migrations were applied (or would have been — i.e. a hot DSN
+    is configured), False if the hot tier is OFF (no `RB_HOT_DSN`) and nothing
+    was done. The boolean lets the migration entrypoint print an accurate
+    "skipped (delta tier off)" vs "applied" line.
+
+    DEFAULT-OFF: with no `RB_HOT_DSN` this is a pure no-op — it never opens a
+    connection, never imports a pgvector dependency, and leaves behaviour
+    identical to today. This is the property that keeps a flag-off
+    `docker compose up` byte-identical.
+
+    Memory mode (`DATABASE_URL=memory://...`) does NOT suppress this: the hot
+    tier is a wholly separate instance addressed by its own DSN, so a test or a
+    deploy can point `RB_HOT_DSN` at a real pgvector while the control plane runs
+    in memory. The gate is `RB_HOT_DSN`, not `DATABASE_URL`.
+
+    The `_HOT_MIGRATE_LOCK` / `_HOT_MIGRATED` pair serialises within a process;
+    `_apply_hot_migrations()` takes a Postgres `pg_advisory_xact_lock` so several
+    processes booting at once serialise in the hot database instead of racing the
+    DDL locks — identical discipline to `migrate()`.
+
+    `force=True` mirrors `migrate(force=True)`: it bypasses the `RB_SKIP_MIGRATE`
+    early-return so the dedicated migration entrypoint always applies the schema
+    even when it inherits that flag from the service env.
+    """
+    dsn = _hot_dsn()
+    if dsn is None:
+        # Delta tier off — nothing to migrate, nothing connects to a hot store.
+        return False
+    if not force and os.getenv("RB_SKIP_MIGRATE", "").lower() in ("1", "true", "yes"):
+        # Schema applied out-of-band (same contract as the control-plane
+        # migrate()); a hot DSN IS configured, so report True.
+        return True
+    global _HOT_MIGRATED
+    with _HOT_MIGRATE_LOCK:
+        if _HOT_MIGRATED:
+            return True
+        _apply_hot_migrations(dsn)
+        _HOT_MIGRATED = True
+    return True
+
+
+def _apply_hot_migrations(dsn: str) -> None:
+    """Apply the ordered hot migration files exactly once each (version-tracked).
+
+    A faithful copy of `_apply_migrations()`'s cross-process-safe pattern, but
+    against the hot DSN and the `hot_schema_migrations` ledger:
+
+      - a dedicated (non-pooled) connection to `dsn` — the hot instance has no
+        application connection pool;
+      - `pg_advisory_xact_lock(_HOT_MIGRATE_LOCK_KEY)` first, so concurrent
+        migrators serialise in the hot database rather than deadlocking on the
+        `CREATE EXTENSION` / `CREATE TABLE` locks;
+      - a `hot_schema_migrations(version, applied_at)` ledger so a re-run applies
+        only un-applied versions. The hot migrations are all `IF NOT EXISTS`
+        (additive, non-destructive), so even a direct re-execute is safe; the
+        ledger keeps the common path a clean skip.
+
+    There is no legacy-bootstrap branch (unlike the control plane): the hot
+    instance is brand new with the delta tier, so there is never a pre-existing
+    hot schema without a ledger to reconcile.
+    """
+    migrations_dir = Path(__file__).parent / "migrations" / "hot"
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(%s)", (_HOT_MIGRATE_LOCK_KEY,)
+            )
+            cur.execute(
+                """
+CREATE TABLE IF NOT EXISTS hot_schema_migrations (
+  version    TEXT PRIMARY KEY,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+                """
+            )
+            cur.execute("SELECT version FROM hot_schema_migrations")
+            applied = {row[0] for row in cur.fetchall()}
+            for version in _HOT_MIGRATION_VERSIONS:
+                if version in applied:
+                    continue
+                sql = (migrations_dir / f"{version}.sql").read_text(
+                    encoding="utf-8"
+                )
+                cur.execute(sql)
+                cur.execute(
+                    "INSERT INTO hot_schema_migrations(version) VALUES (%s) "
+                    "ON CONFLICT (version) DO NOTHING",
+                    (version,),
+                )
+    finally:
+        conn.close()
 
 
 # --- Per-dataset build advisory lock (multi-worker safety) ----------------
