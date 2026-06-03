@@ -76,6 +76,8 @@ The ~10 most useful knobs. Every other env var lives in the source — grep
 | `CORS_ALLOW_ORIGINS` | Comma-separated extra CORS origins for browser clients | `""` (localhost dev range always allowed) |
 | `QUERY_DP_URL` | CP→DP reverse-proxy base URL | `http://localhost:8090` |
 | `RB_PROXY_SECRET` | Shared secret CP sends on every CP→DP call | unset → DP relies on network isolation |
+| `RB_HOT_DSN` | Delta-tier (hot tier) pgvector DSN | unset → **delta tier off** (see [§3i](#i-delta-tier-hot-tier-read-your-writes)) |
+| `RB_DELTA_TIER` | Master switch for delta-tier behaviour | `false` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint | `http://localhost:4318` |
 | `OTEL_SDK_DISABLED` | Opt out of telemetry entirely | `false` |
 
@@ -311,6 +313,65 @@ The CP→DP wire contract:
 The DP has **no** `Authorization` parsing and **no** quota check — it trusts
 the verified `X-RB-Tenant-Id` header the CP sends. Do not expose the DP
 directly to users; route everything via the CP.
+
+### i. Delta tier (hot tier) — read-your-writes
+
+**Default OFF.** RosalindDB is eventually consistent on writes by default
+(`POST /vectors` lands data that an async build later folds into a shard). The
+**delta tier** adds a small, synchronously-writable, immediately-queryable
+**hot tier** in front of the immutable shards and unions the two at query time
+— so a just-written vector is visible on the very next query. The full design
+is in [`docs/architecture/delta-tier.md`](../architecture/delta-tier.md).
+
+The hot tier is a **separate data-plane pgvector instance**, deliberately *not*
+the control-plane Postgres: it is kept off the metadata DB so a tenant write
+storm against the hot tier can never starve the catalog reads that sit on every
+query's critical path ("blast-radius isolation"). The bundled compose stack
+ships a `pgvector` service (image `pgvector/pgvector:pg15`, on host port `5433`)
+for exactly this.
+
+It is entirely opt-in, controlled by two env vars:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `RB_HOT_DSN` | DSN of the hot pgvector instance. Setting it makes the migrator apply the hot schema and lets services connect. | unset → off |
+| `RB_DELTA_TIER` | Master switch for delta-tier behaviour (sync hot write, query union, flush). | `false` |
+
+**Flag-off is byte-identical to today.** With `RB_HOT_DSN` unset (the default):
+
+- The `pgvector` container starts and goes healthy, but **nothing connects to
+  it** — `RB_HOT_DSN` defaults to empty on every service and the code treats
+  blank/unset as "off" (no connection opened).
+- `python -m scripts.migrate` applies the control-plane schema exactly as
+  before, then prints `hot tier off (RB_HOT_DSN unset); skipping hot schema`
+  and applies no hot migrations.
+- Every existing shard carries `durable_lsn = 0` (the migration 008 default),
+  so the query path takes the pure cold path and existing logic is untouched.
+
+If you do not want the extra idle container at all, simply do not start it:
+`docker compose up` brings up everything, or scope it with
+`docker compose up cp query_dp redis minio postgres ...` to omit `pgvector`.
+
+**Enabling it** (bundled pgvector):
+
+```bash
+export RB_HOT_DSN=postgresql://postgres:postgres@pgvector:5432/hot
+export RB_DELTA_TIER=true
+docker compose up
+```
+
+The migrator waits for the hot instance, then applies the hot schema
+(`CREATE EXTENSION vector` + `hot_vectors` + the per-(tenant,dataset) LSN
+sequence table). For a non-compose deploy, point `RB_HOT_DSN` at any pgvector
+instance and run `python -m scripts.migrate` — it migrates both the control
+plane and (when `RB_HOT_DSN` is set) the hot instance. The embedding dimension
+is **per-dataset**: the `hot_vectors.embedding` column is an unparameterised
+pgvector `vector`, so one hot instance serves datasets of differing dimensions.
+
+> The hot-tier *behaviour* (sync write path, query union, flush) lands in
+> later PRs behind `RB_DELTA_TIER`. This release ships only the schema and the
+> separate instance — enabling `RB_HOT_DSN` today provisions and migrates the
+> store but does not yet change request behaviour.
 
 ---
 
