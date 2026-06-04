@@ -495,20 +495,57 @@ class _FakeRecallCursor:
 
 
 class _FakeRecallConn:
+    """Connection stub for the POOLED recall search path.
+
+    `recall_pooled_conn()` owns the transaction (commit/rollback) and returns the
+    conn to the pool, so the connection is no longer used as a `with` context and
+    is never closed — it just needs `cursor`, `commit`, `rollback`.
+    """
+
     def __init__(self, cursor):
         self._cursor = cursor
 
     def cursor(self):
         return self._cursor
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def close(self):
+    def commit(self):
         pass
+
+    def rollback(self):
+        pass
+
+
+class _FakeRecallPool:
+    """A `ThreadedConnectionPool`-shaped stub returning one fake conn.
+
+    Mirrors `tests/unit/test_state_pool.py`'s `_FakePool`. Non-empty `_pool`
+    keeps the `reused` probe in `recall_pooled_conn()` happy.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._pool = [object()]
+
+    def getconn(self):
+        return self._conn
+
+    def putconn(self, conn):
+        pass
+
+
+def _wire_recall(state_mod, monkeypatch, cur):
+    """Wire a fake recall pool so `recall_pooled_conn()` yields `cur`'s conn.
+
+    The pooled replacement for `monkeypatch.setattr(state_mod, "_recall_conn",
+    ...)`: bind a fake recall pool (`_RECALL_POOL`) keyed to the live DSN, exactly
+    as the control-plane pool tests wire `_POOL`. A `RB_RECALL_DSN` is set so the
+    pool getter's DSN-key check resolves (and matches `_RECALL_POOL_DSN`) — the
+    fake pool is used, no real connection is opened.
+    """
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    pool = _FakeRecallPool(_FakeRecallConn(cur))
+    monkeypatch.setattr(state_mod, "_RECALL_POOL", pool)
+    monkeypatch.setattr(state_mod, "_RECALL_POOL_DSN", state_mod._recall_dsn())
 
 
 def test_recall_search_filter_gates_matches_not_suppression(monkeypatch):
@@ -528,7 +565,7 @@ def test_recall_search_filter_gates_matches_not_suppression(monkeypatch):
         ("tomb", 3.0, {"lang": "fr"}, True),
     ]
     cur = _FakeRecallCursor(rows)
-    monkeypatch.setattr(state_mod, "_recall_conn", lambda: _FakeRecallConn(cur))
+    _wire_recall(state_mod, monkeypatch, cur)
 
     suppress_ids, matches = state_mod.recall_search(
         "t1", "ds", [0.0, 0.0], top_k=10, watermark=5, flt={"lang": "en"}
@@ -553,7 +590,7 @@ def test_recall_search_scoped_to_tenant_dataset_and_watermark(monkeypatch):
     import adapters.state.state as state_mod
 
     cur = _FakeRecallCursor([])
-    monkeypatch.setattr(state_mod, "_recall_conn", lambda: _FakeRecallConn(cur))
+    _wire_recall(state_mod, monkeypatch, cur)
     state_mod.recall_search("tenantA", "datasetB", [1.0], top_k=3, watermark=99)
     sql, params = cur.executed
     # The MATCH scan is partition + watermark scoped AND excludes tombstones.
@@ -566,7 +603,7 @@ def test_recall_search_squares_pgvector_distance(monkeypatch):
     import adapters.state.state as state_mod
 
     cur = _FakeRecallCursor([])
-    monkeypatch.setattr(state_mod, "_recall_conn", lambda: _FakeRecallConn(cur))
+    _wire_recall(state_mod, monkeypatch, cur)
     state_mod.recall_search("t", "d", [1.0], top_k=1, watermark=0)
     sql, _ = cur.executed
     assert "power(embedding <-> %s, 2)" in sql, "recall score must be L2-SQUARED"
@@ -582,7 +619,7 @@ def test_recall_search_truncates_live_matches_to_top_k(monkeypatch):
         ("c", 3.0, {}, False),  # beyond top_k=2 → not a match (but suppresses)
     ]
     cur = _FakeRecallCursor(rows)
-    monkeypatch.setattr(state_mod, "_recall_conn", lambda: _FakeRecallConn(cur))
+    _wire_recall(state_mod, monkeypatch, cur)
     suppress_ids, matches = state_mod.recall_search("t", "d", [0.0], top_k=2, watermark=0)
     assert [r["id"] for r in matches] == ["a", "b"]
     # `c` ranked past top_k → not a match, but STILL suppresses its stale cold id.
@@ -607,7 +644,7 @@ def test_recall_search_returns_match_and_suppresses_past_top_k_and_tombstones(mo
         ("tomb", 9.0, {}, True),     # far out, never a match, but suppresses
     ]
     cur = _FakeRecallCursor(rows)
-    monkeypatch.setattr(state_mod, "_recall_conn", lambda: _FakeRecallConn(cur))
+    _wire_recall(state_mod, monkeypatch, cur)
     suppress_ids, matches = state_mod.recall_search("t", "d", [0.0], top_k=2, watermark=0)
     assert [r["id"] for r in matches] == ["live1", "live2"], matches
     assert suppress_ids == {"live1", "live2", "live3", "tomb"}, suppress_ids

@@ -513,19 +513,36 @@ def test_delete_recall_writes_above_watermark_tombstone(env, monkeypatch):
             return (51,)
 
     class _FakeConn:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
+        # Pooled recall path: the context manager owns commit/rollback + the
+        # return to the pool, so the conn just needs cursor + commit + rollback.
         def cursor(self):
             return _FakeCur()
 
-        def close(self):
+        def commit(self):
             pass
 
-    monkeypatch.setattr(env.state, "_recall_conn", lambda: _FakeConn())
+        def rollback(self):
+            pass
+
+    class _FakeRecallPool:
+        """`ThreadedConnectionPool`-shaped stub yielding one fake conn (per
+        `tests/unit/test_state_pool.py`'s `_FakePool`)."""
+
+        def __init__(self):
+            self._conn = _FakeConn()
+            self._pool = [object()]
+
+        def getconn(self):
+            return self._conn
+
+        def putconn(self, conn):
+            pass
+
+    # Wire a fake recall pool (matching DSN) so `recall_pooled_conn()` yields the
+    # fake conn — no real connection is opened.
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    monkeypatch.setattr(env.state, "_RECALL_POOL", _FakeRecallPool())
+    monkeypatch.setattr(env.state, "_RECALL_POOL_DSN", env.state._recall_dsn())
 
     s = _signup(env.client)
     _make_dataset(env, s["token"], dim=4)

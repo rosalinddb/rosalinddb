@@ -84,25 +84,51 @@ class _FakeCur:
 
 
 class _FakeConn:
+    """Connection stub for the POOLED recall path.
+
+    `recall_pooled_conn()` owns the transaction (it calls `commit`/`rollback`
+    itself and returns the conn to the pool), so the connection is no longer used
+    as a `with` context manager and is never `close()`d — it just needs `cursor`,
+    `commit`, `rollback`.
+    """
+
     def __init__(self, cur):
         self._cur = cur
 
     def cursor(self):
         return self._cur
 
-    def __enter__(self):
-        return self
+    def commit(self):
+        pass
 
-    def __exit__(self, *a):
-        return False
+    def rollback(self):
+        pass
 
-    def close(self):
+
+class _FakeRecallPool:
+    """A `ThreadedConnectionPool`-shaped stub returning one fake conn.
+
+    Mirrors `tests/unit/test_state_pool.py`'s `_FakePool`: `getconn()` hands out
+    the single fake conn, `putconn()` is a no-op return. Non-empty `_pool` keeps
+    the `reused` probe in `recall_pooled_conn()` happy.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._pool = [object()]
+
+    def getconn(self):
+        return self._conn
+
+    def putconn(self, conn):
         pass
 
 
 def _wire(state, monkeypatch, rows=None, seq_start=0):
     cur = _FakeCur(rows=rows, seq_start=seq_start)
-    monkeypatch.setattr(state, "_recall_conn", lambda: _FakeConn(cur))
+    pool = _FakeRecallPool(_FakeConn(cur))
+    monkeypatch.setattr(state, "_RECALL_POOL", pool)
+    monkeypatch.setattr(state, "_RECALL_POOL_DSN", state._recall_dsn())
     return cur
 
 

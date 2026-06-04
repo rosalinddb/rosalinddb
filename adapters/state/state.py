@@ -1042,16 +1042,18 @@ def recall_enabled() -> bool:
 def _recall_conn() -> "psycopg2.extensions.connection":
     """Return a fresh, DEDICATED psycopg2 connection to the recall store.
 
-    A brand-new connection to `RB_RECALL_DSN` per call (NOT pooled): the recall
-    tier is a separate data-plane instance with no application pool of its own,
-    and the per-write path is short — allocate an LSN, UPSERT, commit. The caller
-    owns the connection and MUST close it (see `recall_upsert_vectors`, which
-    uses `contextlib.closing`).
+    A brand-new connection to `RB_RECALL_DSN` (a full TCP + TLS + auth
+    handshake). This is NO LONGER the per-op recall path: every recall CRUD /
+    consolidation function now checks a connection out of the recall pool via
+    `recall_pooled_conn()` instead (see below). `_recall_conn()` is retained for
+    the migration runner's dedicated-connection needs and as a low-level
+    factory, never as the hot per-query path it used to be (~48ms/op of pure
+    handshake when one was opened per recall op).
 
-    Lazy by construction: this is only ever reached from `recall_upsert_vectors`,
-    which the service calls only when `recall_enabled()` is True. With the flag
-    off no caller reaches here, so no connection to a recall instance is ever
-    opened — the property that keeps a flag-off deploy byte-identical.
+    Lazy by construction: only reached when `recall_enabled()` is True. With the
+    flag off no caller reaches here and no recall pool is built, so no connection
+    to a recall instance is ever opened — the property that keeps a flag-off
+    deploy byte-identical.
 
     Raises `RuntimeError` if `RB_RECALL_DSN` is unset — that is a programming
     error (a caller reached the recall path with the tier off), not an expected
@@ -1063,6 +1065,179 @@ def _recall_conn() -> "psycopg2.extensions.connection":
             "recall tier is off (RB_RECALL_DSN unset); no recall connection"
         )
     return psycopg2.connect(dsn)
+
+
+# --- Recall-tier application-side connection pool --------------------------
+#
+# `_recall_conn()` opened a brand-new connection per recall op — a full TCP +
+# TLS + auth handshake (~48ms against a managed pgvector instance). A single
+# `POST /vectors` or `POST /v1/query` paid that tax on every recall read/write.
+# This pool mirrors the control-plane pool (`_POOL` / `pooled_conn()` above)
+# one-for-one, but against the SEPARATE recall DSN (`RB_RECALL_DSN`): it opens a
+# small set of recall connections once and hands them out / takes them back via
+# `recall_pooled_conn()`.
+#
+# Independence from the control-plane pool is deliberate and load-bearing: the
+# recall tier is a DIFFERENT database instance (its own DSN), so it MUST have its
+# own pool — a control-plane connection cannot talk to the recall store and vice
+# versa. One recall pool PER PROCESS, exactly like the control-plane pool.
+#
+# DEFAULT-OFF / lazy: the pool is built on the FIRST `recall_pooled_conn()`
+# checkout, which is only ever reached when `recall_enabled()` is True. With
+# `RB_RECALL_DSN` unset no recall function runs, so the pool is NEVER built and
+# no connection to a recall instance is ever opened — the flag-off deploy stays
+# byte-identical (the `psycopg2.connect`-raises tests still pass untouched).
+
+_DEFAULT_RECALL_POOL_MAX = 10  # per-process ceiling; override with RB_RECALL_POOL_MAX
+_RECALL_POOL_MIN = 1  # connections kept warm even when idle
+
+# The process-wide recall pool, plus the DSN it was built for. Built lazily on
+# the first `recall_pooled_conn()` checkout (NOT at import — flag-off never gets
+# here). Keyed on the DSN so a test (or a reconfigure) that rebinds
+# `RB_RECALL_DSN` transparently rebuilds the pool against the new instance rather
+# than handing out connections to the old one. `_RECALL_POOL_LOCK` guards
+# construction so two threads racing the first checkout do not build two pools.
+_RECALL_POOL: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+_RECALL_POOL_DSN: Optional[str] = None
+_RECALL_POOL_LOCK = threading.Lock()
+
+
+def _recall_pool_max_size() -> int:
+    """Return the per-process recall-pool ceiling.
+
+    Mirrors `_pool_max_size()`: defaults to `_DEFAULT_RECALL_POOL_MAX` (10).
+    `RB_RECALL_POOL_MAX`, when set to a positive integer, overrides it — useful
+    to fit the recall pool under the recall instance's connection cap when many
+    worker processes run side by side. A missing or malformed value falls back
+    to the default rather than crashing.
+    """
+    raw = os.getenv("RB_RECALL_POOL_MAX")
+    if raw and raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return _DEFAULT_RECALL_POOL_MAX
+
+
+def _get_recall_pool(
+    maxconn_override: Optional[int] = None,
+) -> psycopg2.pool.ThreadedConnectionPool:
+    """Return the process-wide recall pool, building it lazily on first use.
+
+    Mirrors `_get_pool()`: a `ThreadedConnectionPool` (the services run threaded
+    under uvicorn, so checkout/return must be thread-safe) built against the
+    recall DSN. Keyed on `RB_RECALL_DSN` — if the DSN changed since the pool was
+    built (a test rebind, a reconfigure), the old pool is torn down and a fresh
+    one is built against the new instance, so a checkout never returns a
+    connection to a stale recall store.
+
+    `maxconn_override` forces the pool's max size; it is a test hook (a tiny
+    max-1 pool makes a connection leak immediately fatal). In production the size
+    comes from `_recall_pool_max_size()`.
+
+    Raises `RuntimeError` if `RB_RECALL_DSN` is unset — reaching here with the
+    tier off is a programming error, identical to `_recall_conn()`.
+    """
+    global _RECALL_POOL, _RECALL_POOL_DSN
+    dsn = _recall_dsn()
+    if dsn is None:
+        raise RuntimeError(
+            "recall tier is off (RB_RECALL_DSN unset); no recall connection pool"
+        )
+    if _RECALL_POOL is None or _RECALL_POOL_DSN != dsn:
+        with _RECALL_POOL_LOCK:
+            # Re-check under the lock — another thread may have built it while
+            # this one waited.
+            if _RECALL_POOL is None or _RECALL_POOL_DSN != dsn:
+                if _RECALL_POOL is not None:
+                    # DSN changed: discard the pool bound to the old instance.
+                    try:
+                        _RECALL_POOL.closeall()
+                    except Exception:
+                        pass
+                maxconn = maxconn_override or _recall_pool_max_size()
+                _RECALL_POOL = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=_RECALL_POOL_MIN,
+                    maxconn=max(_RECALL_POOL_MIN, maxconn),
+                    dsn=dsn,
+                )
+                _RECALL_POOL_DSN = dsn
+    return _RECALL_POOL
+
+
+def _close_recall_pool() -> None:
+    """Close every connection in the recall pool and discard it.
+
+    Mainly a test teardown hook so a test that rebinds `RB_RECALL_DSN` does not
+    leave a pool pinned to a stopped recall container. Safe to call when no pool
+    exists. Production processes are long-lived and let the pool live for the
+    process lifetime.
+    """
+    global _RECALL_POOL, _RECALL_POOL_DSN
+    with _RECALL_POOL_LOCK:
+        if _RECALL_POOL is not None:
+            _RECALL_POOL.closeall()
+            _RECALL_POOL = None
+            _RECALL_POOL_DSN = None
+
+
+@contextlib.contextmanager
+def recall_pooled_conn(
+    maxconn_override: Optional[int] = None,
+) -> Iterator["psycopg2.extensions.connection"]:
+    """Check a recall connection out of the recall pool; commit/return on exit.
+
+    The pool-aware replacement for `with contextlib.closing(_recall_conn()) as
+    conn, conn:` at every recall call site. It mirrors `pooled_conn()`'s
+    STANDALONE path exactly (the recall tier has no request-scoped connection
+    middleware — it is a separate data-plane instance, so there is no
+    `_REQUEST_CONN` analogue here; every recall op is its own short transaction):
+
+      - on enter: check a connection out of the recall pool (block-with-timeout —
+        on `PoolError` it poll-retries until the checkout deadline, so a
+        transient burst blocks rather than 500s, and only a sustained exhaustion
+        raises `PoolCheckoutTimeout`);
+      - on normal exit: `commit()`, then return the connection to the pool;
+      - on exception: `rollback()`, then return the connection, then re-raise —
+        the connection is returned in EVERY path, never leaked, and a borrower
+        never inherits a half-applied or aborted transaction.
+
+    This yields ONE connection for the WHOLE `with` block, so a multi-statement
+    recall transaction (e.g. `recall_upsert_vectors`: allocate an LSN block with
+    `UPDATE ... RETURNING`, then UPSERT, then commit) runs entirely on a SINGLE
+    checked-out connection — the LSN allocation and the UPSERT are the same
+    transaction on the same backend, committed once on clean exit. The
+    single-connection-per-transaction guarantee the old `closing(_recall_conn())`
+    block gave is preserved verbatim; only the connection's lifecycle changed
+    from open/close to checkout/return.
+
+    `maxconn_override` is a test hook forwarded to `_get_recall_pool`.
+
+    Only ever reached when `recall_enabled()` is True (every caller is gated), so
+    with the flag off the recall pool is never built and no recall connection is
+    ever opened.
+    """
+    pool = _get_recall_pool(maxconn_override=maxconn_override)
+    # `state.connect` span — annotated so a trace distinguishes a ~0ms reuse from
+    # a genuine new-backend open, exactly as the control-plane pool does. The
+    # pool keeps `_RECALL_POOL_MIN` warm and only opens a new backend when every
+    # kept connection is checked out, so a checkout that finds a free connection
+    # in `_pool` is a reuse.
+    reused = bool(getattr(pool, "_pool", None))
+    with state_connect_span(reused=reused):
+        conn = _getconn_with_timeout(pool, _pool_checkout_timeout_s())
+    try:
+        yield conn
+    except BaseException:
+        # Roll back so the connection is returned to the pool clean — never
+        # carrying a half-applied or aborted transaction into the next borrower —
+        # then re-raise.
+        try:
+            conn.rollback()
+        finally:
+            pool.putconn(conn)
+        raise
+    else:
+        conn.commit()
+        pool.putconn(conn)
 
 
 def _to_pgvector_literal(values: List[float]) -> str:
@@ -1134,11 +1309,14 @@ def recall_upsert_vectors(
     winners = list(deduped.values())
     n = len(winners)
 
-    # One dedicated recall connection for the whole batch. `contextlib.closing`
-    # guarantees the socket is closed on every exit path; the `with conn` block
-    # manages the transaction (commit on success, rollback on error) so the
-    # batch is all-or-nothing.
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    # ONE pooled recall connection for the WHOLE batch — the LSN-block allocation
+    # and the multi-row UPSERT run in a SINGLE transaction on a SINGLE checked-out
+    # connection. `recall_pooled_conn()` owns the lifecycle: it commits on clean
+    # exit (the batch is all-or-nothing), rolls back on error, and returns the
+    # connection to the recall pool on EVERY path. Holding one connection for the
+    # duration of the txn — allocate, upsert, commit, then return — is what keeps
+    # the LSN allocation and the UPSERT atomic (read-your-writes correctness).
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         # 1. Allocate the whole LSN block in ONE statement. The upsert-increment
         #    is serialised by Postgres on the single seq row, so `last_lsn` is
         #    strictly monotonic with no cross-dataset contention. Bumping by N at
@@ -1273,7 +1451,7 @@ def recall_search(
     #       such id is dropped whether the recall row is a tombstone, fails the
     #       filter, or ranks past `top_k`. Built WITHOUT the filter and WITHOUT a
     #       top_k cap on purpose.
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         # (a) MATCH scan: LIVE rows only, ordered by the FAISS-aligned squared L2
         # distance. `power(embedding <-> %s, 2)` squares pgvector's plain-L2 `<->`
         # so the score matches FAISS L2². The query vector is bound TWICE — once
@@ -1404,7 +1582,7 @@ def recall_get_vector(
     this partition → `(None, None)` → the caller's cold lookup (also tenant-
     scoped) yields the 404. Only ever called when `recall_enabled()` is True.
     """
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
 SELECT metadata, deleted
@@ -1444,7 +1622,7 @@ def recall_get_vector_with_embedding(
     Scope is byte-identical to `recall_get_vector` (I1 partition + I3 watermark
     pairing). Only ever called when `recall_enabled()` is True.
     """
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
 SELECT metadata, deleted, embedding
@@ -1496,7 +1674,7 @@ def recall_list_rows(
     #   (b) the SUPPRESS scan — every id above the watermark (live AND tombstoned)
     #       — preserves tombstone-suppress EXACTLY: a tombstone HIDES the cold id
     #       from the list, a live recall row replaces the cold copy.
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         # (a) LIVE scan: not-deleted rows only.
         cur.execute(
             """
@@ -1570,7 +1748,7 @@ def recall_delete_vector(
     # dimension as every live row in the partition, so the search scan's `<->`
     # never hits a dimension mismatch on a cold-only delete's fresh tombstone.
     placeholder = _to_pgvector_literal([0.0] * max(1, int(dimension)))
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         # 1. Allocate a SINGLE fresh lsn from the per-(tenant, dataset) sequence —
         #    the same atomic upsert-increment the write path uses, so the tombstone
         #    is stamped strictly above every prior lsn (and thus above any
@@ -1655,7 +1833,7 @@ def recall_snapshot_for_consolidation(
     the union (`lsn > consolidated_lsn`), and the next consolidation folds it.
     This is what makes read-your-writes hold THROUGH a consolidation (I1 + I2).
     """
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         # ONE statement: derive the bound N inside the same query via a scalar
         # sub-SELECT, so N and the selected rows share a single MVCC snapshot. A
         # concurrent write (higher LSN) is excluded by the `lsn <=` bound, so the
@@ -1720,7 +1898,7 @@ def recall_partition_count(tenant_id: str, dataset: str) -> int:
     still costs the brute-force scan), so the cap genuinely bounds the recall
     set the union scans.
     """
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT COUNT(*) FROM recall_vectors "
             "WHERE tenant_id = %s AND dataset = %s",
@@ -1747,7 +1925,7 @@ def recall_trim(tenant_id: str, dataset: str, grace_watermark: int) -> int:
     """
     if grace_watermark <= 0:
         return 0
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "DELETE FROM recall_vectors "
             "WHERE tenant_id = %s AND dataset = %s AND lsn <= %s",
@@ -1770,7 +1948,7 @@ def recall_idle_partitions(idle_seconds: float) -> List[Tuple[str, str]]:
     partition across the whole recall instance in one pass.
     """
     cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=idle_seconds)
-    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+    with recall_pooled_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
 SELECT tenant_id, dataset
