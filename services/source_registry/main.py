@@ -918,7 +918,23 @@ def list_vectors_endpoint(
     return {"vectors": page, "next_cursor": next_cursor}
 
 
-@app.delete("/v1/datasets/{name}/vectors/{vector_id}", status_code=202)
+@app.delete(
+    "/v1/datasets/{name}/vectors/{vector_id}",
+    status_code=202,
+    # The success code is FLAG-CONDITIONAL: 204 (No Content, synchronous
+    # read-your-deletes) on the recall path (`RB_RECALL` on), 202 (`{job_id}`,
+    # eventually-consistent builder delete) on the default cold-only path. The
+    # declared `status_code=202` is the default; the recall path returns an
+    # explicit `Response(204)` at runtime. Document BOTH in the OpenAPI schema so
+    # the generated contract reflects the real flag-conditional behaviour rather
+    # than advertising only 202.
+    responses={
+        204: {"description": "Recall path (RB_RECALL on): tombstone written "
+                             "synchronously; no body (read-your-deletes)."},
+        202: {"description": "Default path: DELETE_VECTORS enqueued; returns "
+                             "`{job_id}` (eventually consistent)."},
+    },
+)
 def delete_vector_endpoint(
     name: str,
     vector_id: str,
