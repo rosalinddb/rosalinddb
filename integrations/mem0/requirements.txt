@@ -1,0 +1,16 @@
+# Optional dependencies for the RosalindDB <-> mem0 integration.
+#
+# These are NOT part of RosalindDB's core `requirements.txt` and are NOT
+# installed by the core CI. Install them only when you want to use the mem0
+# adapter / run its demo and tests:
+#
+#     pip install -r integrations/mem0/requirements.txt
+#
+# The adapter's tests are gated with `pytest.importorskip("mem0")`, so the core
+# `make test-unit` / `make test-integration` suites stay green without mem0ai.
+mem0ai==2.0.4
+
+# `requests` is already a RosalindDB core dependency, so the REST client needs
+# no extra install in this repo. Listed here for the benefit of anyone vendoring
+# the adapter into a project that does not already depend on it.
+# requests>=2.31
