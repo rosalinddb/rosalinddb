@@ -1008,8 +1008,9 @@ CREATE TABLE IF NOT EXISTS recall_schema_migrations (
 # here is a no-op unless `recall_enabled()` is True, which the service checks
 # before calling in; so a flag-off deploy never opens a recall connection.
 #
-# Scope note: this is the WRITE path only — the query union, the
-# recall→consolidated consolidation, and recall-delete tombstoning are later PRs.
+# Scope note: this is the UPSERT (write) path. The query union, the
+# recall→consolidated consolidation, and the get/list/delete CRUD union
+# (including recall-delete tombstoning) live in their own sections below.
 
 
 def recall_enabled() -> bool:
@@ -1346,6 +1347,190 @@ def _metadata_matches_filter(metadata: dict, flt: dict) -> bool:
         if got != want:
             return False
     return True
+
+
+# --- Recall-tier CRUD union helpers (get / list / delete) -----------------
+#
+# The get/list/delete-by-id union (PR6): when the recall tier is on, the
+# consolidated-tier CRUD endpoints (`services.source_registry.main`) union the
+# immutable shard sidecar with the recall tier, with RECALL AUTHORITATIVE for any
+# id above the resolved shard's watermark — the same recall-wins / tombstone-
+# suppress rule the QUERY union uses (`recall_search` + `_merge_recall_and_cold`).
+# These point-lookup / partition-scan helpers back that union; they ONLY ever run
+# when the endpoint reaches the `recall_enabled()`-gated path, so a flag-off
+# deploy never opens a recall connection through here. See
+# docs/architecture/recall-consolidate.md, "Read path — the union" / PR6.
+
+
+def recall_get_vector(
+    tenant_id: str, dataset: str, vector_id: str, watermark: int
+) -> Tuple[Optional[str], Optional[dict]]:
+    """Point-look up one id in the recall tier above `watermark`. Recall-authoritative.
+
+    Returns a `(status, metadata)` pair the CRUD get-by-id union consumes:
+
+      - `("live", metadata)` — a LIVE recall row with `lsn > watermark`: recall
+        wins, the endpoint returns this `{id, metadata}` (its version is newer
+        than any consolidated copy).
+      - `("tombstone", None)` — a recall TOMBSTONE with `lsn > watermark`: the id
+        was deleted in recall; the endpoint returns `404 not_found` and MUST NOT
+        fall back to the (stale) cold sidecar.
+      - `(None, None)` — NO recall row above the watermark for this id: the
+        endpoint falls back to the cold sidecar lookup (the id, if it exists, is
+        consolidated).
+
+    Scope (I1 partition + I3 watermark pairing): `WHERE tenant_id=? AND dataset=?
+    AND id=? AND lsn > :watermark`. The recall tier owns `lsn > consolidated_lsn`;
+    a row at or below the watermark is already consolidated into the cold shard
+    and is harmlessly ignored here (the cold sidecar is then authoritative for it).
+    `watermark` MUST be the `consolidated_lsn` of the shard the caller resolved.
+
+    Tenant-scoped via the partition key; a cross-tenant id is simply absent from
+    this partition → `(None, None)` → the caller's cold lookup (also tenant-
+    scoped) yields the 404. Only ever called when `recall_enabled()` is True.
+    """
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+        cur.execute(
+            """
+SELECT metadata, deleted
+FROM recall_vectors
+WHERE tenant_id = %s AND dataset = %s AND id = %s AND lsn > %s
+            """,
+            (tenant_id, dataset, vector_id, watermark),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None, None
+    metadata, deleted = row
+    if deleted:
+        return "tombstone", None
+    return "live", (metadata or {})
+
+
+def recall_list_rows(
+    tenant_id: str, dataset: str, watermark: int
+) -> Tuple[List[dict], set]:
+    """List the recall partition above `watermark` for the CRUD list union.
+
+    Returns `(live_rows, suppress_ids)`, mirroring `recall_search`'s split so the
+    list union dedups identically to the query union:
+
+      - `live_rows` — `[{"id", "metadata"}, ...]` for every LIVE (not-deleted)
+        recall row with `lsn > watermark`. These are unioned with the cold sidecar
+        entries, recall-wins on the same id (recall metadata overrides cold).
+      - `suppress_ids` — the FULL set of EVERY recall id above the watermark (live
+        AND tombstoned). Recall is authoritative for `lsn > watermark`, so the
+        stale cold copy of any such id is dropped: a tombstone HIDES the cold id
+        from the list (the mirror of the query union's tombstone suppression), and
+        a live recall row replaces the cold copy with the recall version.
+
+    No metadata filter is applied here — the endpoint applies the AND-of-equals
+    filter to the merged result (matching the cold list, which filters after the
+    sidecar read), so the filter semantics stay byte-identical across tiers.
+
+    Scope (I1 + I3): `WHERE tenant_id=? AND dataset=? AND lsn > :watermark`. The
+    recall set is small by construction (consolidation-bounded), so materialising
+    the whole partition is cheap. Only ever called when `recall_enabled()` is True.
+    """
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+        cur.execute(
+            """
+SELECT id, metadata, deleted
+FROM recall_vectors
+WHERE tenant_id = %s AND dataset = %s AND lsn > %s
+            """,
+            (tenant_id, dataset, watermark),
+        )
+        rows = cur.fetchall()
+    live_rows: List[dict] = []
+    suppress_ids: set = set()
+    for rid, metadata, deleted in rows:
+        # Every recall id above the watermark suppresses its stale cold twin
+        # (tombstone OR live), exactly as `recall_search` builds `suppress_ids`.
+        suppress_ids.add(rid)
+        if deleted:
+            # A tombstone HIDES the id from the list; it contributes no live row.
+            continue
+        live_rows.append({"id": rid, "metadata": metadata or {}})
+    return live_rows, suppress_ids
+
+
+def recall_delete_vector(
+    tenant_id: str, dataset: str, vector_id: str, dimension: int
+) -> int:
+    """Write an ABOVE-watermark tombstone for one id; return the allocated lsn.
+
+    The recall-delete write path (PR6). DELETE is a last-write-wins UPSERT of a
+    TOMBSTONE row (`deleted = true`) keyed on `(tenant, dataset, id)`, stamped
+    with a FRESH lsn allocated from `recall_lsn_seq` — the SAME atomic upsert-
+    increment the recall UPSERT uses. Returns that lsn.
+
+    HARD CONTRACT — the lsn MUST be strictly ABOVE the current watermark (it is,
+    because every allocated lsn is `> max(lsn) >= consolidated_lsn`). We
+    deliberately ALLOCATE A NEW LSN rather than flip `deleted=true` in place /
+    reuse the row's old lsn: a tombstone at or below the watermark would be
+    EXCLUDED from every union (`lsn > consolidated_lsn` is false → the id never
+    deletes) AND would be trim-eligible-but-unapplied (the consolidation could
+    GC the row before folding the delete → the id resurrects). Allocating fresh,
+    above the max, guarantees the tombstone is in the recall partition the union
+    scans and the next consolidation applies. See
+    docs/architecture/recall-consolidate.md, "Write path" (Delete) + invariants
+    I1/I2 + the failure-mode "Delete then immediate query".
+
+    `dimension` is the dataset's embedding dimension (the caller passes
+    `dataset.dimension`). A brand-new tombstone — deleting an id present only in
+    the COLD tier, with no prior recall row — still needs an `embedding` for the
+    `NOT NULL` column, and it MUST match the partition's dimension: the recall
+    SEARCH scan computes `embedding <-> q` over EVERY row above the watermark
+    (tombstones included) BEFORE filtering `deleted` in Python, so a placeholder
+    of a different dimension would raise pgvector's "different vector dimensions"
+    error on the next query. A zero-vector of the dataset dimension is therefore
+    written; it is never a search MATCH (tombstones are skipped) and never folded
+    into a shard (consolidation only `_remove_ids`'s a tombstoned id). On a
+    conflict the existing embedding is left untouched.
+
+    Synchronous + read-your-deletes: the row is committed before this returns, so
+    an immediate GET sees the tombstone and a `POST /query` no longer returns the
+    id. Only ever called when `recall_enabled()` is True (the endpoint gates it),
+    so it never opens a recall connection with the flag off.
+    """
+    # Zero-vector placeholder of the dataset dimension (see docstring): same
+    # dimension as every live row in the partition, so the search scan's `<->`
+    # never hits a dimension mismatch on a cold-only delete's fresh tombstone.
+    placeholder = _to_pgvector_literal([0.0] * max(1, int(dimension)))
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+        # 1. Allocate a SINGLE fresh lsn from the per-(tenant, dataset) sequence —
+        #    the same atomic upsert-increment the write path uses, so the tombstone
+        #    is stamped strictly above every prior lsn (and thus above any
+        #    watermark, which can only be <= max(lsn)). This is the contract that
+        #    keeps the tombstone inside the union's scan window.
+        cur.execute(
+            """
+INSERT INTO recall_lsn_seq (tenant_id, dataset, last_lsn)
+VALUES (%s, %s, 1)
+ON CONFLICT (tenant_id, dataset)
+DO UPDATE SET last_lsn = recall_lsn_seq.last_lsn + 1
+RETURNING last_lsn
+            """,
+            (tenant_id, dataset),
+        )
+        lsn = cur.fetchone()[0]
+        # 2. UPSERT the tombstone (last-write-wins on the partition key). An
+        #    existing live/deleted row for this id is overwritten with deleted=true
+        #    and the fresh higher lsn; a brand-new tombstone gets the dimension-
+        #    matched zero placeholder. On a conflict the embedding is untouched.
+        cur.execute(
+            """
+INSERT INTO recall_vectors (tenant_id, dataset, id, embedding, metadata, lsn, deleted)
+VALUES (%s, %s, %s, %s, '{}'::jsonb, %s, TRUE)
+ON CONFLICT (tenant_id, dataset, id)
+DO UPDATE SET
+  lsn     = EXCLUDED.lsn,
+  deleted = TRUE
+            """,
+            (tenant_id, dataset, vector_id, placeholder, lsn),
+        )
+    return int(lsn)
 
 
 # --- Recall-tier consolidation (flush) helpers ----------------------------
