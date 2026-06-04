@@ -26,11 +26,11 @@ onto :class:`RosalindDBError` subclasses so callers can branch on a stable
 """
 from __future__ import annotations
 
+import http.client
 import json
+import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any, Iterable, Optional
 
 try:  # `requests` is a RosalindDB core dependency; use it when available.
@@ -165,6 +165,14 @@ class RosalindDBClient:
         self.timeout = timeout
         self._session = requests.Session() if _HAVE_REQUESTS else None
 
+        # urllib/http.client fallback state (used only when `requests` is
+        # absent). A single persistent connection is reused across requests for
+        # HTTP keep-alive instead of paying TCP setup per call; a lock guards it
+        # because the rest of the client makes no per-thread assumption and the
+        # connection object is not thread-safe.
+        self._fallback_lock = threading.Lock()
+        self._fallback_conn: Optional[http.client.HTTPConnection] = None
+
     # -- low-level transport ------------------------------------------------
 
     def _headers(self, content_type: Optional[str] = None) -> dict:
@@ -211,23 +219,105 @@ class RosalindDBClient:
                 # never reached a v1 envelope. Wrap into the typed hierarchy.
                 raise TransportError(f"{method} {url} failed: {exc}") from exc
             response = _Response(resp.status_code, resp.content)
-        else:  # pragma: no cover - exercised only without `requests`
-            req = urllib.request.Request(
-                url, data=body, headers=self._headers(content_type), method=method
+        else:
+            response = self._fallback_request(
+                method, url, body, self._headers(content_type)
             )
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as raw:
-                    response = _Response(raw.status, raw.read())
-            except urllib.error.HTTPError as exc:
-                response = _Response(exc.code, exc.read())
-            except (urllib.error.URLError, OSError) as exc:
-                # URLError wraps connection refused/DNS; OSError covers socket
-                # timeouts. Same typed wrapping as the `requests` path.
-                raise TransportError(f"{method} {url} failed: {exc}") from exc
 
         if response.status >= 400:
             _raise_for_envelope(response.status, response.content)
         return response
+
+    # -- urllib/http.client fallback (keep-alive) ---------------------------
+
+    def _fallback_request(
+        self, method: str, url: str, body: Optional[bytes], headers: dict
+    ) -> _Response:
+        """Issue one request over a persistent, reused ``http.client`` socket.
+
+        Replaces a fresh-connection-per-call ``urllib.request.urlopen`` with a
+        single keep-alive connection reused across requests. On a dropped or
+        otherwise broken persistent connection (the server may close an idle
+        keep-alive socket) the connection is reopened and the request retried
+        exactly once, transparently. Semantics — method/URL/headers/body,
+        response parsing, and the typed :class:`TransportError` wrapping for
+        unreachable/timed-out sockets — are identical to the previous fallback.
+
+        A lock serialises access to the shared connection so concurrent callers
+        cannot interleave on the non-thread-safe socket.
+        """
+        parsed = urllib.parse.urlsplit(url)
+        # http.client wants the path (+query) on the request line, not the
+        # absolute origin form.
+        request_target = urllib.parse.urlunsplit(
+            ("", "", parsed.path or "/", parsed.query, "")
+        )
+        send_headers = dict(headers)
+        # Ask the server to keep the TCP connection open for reuse.
+        send_headers["Connection"] = "keep-alive"
+
+        # http.client raises HTTPException for protocol errors; OSError (which
+        # subsumes socket.error, ConnectionError and socket timeouts) for socket
+        # failures. A *reused* keep-alive socket the server has since closed
+        # surfaces here on the next send, so we drop it, reopen, and retry once;
+        # if that retry also fails the request never reached a v1 envelope and is
+        # wrapped into the typed TransportError, exactly as the old fallback did.
+        with self._fallback_lock:
+            try:
+                return self._fallback_send(
+                    parsed, method, request_target, body, send_headers
+                )
+            except (http.client.HTTPException, OSError):
+                self._fallback_close()
+                try:
+                    return self._fallback_send(
+                        parsed, method, request_target, body, send_headers
+                    )
+                except (http.client.HTTPException, OSError) as exc:
+                    self._fallback_close()
+                    raise TransportError(f"{method} {url} failed: {exc}") from exc
+
+    def _fallback_send(
+        self,
+        parsed: urllib.parse.SplitResult,
+        method: str,
+        request_target: str,
+        body: Optional[bytes],
+        headers: dict,
+    ) -> _Response:
+        """Send one request on the (lazily opened) persistent connection."""
+        conn = self._fallback_connection(parsed)
+        conn.request(method, request_target, body=body, headers=headers)
+        raw = conn.getresponse()
+        return _Response(raw.status, raw.read())
+
+    def _fallback_connection(
+        self, parsed: urllib.parse.SplitResult
+    ) -> http.client.HTTPConnection:
+        """Return the persistent connection, opening it on first use.
+
+        Caller must hold ``self._fallback_lock``.
+        """
+        if self._fallback_conn is None:
+            cls = (
+                http.client.HTTPSConnection
+                if parsed.scheme == "https"
+                else http.client.HTTPConnection
+            )
+            self._fallback_conn = cls(
+                parsed.hostname, parsed.port, timeout=self.timeout
+            )
+        return self._fallback_conn
+
+    def _fallback_close(self) -> None:
+        """Close and drop the persistent connection. Caller holds the lock."""
+        conn = self._fallback_conn
+        self._fallback_conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # -- datasets -----------------------------------------------------------
 
