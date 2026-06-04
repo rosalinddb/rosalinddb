@@ -1,0 +1,83 @@
+@startuml recall-consolidate-watermark
+' The key "snap" picture: an LSN number line with consolidated_lsn (the
+' watermark) as the divider between the Consolidate tier (lsn <= W) and the
+' Recall tier (lsn > W). BEFORE a consolidation Recall owns (W, N]; AFTER,
+' consolidation snaps (W, N] into a new shard and the watermark advances
+' W -> N. The grace-bounded trim reclaims Recall only up to the 2nd-newest
+' shard's watermark (I4), so the rows in (grace_W, N] stay in Recall as a
+' safety buffer for in-flight queries on the older shard.
+
+title The seam "snaps": consolidated_lsn advances W -> N, grace-bounded trim (I4)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam NoteFontSize 11
+skinparam rectangleBorderThickness 1
+
+' ===================== BEFORE =====================
+rectangle "BEFORE consolidation" as before #FDF3E7 {
+
+  rectangle "Consolidate tier (shards on S3)\nOWNS  lsn <= W\n[shard gen-2 wm=Wg]  [shard gen-1 (newest) wm=W]" as cBefore #E7F3FD
+  rectangle "Recall tier (pgvector)\nOWNS  lsn > W\nrows in (W, N]  <- queryable now" as rBefore #E9F7E9
+
+  note bottom of cBefore
+    LSN number line:
+    0 ......... Wg ......... W |  W+1 ......... N
+    [====== Consolidate =====]  [==== Recall ====]
+                              ^
+                       consolidated_lsn = W
+                          (the watermark)
+  end note
+
+  cBefore -[hidden]right-> rBefore
+}
+
+' the "snap" transition
+note as snap #LightYellow
+  ====  CONSOLIDATION  ====
+  1. snapshot Recall up to max(lsn) = N
+  2. build a NEW shard from (W, N]
+  3. COMMIT consolidated_lsn = N    (I2: commit FIRST)
+  4. grace-bounded TRIM              (I2: only AFTER commit)
+  The watermark SNAPS:  W  -->  N
+end note
+
+before -down[hidden]-> snap
+
+' ===================== AFTER =====================
+rectangle "AFTER consolidation" as after #FDF3E7 {
+
+  rectangle "Consolidate tier (shards on S3)\nOWNS  lsn <= N\n[gen-2 wm=W]  [gen-1 (newest) wm=N]  <- the snapped (W,N] lives here now" as cAfter #E7F3FD
+  rectangle "Recall tier (pgvector)\nOWNS  lsn > N\nrows in (N, N']  <- writes that arrived after the snapshot" as rAfter #E9F7E9
+
+  note bottom of cAfter
+    LSN number line after the snap:
+    0 ....... W |  W+1 ..... N |  N+1 ..... N'
+    [===== Consolidate ======]  [== Recall ==]
+                              ^
+                  consolidated_lsn = N (advanced)
+
+    GRACE BUFFER (I4): trim hard-deletes only
+    lsn <= 2nd-newest shard's wm = W, NOT N.
+    So rows in (W, N] STAY in Recall too:
+      (W, N]  excluded from the union by the new
+               shard (lsn > N is false), so NO duplicate,
+               but still present for an in-flight
+               query that resolved the OLD shard (wm=W).
+  end note
+
+  cAfter -[hidden]right-> rAfter
+}
+
+snap -down[hidden]-> after
+
+note right of after #E9F7E9
+  Why the grace buffer is safe (I3 + I4):
+  a query that resolved the OLD shard (wm=W) filters
+  Recall with lsn > W -- and finds (W, N] still there,
+  so no rows vanish mid-flight. Once that shard is
+  >= 2 generations old, the next trim reclaims (W, N].
+end note
+
+@enduml

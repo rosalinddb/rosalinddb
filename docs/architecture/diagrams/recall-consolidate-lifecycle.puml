@@ -1,0 +1,86 @@
+@startuml recall-consolidate-lifecycle
+' Sequence: one vector's journey across the seam.
+' client write -> Recall (lsn=k, immediately queryable) -> query union serves
+' it FROM Recall -> consolidation builds a shard, commits watermark=N>=k,
+' grace-trims -> query union now serves it FROM Consolidate -> the Recall row
+' is eventually trimmed once its shard is >= 2 generations old.
+
+title One vector's journey: Recall -> (consolidation) -> Consolidate (RB_RECALL on)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+actor "client" as client
+participant "cp\n(Control Plane)" as cp
+participant "query_dp\n(union + merge)" as dp
+database "Recall\n(pgvector)" as recall
+participant "index_builder\n(consolidate)" as builder
+database "shard_catalog\n(consolidated_lsn)" as catalog
+collections "Consolidate\n(S3 shards)" as os
+
+== t0: write -- vector V lands in Recall ==
+
+client -> cp : POST /vectors {id=V, values}
+cp -> recall : nextval(lsn_seq) -> lsn = k;\nUPSERT (V, .., lsn=k, deleted=false)
+activate recall
+recall --> cp : durable
+deactivate recall
+cp --> client : 200 OK
+note over recall #E9F7E9
+  V now lives at lsn=k, with k > consolidated_lsn(W).
+  It is in the RECALL set and immediately queryable.
+end note
+
+== t1: query union serves V FROM Recall ==
+
+client -> dp : POST /query {vector ~ V}
+activate dp
+dp -> catalog : resolve latest shard S, read consolidated_lsn(S) = W   (W < k)
+dp -> os : FAISS search S  (V not here yet)
+dp -> recall : exact: NOT deleted, lsn > W  -> matches V (lsn=k)
+dp -> dp : square pgvector L2 -> L2^2, recall-wins dedup, sort, top_k
+dp --> client : matches include V  [served from RECALL]
+deactivate dp
+
+== t2: consolidation -- snap V into a shard, advance watermark ==
+
+builder -> recall : snapshot lsn <= N   (N >= k, so V is in the snapshot)
+activate builder
+builder -> os : build + write new shard containing V + sidecar
+builder -> catalog : COMMIT consolidated_lsn = N   [I2: commit FIRST]
+note over catalog #LightYellow
+  Watermark snaps W -> N (N >= k).
+  Now lsn=k is <= consolidated_lsn -> V belongs to CONSOLIDATE.
+end note
+builder -> recall : grace-bounded TRIM lsn <= 2nd-newest wm (= W, not N)\n[I2 after commit, I4 grace] -- V (lsn=k in (W,N]) is KEPT for now
+deactivate builder
+
+== t3: query union now serves V FROM Consolidate ==
+
+client -> dp : POST /query {vector ~ V}
+activate dp
+dp -> catalog : resolve latest shard S' (the new one), consolidated_lsn(S') = N
+dp -> os : FAISS search S'  -> matches V (now in the shard)
+dp -> recall : exact: lsn > N  -> V (lsn=k) NOT returned (k <= N) -> no duplicate
+dp -> dp : merge -> single copy of V
+dp --> client : matches include V  [served from CONSOLIDATE]
+deactivate dp
+note over recall, os #E7F3FD
+  V's Recall row still physically exists in (W, N] as a
+  grace buffer (I4), but the union excludes it (lsn > N is false).
+  No loss, no duplicate.
+end note
+
+== t4: V's Recall row is eventually trimmed ==
+
+builder -> recall : later consolidation: shard S' is now >= 2 gens old\n-> trim reclaims lsn <= N, hard-deleting V's Recall row
+note over recall #FDF3E7
+  V now lives ONLY in the Consolidate tier.
+  Idle datasets drain Recall to 0 -> queries skip pgvector.
+end note
+
+@enduml

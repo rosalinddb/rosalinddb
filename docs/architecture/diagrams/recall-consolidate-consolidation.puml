@@ -1,0 +1,87 @@
+@startuml recall-consolidate-consolidation
+' The handoff sequence (I2 / I4): the index_builder snapshots Recall up to N,
+' builds + commits the shard (consolidated_lsn = N), then runs a grace-bounded
+' idempotent trim (to the 2nd-newest shard's watermark). Annotates the
+' load-bearing commit-then-trim ordering (I2) and the grace buffer (I4), and
+' marks the crash-safe windows across the two-database seam (no distributed
+' transaction): Recall rows in RB_RECALL_DSN, consolidated_lsn in the
+' control-plane catalog.
+
+title Consolidation handoff: build -> commit (I2) -> grace-bounded trim (I4), crash-safe
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+queue "CONSOLIDATE\ntopic" as q
+participant "index_builder\n(single replica,\nper-dataset advisory lock)" as builder
+database "Recall\n(pgvector, RB_RECALL_DSN)" as recall
+collections "Consolidate\n(object store: shard + sidecar)" as os
+database "shard_catalog\n(control-plane PG,\nconsolidated_lsn)" as catalog
+
+q -> builder : trigger\n(cap RB_RECALL_MAX_ROWS exceeded\nOR idle-tick sweep)
+activate builder
+builder -> builder : acquire per-dataset advisory lock\n(serialised vs any build/delete)
+
+== Step 1: snapshot (single read txn) ==
+
+builder -> recall : recall_snapshot_for_consolidation\n(tenant, dataset) up to max(lsn) = N\n(LIVE rows + tombstones)
+activate recall
+recall --> builder : snapshot of (W, N]
+deactivate recall
+note right of builder
+  A write that lands AFTER this snapshot (lsn > N)
+  stays in Recall -> still queryable via the union ->
+  folded by the NEXT consolidation. Read-your-writes
+  holds THROUGH a consolidation.
+end note
+
+== Step 2: build the shard ==
+
+builder -> os : _add_to_index / fresh build;\n_write_shard + sidecar\napply tombstones (deleted=true -> _remove_ids,\ndropped from sidecar, never added)
+note over builder, os #LightYellow
+  CRASH-SAFE WINDOW A (before commit):
+  shard may be half-written but NOT committed ->
+  catalog still points at the old shard; Recall is
+  still authoritative for (W, N]; consolidation retried.
+  No loss, no duplicate.
+end note
+
+== Step 3: COMMIT (I2 -- commit BEFORE trim) ==
+
+builder -> catalog : COMMIT shard_catalog row:\nconsolidated_lsn = N, build_type='consolidate';\nsupersede sweep (keep newest 2); evict superseded from cache
+activate catalog
+catalog --> builder : committed
+deactivate catalog
+note over builder, catalog #LightSalmon
+  CRASH-SAFE WINDOW B (between commit and trim):
+  shard committed (has (W, N]) but Recall not yet trimmed.
+  Recall still holds rows with lsn <= consolidated_lsn -- the
+  union HARMLESSLY excludes them (lsn > N is false). No loss
+  (shard has them), no duplicate (union excludes Recall copy).
+  Next consolidation GCs them. This is why I2 is load-bearing:
+  NEVER trim before commit, or a crash leaves rows in NEITHER tier.
+end note
+
+== Step 4: grace-bounded idempotent trim (I2 after commit, I4 grace) ==
+
+builder -> recall : recall_trim:\nDELETE WHERE lsn <= 2nd-newest shard's consolidated_lsn\n(grace_watermark = W, NOT the just-committed N)
+activate recall
+note right of recall #E9F7E9
+  I4 GRACE BUFFER: rows in (grace_W, N] are KEPT, so an
+  in-flight query that resolved an OLDER shard (wm <= W)
+  still finds its Recall rows (I3 pairs the watermark to the
+  shard it actually read). First-ever consolidation: its new
+  shard is the only one -> grace_W = 0 -> trims nothing.
+  Idempotent: DELETE WHERE lsn <= grace_W is re-runnable.
+end note
+recall --> builder : trimmed (idempotent)
+deactivate recall
+
+builder -> builder : release advisory lock
+deactivate builder
+
+@enduml
