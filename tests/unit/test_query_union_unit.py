@@ -452,19 +452,20 @@ def test_recall_search_opens_no_connection_when_flag_off(monkeypatch):
 class _FakeRecallCursor:
     """A cursor stand-in that returns canned `recall_vectors` rows.
 
-    `recall_search` now issues TWO scans — a `NOT deleted` MATCH scan
-    (`SELECT id, power(embedding <-> %s, 2) AS score, metadata`) and a separate
-    full SUPPRESS scan (`SELECT id`). The fake projects the scripted
-    `(id, score, metadata, deleted)` rows to the columns the CURRENT statement
-    selects: the MATCH scan yields `(id, score, metadata)` for not-deleted rows
-    only; the SUPPRESS scan yields `(id,)` for EVERY row. `executed` records the
-    MATCH scan (the one the score/param assertions inspect).
+    `recall_search` now issues ONE single-snapshot scan
+    (`SELECT id, deleted, power(embedding <-> %s, 2) AS score, metadata`) over
+    `lsn > watermark`, and splits suppress/match in Python (task #17). The fake
+    projects the scripted `(id, score, metadata, deleted)` rows to the columns the
+    single statement selects — `(id, deleted, score, metadata)` for EVERY row —
+    and records that one execute in `executed` so the SQL/param assertions inspect
+    it. `executes` counts every execute so a test can prove the scan is a SINGLE
+    statement (the structural fix for the b1 over-suppression race).
     """
 
     def __init__(self, rows):
         self._rows = rows
         self.executed = None
-        self._last_sql = ""
+        self.executes = []
 
     def __enter__(self):
         return self
@@ -473,25 +474,16 @@ class _FakeRecallCursor:
         return False
 
     def execute(self, sql, params=None):
-        self._last_sql = sql
-        # Keep `executed` pinned to the MATCH scan (squared-distance, 5 params)
-        # so the existing score/param assertions inspect that statement.
-        if "power(embedding <-> %s, 2)" in sql:
-            self.executed = (sql, params)
+        self.executes.append((sql, params))
+        self.executed = (sql, params)
 
     def fetchall(self):
-        sql = self._last_sql
-        # SUPPRESS scan: `SELECT id ...` — every id above the watermark.
-        if "SELECT id\nFROM recall_vectors" in sql:
-            return [(rid,) for rid, _score, _meta, _del in self._rows]
-        # MATCH scan: `... NOT deleted ...` — not-deleted rows, (id, score, meta).
-        if "power(embedding <-> %s, 2)" in sql:
-            return [
-                (rid, score, meta)
-                for rid, score, meta, deleted in self._rows
-                if not deleted
-            ]
-        return list(self._rows)
+        # The single-snapshot scan selects (id, deleted, score, metadata) for
+        # EVERY row above the watermark (live AND tombstoned).
+        return [
+            (rid, deleted, score, meta)
+            for rid, score, meta, deleted in self._rows
+        ]
 
 
 class _FakeRecallConn:
@@ -593,9 +585,14 @@ def test_recall_search_scoped_to_tenant_dataset_and_watermark(monkeypatch):
     _wire_recall(state_mod, monkeypatch, cur)
     state_mod.recall_search("tenantA", "datasetB", [1.0], top_k=3, watermark=99)
     sql, params = cur.executed
-    # The MATCH scan is partition + watermark scoped AND excludes tombstones.
-    assert "tenant_id = %s AND dataset = %s AND NOT deleted AND lsn > %s" in sql
+    # The single-snapshot scan is partition + watermark scoped, and selects
+    # `deleted` so tombstones are split out in Python (no `NOT deleted` clause).
+    assert "tenant_id = %s AND dataset = %s AND lsn > %s" in sql
+    assert "deleted" in sql, "scan must SELECT deleted to split tombstones in Python"
+    assert "NOT deleted" not in sql, "the single-snapshot scan returns ALL rows"
     assert params[1] == "tenantA" and params[2] == "datasetB" and params[3] == 99
+    # Exactly ONE execute drives the scan — the structural b1 fix.
+    assert len(cur.executes) == 1
 
 
 def test_recall_search_squares_pgvector_distance(monkeypatch):
