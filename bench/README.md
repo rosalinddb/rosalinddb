@@ -14,6 +14,10 @@ per-container CPU/memory plus OTLP traces for each cell of the matrix.
 | `run_matrix.sh` | Drives the 6-cell matrix (128 + 1536 dim x 10/20/50 VU). |
 | `run_mmap_comparison.sh` | Runs a 3-cell matrix twice against the same corpus, with `RB_FAISS_MMAP=false` then `=true`. |
 | `analyze.py` | Aggregates raw cells into `RESULTS.md` and `summary.json`. |
+| `docker-compose.recall-bench.yml` | Self-contained **recall-enabled** bench stack (`RB_RECALL=true`, separate project + remapped ports) for the multi-agent memory bench. |
+| `load_test_agents.js` | k6 multi-agent loop: N VUs = N agents writing + searching + a read-your-writes probe on the recall path. |
+| `run_agents_bench.sh` | Sweeps `MODE` x `AGENTS` against the recall-bench stack; `--smoke` for harness validation. |
+| `analyze_agents.py` | Aggregates agent cells into `RESULTS.md` + `summary.json` with a per-agent-vs-shared comparison. |
 
 ## Prerequisites
 
@@ -108,3 +112,86 @@ bench/results/<timestamp>-mmap/
 - **`query_dp` mean memory in `docker_stats.jsonl`** drops with mmap on:
   RSS no longer covers the full index, so the per-shard footprint is
   bounded by what the kernel chooses to keep resident.
+
+## Multi-agent memory load
+
+A concurrent-agent stress of the **recall (read-your-writes) path** — the
+`RB_RECALL` tier that accepts synchronous writes and unions them into queries.
+N k6 VUs model N agents; each agent loops: **write** a batch of memory vectors
+(sync `200`), **search** its own memories, and run a **read-your-writes probe**
+(write a sentinel id, immediately query with its exact vector, record whether
+the id comes back and the round-trip lag).
+
+### What it measures
+
+- **Write throughput** (`rb_writes` counter -> ops/s) and write latency
+  (p50/p95/p99) on the synchronous recall write path.
+- **Search latency** (p50/p95/p99) of the union query.
+- **Read-your-writes**: `rb_ryw_hit` (Rate — was the just-written sentinel
+  returned?) and `rb_ryw_lag_ms` (Trend — write→visible round-trip).
+- **Error rate** (`rb_errors`) across writes, searches, and probes.
+- A **per-agent vs shared** comparison across agent counts.
+
+### Two modes
+
+- **`per-agent`** (default, recommended) — each agent owns its OWN dataset. The
+  recall brute-force scan per query is scoped to that small partition; this is
+  the model the recall tier is designed for.
+- **`shared`** — ALL agents write to ONE dataset, tagging each record with
+  `{agent_id: <vu>}`, and searches filter `{agent_id: <vu>}` (exhaustive
+  server-side). As the single partition grows, every query brute-force-scans
+  the whole thing — this is the **scaling cliff** the comparison exposes.
+
+### Prereqs
+
+- Docker with headroom for the capped recall stack (~6 CPU, ~7 GB incl. the
+  extra `pgvector` recall instance).
+- The image must contain the recall feature code — `run_agents_bench.sh`
+  rebuilds `rosalinddb-backend:latest` from this worktree by default (pass
+  `--no-build` to reuse an existing image).
+- Nothing else needs to be running; the harness brings the stack up and tears
+  it down. It uses a **separate compose project** (`rosalinddb-recall-bench`)
+  and **remapped host ports** (CP `18080`, not `8080`) so it never disturbs a
+  base stack already on `:8080`.
+
+### Run it
+
+```bash
+# Smoke (3 agents, 30s, both modes) — validates the harness end-to-end:
+bash bench/run_agents_bench.sh --smoke
+
+# Full sweep: MODE in {per-agent, shared} x AGENTS in {10,50,100}, 2m cells:
+bash bench/run_agents_bench.sh
+
+# Aggregate into RESULTS.md + summary.json:
+python3 bench/analyze_agents.py bench/results/agents-<timestamp>
+```
+
+The runner brings up the recall-bench stack itself:
+
+```bash
+docker compose -p rosalinddb-recall-bench \
+  -f bench/docker-compose.recall-bench.yml up -d --build
+```
+
+It is a **self-contained** compose file (not a `-f` overlay on the root
+compose): the pinned Compose v2.6.0 merges/appends `ports` across `-f` files
+and has no `!reset`, so a layered overlay could not drop the base file's
+hardcoded `8080`/`5432`/`5433` host bindings — it would clash with a base stack
+on `:8080`. A standalone file controls the host ports on any Compose version
+with zero risk to a running stack.
+
+Results land in `bench/results/agents-<timestamp>/<mode>/agents-<N>/` —
+`k6_summary.json`, `k6_stdout.log`, `docker_stats.jsonl`, and the cell
+start/end timestamps. The stack is torn down on exit (`--keep-up` to leave it).
+
+### Knobs
+
+- `AGENTS_LIST`, `MODES`, `DURATION`, `DIM`, `MEMORIES_PER`, `TOP_K`,
+  `SETTLE_S` — env vars on `run_agents_bench.sh`.
+- `RB_RECALL_MAX_ROWS` / `RB_RECALL_IDLE_S` — lifted high by the overlay so
+  consolidation does not churn mid-run; override at compose-up time.
+- Host ports — `RB_BENCH_CP_PORT` (default 18080), `RB_BENCH_PGVECTOR_PORT`
+  (15433), `RB_BENCH_PG_PORT` (15432), `RB_BENCH_REDIS_PORT` (16379),
+  `RB_BENCH_MINIO_PORT` (19000) — in `docker-compose.recall-bench.yml`.
+- Latency thresholds (incl. `rb_ryw_hit > 0.99`) — `load_test_agents.js`.

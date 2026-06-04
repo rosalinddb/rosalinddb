@@ -1,0 +1,413 @@
+# Recall-enabled, self-contained compose stack for the multi-agent memory
+# load benchmark.
+#
+#   docker compose \
+#     -p rosalinddb-recall-bench \
+#     -f bench/docker-compose.recall-bench.yml \
+#     up -d --build
+#
+# This is a COMPLETE stack derived from the root docker-compose.yml — NOT a
+# `-f` overlay layered on it. It is intentionally self-contained:
+#
+#   * The pinned Docker Compose here is v2.6.0, which MERGES (appends) list
+#     fields like `ports` across `-f` files and offers no `!reset` (that landed
+#     in v2.24). An overlay therefore CANNOT drop the base file's hardcoded
+#     `8080:8080` / `5432` / `5433` / `6379` / `9000` host bindings, so a layered
+#     bench stack would try to publish those ports too and clash with a base
+#     stack already running on :8080. A standalone file gives full control of the
+#     host ports on ANY compose version with zero risk to the running stack.
+#   * It keeps service shapes (images, commands, env, depends_on, healthchecks,
+#     migrator boot sequence) aligned with the root compose; the deltas are:
+#       1. RECALL ON. RB_RECALL=true + RB_RECALL_DSN -> the `pgvector` service on
+#          every recall-touching service (cp / query_dp / index_builder /
+#          ephemeral_runner) and the migrator (so `migrate_recall` runs). POST
+#          /vectors then returns 200 synchronously; an immediate query reads its
+#          writes.
+#       2. INTERFERENCE OFF. RB_ENABLE_QUOTAS=false + RB_REQUIRE_AUTH=false, so
+#          the bench measures the recall DATA path, not auth/quota/rate-limit.
+#          Every request resolves to the single built-in `default` tenant; agents
+#          are modeled as DATASETS under it (quotas are per-tenant, hence off).
+#       3. PARALLELISM-FRIENDLY. RB_RECALL_MAX_ROWS lifted high + RB_RECALL_IDLE_S
+#          stretched so consolidation does not churn mid-run and steal the
+#          throughput we are measuring. Env-overridable at compose-up time.
+#       4. SEPARATE PROJECT + REMAPPED HOST PORTS (CP 18080, NOT 8080; pgvector
+#          15433; postgres 15432; redis 16379; minio 19000/19001) — env-
+#          overridable — so this stack NEVER disturbs a base stack on :8080. The
+#          in-network service ports are unchanged (k6 hits http://cp:8080 over
+#          the compose network).
+#       5. PER-SERVICE CPU/MEM CAPS in the existing bench spirit, plus a
+#          `grafana/k6` load generator on the same network as cp.
+#
+# Dev-default creds only (postgres/postgres, minio/minio123, dev JWT) — public
+# repo safe; synthetic vectors only.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${RB_BENCH_REDIS_PORT:-16379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256m
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    command: server /data --console-address :9001
+    ports:
+      - "${RB_BENCH_MINIO_PORT:-19000}:9000"
+      - "${RB_BENCH_MINIO_CONSOLE_PORT:-19001}:9001"
+    # Ephemeral bench storage — a named volume scoped to this project, so a
+    # `down -v` reclaims it and it never collides with the base stack's
+    # ./data/minio bind mount.
+    volumes:
+      - recall_bench_minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512m
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh -c
+    command: >
+      "mc alias set local http://minio:9000 minio minio123 &&
+       mc mb -p local/vectors || true &&
+       mc anonymous set public local/vectors || true"
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: vectors
+    ports:
+      - "${RB_BENCH_PG_PORT:-15432}:5432"
+    volumes:
+      - recall_bench_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vectors"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512m
+
+  # The recall tier under test — a SEPARATE data-plane pgvector instance.
+  pgvector:
+    image: pgvector/pgvector:pg15
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: recall
+    ports:
+      - "${RB_BENCH_PGVECTOR_PORT:-15433}:5432"
+    volumes:
+      - recall_bench_pgvector:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d recall"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
+
+  # One-shot migrator — RB_RECALL_DSN set so it applies the recall-tier schema
+  # (`migrate_recall`) against pgvector before any app boots. Same boot sequence
+  # as the root compose: wait for control-plane PG, then the recall instance,
+  # then run migrate (fails loudly if the recall instance is unreachable).
+  migrator:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command:
+      - "sh"
+      - "-c"
+      - |
+        echo "migrator: waiting for postgres to accept connections..."
+        for i in $$(seq 1 30); do
+          python -c "import psycopg2, os; psycopg2.connect(os.environ['DATABASE_URL']).close()" 2>/dev/null && break
+          sleep 1
+        done
+        echo "migrator: RB_RECALL_DSN set — waiting for the recall pgvector instance..."
+        recall_ok=0
+        for i in $$(seq 1 30); do
+          python -c "import psycopg2, os; psycopg2.connect(os.environ['RB_RECALL_DSN']).close()" 2>/dev/null && recall_ok=1 && break
+          sleep 1
+        done
+        if [ "$$recall_ok" != "1" ]; then
+          echo "migrator: recall pgvector instance unreachable after 30 tries — failing loudly." >&2
+          exit 1
+        fi
+        exec python -m scripts.migrate
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+    restart: "no"
+
+  cp:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command:
+      ["uvicorn", "services.control_plane.cp_app:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      QUERY_DP_URL: http://query_dp:8080
+      # Recall ON, interference OFF.
+      RB_RECALL: "true"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+      RB_REQUIRE_AUTH: "false"
+      RB_ENABLE_QUOTAS: "false"
+      # Keep consolidation from churning mid-run.
+      RB_RECALL_MAX_ROWS: "${RB_RECALL_MAX_ROWS:-1000000}"
+      RB_RECALL_IDLE_S: "${RB_RECALL_IDLE_S:-3600}"
+    ports:
+      - "${RB_BENCH_CP_PORT:-18080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
+
+  query_dp:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command:
+      ["uvicorn", "services.query_api.dp_app:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      RB_RECALL: "true"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+      RB_REQUIRE_AUTH: "false"
+      RB_ENABLE_QUOTAS: "false"
+      CACHE_DIR: /home/rosalind/cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2g
+
+  validator:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command: ["python", "-m", "services.validator_worker.run"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      RB_REQUIRE_AUTH: "false"
+      RB_ENABLE_QUOTAS: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512m
+
+  index_builder:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command: ["python", "-m", "services.index_builder.run"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      RB_RECALL: "true"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+      RB_REQUIRE_AUTH: "false"
+      RB_ENABLE_QUOTAS: "false"
+      RB_RECALL_MAX_ROWS: "${RB_RECALL_MAX_ROWS:-1000000}"
+      RB_RECALL_IDLE_S: "${RB_RECALL_IDLE_S:-3600}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1g
+
+  ephemeral_runner:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rosalinddb-backend:latest
+    command: ["python", "-m", "services.ephemeral_runner.run"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      S3_REGION: us-east-1
+      LANDING_PREFIX: s3://vectors/landing
+      INDEXES_PREFIX: s3://vectors/indexes
+      JWT_SECRET: "${JWT_SECRET:-dev-secret}"
+      RB_RECALL: "true"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+      RB_REQUIRE_AUTH: "false"
+      RB_ENABLE_QUOTAS: "false"
+      CACHE_DIR: /home/rosalind/cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512m
+
+  # === Load generator — on the same default network as cp; RTT is loopback. ===
+  k6:
+    image: grafana/k6:latest
+    container_name: rosalinddb-recall-bench-k6
+    depends_on:
+      cp:
+        condition: service_started
+    environment:
+      BASE_URL: "http://cp:8080"
+    volumes:
+      # The bench/ directory (this compose file's directory) -> /bench, so k6
+      # finds load_test_agents.js and writes summaries under /bench/results/.
+      - .:/bench
+    working_dir: /bench
+    # Kept alive so `docker compose exec` can drive individual k6 runs from
+    # run_agents_bench.sh. Each (mode x agents) cell is a separate `k6 run`.
+    entrypoint: ["sleep", "infinity"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
+
+volumes:
+  recall_bench_minio:
+  recall_bench_postgres:
+  recall_bench_pgvector:
