@@ -1,0 +1,65 @@
+@startuml recall-internal-delete
+' SEQUENCE: the Recall DELETE path in isolation
+' (services.source_registry.main -> adapters.state.state.recall_delete_vector).
+' Delete = UPSERT a TOMBSTONE (deleted=true) stamped with a FRESH lsn from
+' recall_lsn_seq (the SAME atomic upsert-increment the write uses), so the
+' tombstone is strictly ABOVE the watermark -- NEVER an in-place flip of an old
+' row's lsn. Last-write-wins on the PK. Committed before returning ->
+' synchronous read-your-deletes. The cap/CONSOLIDATE enqueue lives in
+' recall-internal-bounding, not here.
+
+title Recall internals: delete = above-watermark tombstone (read-your-deletes)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+actor "client" as client
+participant "cp\n(recall_delete_vector)" as cp
+database "recall_lsn_seq" as seq
+database "recall_vectors" as rv
+
+client -> cp : DELETE /vectors/{id}
+activate cp
+
+== one transaction on a dedicated recall connection ==
+
+cp -> seq : INSERT .. ON CONFLICT\nDO UPDATE last_lsn = last_lsn + 1\nRETURNING last_lsn
+activate seq
+seq --> cp : fresh lsn  (= max(lsn)+1)
+deactivate seq
+note right of seq #FDF3E7
+  A FRESH lsn, strictly above max(lsn) and thus
+  above ANY watermark. We do NOT flip deleted in
+  place / reuse the old lsn: a tombstone at-or-
+  below the watermark is excluded from the union
+  (the id never deletes) AND is trim-eligible
+  before its delete is folded (the id resurrects).
+end note
+
+cp -> rv : UPSERT (id, deleted=TRUE, lsn=fresh,\nzero-vector placeholder of dataset dim)\nON CONFLICT DO UPDATE lsn=EXCLUDED, deleted=TRUE
+activate rv
+note right of rv #E9F7E9
+  Last-write-wins on (tenant,dataset,id): an
+  existing live/deleted row is overwritten with
+  deleted=true + the fresh higher lsn. A cold-only
+  delete (no prior recall row) gets a dimension-
+  matched zero placeholder for the NOT NULL column
+  (never ranked -- the search excludes tombstones).
+end note
+rv --> cp : tombstone written
+deactivate rv
+
+cp -> cp : COMMIT
+note over cp #E7F3FD
+  Synchronous read-your-deletes: the tombstone is
+  durable BEFORE returning, so an immediate query
+  suppresses the id at once. RB_RECALL on -> 204.
+end note
+cp --> client : 204 No Content
+deactivate cp
+
+@enduml

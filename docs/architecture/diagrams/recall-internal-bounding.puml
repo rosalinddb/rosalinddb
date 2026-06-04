@@ -1,0 +1,66 @@
+@startuml recall-internal-bounding
+' What keeps the Recall tier SMALL so brute-force stays cheap -- from RECALL's
+' OWN point of view (the full consolidation mechanics are the tandem diagrams).
+' Two bounding forces, both enqueue a CONSOLIDATE (the outflow):
+'   (1) per-(tenant,dataset) cap RB_RECALL_MAX_ROWS -- after a write/delete, if
+'       recall_partition_count(...) > cap, enqueue CONSOLIDATE (best-effort,
+'       after the durable write).
+'   (2) idle window RB_RECALL_IDLE_S -- the builder idle-tick sweep
+'       (recall_idle_partitions) enqueues CONSOLIDATE for any partition whose
+'       newest write is older than the window -> drained to ZERO rows ->
+'       idle queries skip pgvector (scale-to-zero).
+' CONSOLIDATE is drawn only as the OUTFLOW; its internals are out of scope.
+'
+' Layout: a clean top->bottom pipeline. recall_vectors GROWS at the top; the two
+' triggers sit in the middle and both feed CONSOLIDATE at the bottom; the single
+' drain back-edge (right side) closes the loop. Few edges, short labels.
+
+title Recall internals: what keeps the set small (cap + idle drain)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam wrapWidth 230
+skinparam nodesep 45
+skinparam ranksep 55
+
+database "recall_vectors\n(rows + tombstones grow on\nevery sync write / delete)" as rv #F4F8FF
+
+card "(1) CAP trigger -- on write/delete\nrecall_partition_count(t,d)\n> RB_RECALL_MAX_ROWS (2000)?" as cap #LightYellow
+card "(2) IDLE trigger -- builder idle tick\nmax(created_at) older than\nRB_RECALL_IDLE_S (60s)?\n(recall_idle_partitions)" as idle #LightYellow
+
+queue "CONSOLIDATE\n(the OUTFLOW -- builder folds the partition\ninto a shard; mechanics out of scope here)" as q
+
+' down: grow -> trigger checks -> enqueue
+rv --> cap : on write / delete
+rv --> idle : on idle tick
+cap --> q : > cap -> enqueue\n(best-effort, after\ndurable write)
+idle --> q : idle -> enqueue\nper partition
+
+' single back-edge closes the loop (drain)
+q -[#0a7]-> rv : drain -> rows trimmed\n(idle drains to ZERO)
+
+note left of cap #E9F7E9
+  Bounds the brute-force scan size and
+  stops one chatty tenant evicting
+  another's working set. Best-effort
+  AFTER the committed write -> a cap-check
+  failure never fails the write.
+end note
+
+note right of idle #E7F3FD
+  Drains an idle partition to ZERO recall
+  rows -> idle queries skip pgvector
+  entirely (scale-to-zero preserved).
+end note
+
+note bottom of q #FDF3E7
+  Recall is bounded by CONSOLIDATION CADENCE, not data
+  size. Bulk imports BYPASS recall (land straight to the
+  consolidated tier), so a large dump never enters here.
+  => the set stays small => exact L2 stays cheap.
+end note
+
+@enduml

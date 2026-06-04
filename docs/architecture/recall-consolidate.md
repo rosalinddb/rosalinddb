@@ -57,6 +57,22 @@ companions). All live in [`diagrams/`](diagrams/):
 
 Validated with PlantUML 1.2024.7 (`-checkonly` + PNG render, both clean) — see the PR for details.
 
+### Recall tier internals
+
+A companion set focused on **how the Recall tier works BY ITSELF** — its own
+data model and flows, independent of the Consolidate tandem above. These are
+accurate to the implementation (`adapters.state.state.recall_*` +
+`recall/001_recall_vectors.sql`); CONSOLIDATE appears only as the outflow.
+All live in [`diagrams/`](diagrams/):
+
+| File | Kind | Shows |
+|---|---|---|
+| [`recall-internal-model.puml`](diagrams/recall-internal-model.puml) | structure / data-model | The Recall tier as a SEPARATE data-plane pgvector instance (`RB_RECALL_DSN`, never the control-plane PG): the `recall_vectors` table (columns + `(tenant_id, dataset, id)` PK), the `recall_lsn_seq` table (per-`(tenant,dataset)` `last_lsn`), the partition b-tree on `(tenant_id, dataset, lsn)`; brute-force exact by default (HNSW is a flagged escape hatch needing a fixed dim). |
+| [`recall-internal-write.puml`](diagrams/recall-internal-write.puml) | sequence | Synchronous write (`recall_upsert_vectors`): allocate an LSN BLOCK via the atomic `recall_lsn_seq` upsert-increment (seq-row lock → commit-order == LSN-order → strictly monotonic), then a SINGLE multi-row UPSERT into `recall_vectors` (last-write-wins, `deleted=false`); one transaction, committed before returning → immediately queryable (read-your-writes). |
+| [`recall-internal-search.puml`](diagrams/recall-internal-search.puml) | sequence | Brute-force search internals (`recall_search`): the TWO scans — MATCH (`NOT deleted`, `lsn > watermark`, `ORDER BY embedding <-> q`, `score = power(<->,2) = L2²`) and SUPPRESS-id (all ids above the watermark, live + tombstoned) — both scoped to the `(tenant,dataset)` partition; why an exact full-partition scan is fine (the set is bounded small by the cap + idle drain, not by data size). |
+| [`recall-internal-delete.puml`](diagrams/recall-internal-delete.puml) | sequence | Recall-delete (`recall_delete_vector`): UPSERT a tombstone (`deleted=true`) stamped with a FRESH `lsn` from `recall_lsn_seq` (strictly above the watermark — never an in-place flip), last-write-wins; committed before returning → synchronous read-your-deletes. |
+| [`recall-internal-bounding.puml`](diagrams/recall-internal-bounding.puml) | flow | What keeps Recall SMALL (so brute-force stays cheap) from Recall's own POV: the per-`(tenant,dataset)` cap `RB_RECALL_MAX_ROWS` → enqueue `CONSOLIDATE`; the idle window `RB_RECALL_IDLE_S` → drain to zero rows. CONSOLIDATE is the outflow only. |
+
 ## Architecture
 
 > Diagram: the component/overview is [`diagrams/recall-consolidate-tandem.puml`](diagrams/recall-consolidate-tandem.puml).

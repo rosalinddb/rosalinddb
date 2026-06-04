@@ -1,0 +1,65 @@
+@startuml recall-internal-search
+' SEQUENCE: the Recall brute-force search INTERNALS in isolation
+' (adapters.state.state.recall_search). TWO separate, load-bearing scans over
+' the SAME (tenant, dataset) partition, both filtered lsn > :watermark:
+'   (a) MATCH scan   -- NOT deleted, ORDER BY embedding <-> q,
+'                       score = power(<->, 2) = L2^2 (FAISS-aligned)
+'   (b) SUPPRESS scan -- every id above the watermark (live AND tombstoned)
+' Then a Python pass: take top_k live filter-passing rows as matches; the full
+' id set is the suppress set. The cross-tier merge itself is NOT shown here
+' (that is the tandem query-union diagram) -- this is Recall's own scan.
+
+title Recall internals: brute-force exact search (two scans)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+participant "caller\n(recall_search)" as rs
+database "recall_vectors\n(one (tenant,dataset)\npartition)" as rv
+
+note over rs #E7F3FD
+  Why EXACT full-partition scan is fine:
+  the recall set is bounded by CONSOLIDATION
+  CADENCE, not data size (cap + idle drain) --
+  hundreds-to-thousands of rows -> sub-ms,
+  ZERO recall loss, no ANN index churn.
+end note
+
+== (a) MATCH scan -- live rows, ranked ==
+
+rs -> rv : SELECT id, power(embedding <-> q, 2) AS score, metadata\nWHERE tenant_id=? AND dataset=? AND NOT deleted AND lsn > :watermark\nORDER BY embedding <-> q ASC
+activate rv
+note right of rv #E9F7E9
+  score = power(<->, 2) = L2^2 so it merges
+  DIRECTLY with FAISS L2^2 (metric alignment;
+  both tiers store the SAME un-normalised vecs).
+  NOT deleted keeps tombstones out of the
+  ranking in SQL (a zero-vector tombstone can
+  never sort first / crowd out a real match).
+end note
+rv --> rs : ranked live rows
+deactivate rv
+
+== (b) SUPPRESS-id scan -- every id above the watermark ==
+
+rs -> rv : SELECT id\nWHERE tenant_id=? AND dataset=? AND lsn > :watermark\n(live AND tombstoned; no filter, no top_k)
+activate rv
+rv --> rs : full id set above the watermark
+deactivate rv
+
+== Python post-pass ==
+
+rs -> rs : matches = first top_k LIVE rows\nthat pass the AND-of-equals filter\n(tombstones never match)
+rs -> rs : suppress_ids = EVERY id above the watermark
+note over rs #FDF3E7
+  Returns (suppress_ids, matches).
+  Recall is authoritative for lsn > watermark, so
+  suppress_ids drops the stale cold twin of ANY such
+  id -- tombstoned, filtered-out, or past top_k.
+end note
+
+@enduml
