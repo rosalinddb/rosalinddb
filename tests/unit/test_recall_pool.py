@@ -279,6 +279,62 @@ def test_recall_pooled_conn_rolls_back_and_returns_on_exception(state_on, monkey
     assert fake.opens == 1, "the rolled-back conn was reused, not re-opened"
 
 
+class _CommitRaisesConn(_FakeConn):
+    """A recall conn whose `commit()` RAISES (broken backend / TLS reset / COMMIT timeout).
+
+    Models the failure the fix targets: a clean block exits, `commit()` is called,
+    and the COMMIT itself fails. The connection must STILL be returned to the pool
+    — a commit failure must not leak the conn from the pool's accounting.
+    """
+
+    def commit(self):
+        self.commits += 1
+        raise RuntimeError("COMMIT failed: server closed the connection unexpectedly")
+
+
+def test_recall_pooled_conn_returns_conn_when_commit_raises(state_on, monkeypatch):
+    """A clean block whose `commit()` raises STILL returns the conn to the pool.
+
+    REGRESSION (review P2): if `conn.commit()` on the success path raises (broken
+    backend / TLS reset / statement_timeout on COMMIT), the exception must
+    propagate — but the connection must NOT be leaked. A leak permanently shrinks
+    the pool's `_used` accounting, so repeated commit failures eventually exhaust
+    the pool and every checkout 503s. The fix wraps `commit()` in try/finally so
+    `putconn()` runs on every exit.
+    """
+    state = state_on
+    fake = _FakePool(capacity=1)
+
+    # Mint a connection whose commit() raises, and seed the fake pool with it so
+    # the checkout hands it out.
+    bad = _CommitRaisesConn(fake)
+    fake._free.append(bad)
+    monkeypatch.setattr(state, "_RECALL_POOL", fake)
+    monkeypatch.setattr(state, "_RECALL_POOL_DSN", state._recall_dsn())
+
+    # (a) the commit failure propagates out of the block.
+    with pytest.raises(RuntimeError, match="COMMIT failed"):
+        with state.recall_pooled_conn() as conn:
+            assert conn is bad
+
+    # commit() was attempted exactly once on the clean-exit path.
+    assert bad.commits == 1, "clean exit must attempt commit() exactly once"
+    assert bad.rollbacks == 0, "clean exit must not roll back"
+
+    # (b) the connection is STILL returned to the pool — not leaked.
+    assert fake._out == 0, "commit() failure leaked the conn from the pool"
+
+    # And the returned conn is reusable: the next checkout gets it back (no new
+    # open). Raise inside the block so the exception path returns it WITHOUT
+    # re-invoking the still-failing commit().
+    with pytest.raises(ValueError):
+        with state.recall_pooled_conn() as conn2:
+            assert conn2 is bad
+            raise ValueError("force the rollback-and-return path")
+    assert fake.opens == 0, "the returned conn was reused, not re-opened"
+    assert fake._out == 0, "the reused conn leaked on the exception path"
+
+
 # --- DSN-keyed rebuild -----------------------------------------------------
 
 
