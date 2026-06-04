@@ -86,7 +86,7 @@ All 13 methods mem0 2.0.4 requires:
 |---|---|
 | `create_col(name, vector_size, distance)` | `POST /v1/datasets` `{name, dimension}` — `distance` **ignored** (L2-only); `dataset_exists` is an idempotent no-op |
 | `insert(vectors, payloads, ids)` | `POST /v1/datasets/{name}/vectors` (NDJSON upsert, last-write-wins) |
-| `update(vector_id, vector, payload)` | re-upsert via `POST .../vectors` (last-write-wins); omitted `payload` is backfilled from the current row |
+| `update(vector_id, vector, payload)` | re-upsert via `POST .../vectors` (last-write-wins); omitted `payload` is backfilled. **A metadata-only update (`vector=None`) preserves the stored embedding** by reading it back via `GET ...?include_values=true` — it never writes a placeholder. See the v1 limitation below. |
 | `delete(vector_id)` | `DELETE /v1/datasets/{name}/vectors/{id}` |
 | `get(vector_id)` | `GET /v1/datasets/{name}/vectors/{id}` → `OutputData` (or `None` on 404) |
 | `search(query, vectors, top_k, filters)` | `POST /v1/query` → L2² distance **converted to similarity** → `list[OutputData]` |
@@ -96,7 +96,7 @@ All 13 methods mem0 2.0.4 requires:
 | `delete_col()` | `DELETE /v1/datasets/{name}` |
 | `reset()` | `delete_col()` then `create_col()` |
 | `search_batch(queries, vectors_list, ...)` | inherited default — loops over `search()` |
-| `keyword_search(query, ...)` | **`NotImplementedError`** — RosalindDB v1 has no BM25 / full-text index |
+| `keyword_search(query, ...)` | returns **`None`** — RosalindDB v1 has no BM25 / full-text index. (`Memory.search` calls this unconditionally and guards `if result is not None`, so it MUST return `None`, not raise — see the [base contract](https://github.com/mem0ai/mem0).) |
 
 `OutputData` mirrors mem0's pgvector provider exactly: `id`, `score`, `payload`
 (mem0 reads only those three). `search`/`get` return `OutputData`; `list`
@@ -117,6 +117,22 @@ This is strictly decreasing in `d`, so the ranking is preserved (nearer →
 higher), the exact match `d == 0` maps to the maximum `1.0`, and the value is
 bounded in `(0, 1]`. It is **not** a cosine similarity — just a monotonic
 distance-to-similarity transform.
+
+> [!IMPORTANT]
+> **The similarity scale is NOT cosine — mem0's hard-coded thresholds behave
+> differently.** mem0 compares this `score` against thresholds that were tuned
+> for a **cosine** store (where similarity ∈ `[-1, 1]`), e.g. the memory **dedup**
+> gate (`>= 0.95`) and the search-result **gate** (default `0.1`). Here `score =
+> 1/(1+d)` with `d = L2² (squared Euclidean) distance`, so the same numeric
+> threshold means something different — two embeddings `0.32` apart in L2² already
+> fall to `score ≈ 0.95`, so cosine-tuned cut-offs will over- or under-trigger.
+>
+> Mitigations:
+> - **Normalize your embeddings to unit length.** For unit vectors,
+>   `L2² = 2·(1 − cos)`, so `d` is *monotonic* in cosine distance and the ranking
+>   (and `1/(1+d)`) tracks cosine ranking — the closest practical fix.
+> - **Tune the mem0 thresholds** (the dedup `0.95` and the search-gate `0.1`) to
+>   this `1/(1+d)` scale for your embedder / dimension if you can't normalize.
 
 ## Caveats (read these)
 
@@ -149,3 +165,23 @@ With `RB_RECALL` **off** (the default), writes are **eventually consistent**:
 later, so a just-inserted vector is not queryable until the build lands. The
 client's `poll_until_indexed(name)` helper can wait for that transition, but you
 do **not** get turn-to-turn read-your-writes in that mode.
+
+### 3. Metadata-only `update` only works for recall-resident vectors (v1)
+
+A metadata-only `update(vector_id, vector=None, payload=...)` preserves the
+stored embedding by reading it back via `GET ...?include_values=true` — so it
+**never** clobbers the vector with a placeholder. But `include_values` can only
+return the embedding for a **recall-resident** vector (a plain column read; no
+FAISS). For a **consolidated / cold-only** vector the embedding is not yet
+readable (cold FAISS `reconstruct` is a deferred follow-up), so rather than
+corrupt it the adapter raises:
+
+```
+ValueError: metadata-only update for a consolidated vector requires passing
+vector=...; cold reconstruct is a future include_values follow-up
+```
+
+Pass `vector=...` explicitly to update a consolidated vector. In practice mem0's
+`Memory` always passes `vector`, so this only affects direct/vendored callers
+that edit metadata in place. (Until a vector has been consolidated — i.e. while
+it still lives in the recall tier — metadata-only updates work transparently.)
