@@ -120,35 +120,54 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    """A psycopg2-connection stand-in usable as `with conn` (txn) + `closing`."""
+    """A psycopg2-connection stand-in.
+
+    Recall ops now run through the pooled context manager `recall_pooled_conn()`,
+    which OWNS the transaction: it calls `conn.commit()` on a clean exit and
+    `conn.rollback()` on an exception (the connection is NOT used as a `with`
+    context manager any more, and it is RETURNED to the pool rather than closed).
+    So this stub records commit/rollback directly.
+    """
 
     def __init__(self, cursor):
         self._cursor = cursor
         self.committed = False
         self.rolled_back = False
-        self.closed = False
 
     def cursor(self):
         return self._cursor
 
-    def __enter__(self):
-        return self
+    def commit(self):
+        self.committed = True
 
-    def __exit__(self, exc_type, *exc):
-        # psycopg2's connection-context-manager commits on clean exit, rolls
-        # back on exception. Mirror that so the txn semantics are asserted.
-        if exc_type is None:
-            self.committed = True
-        else:
-            self.rolled_back = True
-        return False
+    def rollback(self):
+        self.rolled_back = True
 
-    def close(self):
-        self.closed = True
+
+class _FakeRecallPool:
+    """A `ThreadedConnectionPool`-shaped stub returning a single fake conn.
+
+    Mirrors the control-plane pool test's `_FakePool`: `getconn()` hands out the
+    one fake connection and `putconn()` records its return, so the test can prove
+    the pooled context manager returned the connection (instead of closing a
+    fresh one per op). A non-empty `_pool` keeps the `reused` probe happy.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._pool = [object()]
+        self.returned = 0
+
+    def getconn(self):
+        return self._conn
+
+    def putconn(self, conn):
+        assert conn is self._conn
+        self.returned += 1
 
 
 def _on_state(state, monkeypatch):
-    """Turn the tier on and return (conn, cur, upserts).
+    """Turn the tier on and return (conn, cur, upserts, pool).
 
     The set-based write applies the batch in ONE multi-row UPSERT via
     `psycopg2.extras.execute_values` (imported by-name into `state`). Driving the
@@ -156,13 +175,20 @@ def _on_state(state, monkeypatch):
     recorder that captures the rendered SQL + the per-row params — that is the
     call shape the test asserts. `upserts` is the list of recorded
     `(sql, rows, template)` tuples.
+
+    Recall pooling: wire a fake recall pool (`_RECALL_POOL`) bound to the
+    matching DSN so `recall_pooled_conn()` checks the one fake conn out of it,
+    EXACTLY as `tests/unit/test_state_pool.py` wires `_POOL` for the
+    control-plane pool. The fake pool yields the fake conn and records its return.
     """
     monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
     monkeypatch.setenv("RB_RECALL", "true")
     importlib.reload(state)
     cur = _FakeCursor()
     conn = _FakeConn(cur)
-    monkeypatch.setattr(state, "_recall_conn", lambda: conn)
+    pool = _FakeRecallPool(conn)
+    monkeypatch.setattr(state, "_RECALL_POOL", pool)
+    monkeypatch.setattr(state, "_RECALL_POOL_DSN", state._recall_dsn())
     upserts: list[tuple] = []
 
     def _fake_execute_values(c, sql, rows, template=None, **kw):
@@ -170,7 +196,7 @@ def _on_state(state, monkeypatch):
         upserts.append((sql, list(rows), template))
 
     monkeypatch.setattr(state, "execute_values", _fake_execute_values)
-    return conn, cur, upserts
+    return conn, cur, upserts, pool
 
 
 def test_recall_upsert_allocates_lsn_block_and_single_upsert(state, monkeypatch):
@@ -180,7 +206,7 @@ def test_recall_upsert_allocates_lsn_block_and_single_upsert(state, monkeypatch)
     NOT 2N. Each record is stamped with its LSN from the contiguous block in
     input order.
     """
-    conn, cur, upserts = _on_state(state, monkeypatch)
+    conn, cur, upserts, pool = _on_state(state, monkeypatch)
     records = [
         {"id": "a", "values": [1.0, 2.0, 3.0], "metadata": {"k": "v"}},
         {"id": "b", "values": [4.0, 5.0, 6.0], "metadata": {}},
@@ -214,9 +240,11 @@ def test_recall_upsert_allocates_lsn_block_and_single_upsert(state, monkeypatch)
     # `deleted` is set FALSE for every row via the row template, not per-row.
     assert template == "(%s, %s, %s, %s, %s, %s, FALSE)"
 
-    # The batch committed once and the connection was closed.
+    # The batch committed once on the pooled connection, which was then RETURNED
+    # to the recall pool (NOT closed) — the whole txn ran on one checked-out conn.
     assert conn.committed is True
-    assert conn.closed is True
+    assert conn.rolled_back is False
+    assert pool.returned == 1, "the pooled recall connection must be returned once"
 
 
 def test_recall_upsert_intra_batch_duplicate_id_last_write_wins(state, monkeypatch):
@@ -226,7 +254,7 @@ def test_recall_upsert_intra_batch_duplicate_id_last_write_wins(state, monkeypat
     so the batch must be deduped before the UPSERT — keeping the latest
     occurrence (last-write-wins) and giving it a single LSN from the block.
     """
-    conn, cur, upserts = _on_state(state, monkeypatch)
+    conn, cur, upserts, pool = _on_state(state, monkeypatch)
     records = [
         {"id": "dup", "values": [1.0, 1.0, 1.0], "metadata": {"v": 1}},
         {"id": "other", "values": [2.0, 2.0, 2.0], "metadata": {}},
@@ -251,14 +279,17 @@ def test_recall_upsert_intra_batch_duplicate_id_last_write_wins(state, monkeypat
 
 
 def test_recall_upsert_empty_is_noop_no_connection(state, monkeypatch):
-    """An empty record list never opens a recall connection."""
+    """An empty record list never checks a recall connection out of the pool."""
     monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
     monkeypatch.setenv("RB_RECALL", "true")
     importlib.reload(state)
 
-    def _boom():  # pragma: no cover - must never be called
-        raise AssertionError("opened a recall connection for an empty batch")
+    def _boom(*a, **k):  # pragma: no cover - must never be called
+        raise AssertionError("built a recall pool for an empty batch")
 
+    # Guard BOTH the pool builder and the low-level connect: the empty-batch
+    # short-circuit must return before either is reached.
+    monkeypatch.setattr(state, "_get_recall_pool", _boom)
     monkeypatch.setattr(state, "_recall_conn", _boom)
     assert state.recall_upsert_vectors("t1", "ds", []) == 0
 
