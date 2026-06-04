@@ -445,3 +445,314 @@ def test_request_scoped_conn_resolves_inside_offloaded_state_call(monkeypatch):
         "the request-scoped connection contextvar did not resolve inside the "
         "offloaded state call — to_thread must copy contextvars"
     )
+
+
+# --- Split connect/read CP→DP timeout (#26) -------------------------------
+#
+# The CP proxies POST /v1/query to a private Query-DP over a persistent
+# httpx.AsyncClient. A single ~5s scalar timeout killed any query that
+# resolved a large COLD consolidated shard (first S3 GET + large shard
+# deserialise can legitimately run >5s on a healthy DP), surfacing a spurious
+# 504. The fix splits the timeout into a SHORT connect (fast-fail a dead DP)
+# and a generously LARGER read (let a slow large-cold-shard query on a healthy
+# DP finish), both env-tunable. These tests pin the new behaviour.
+
+
+def test_query_timeout_returns_httpx_timeout_with_split_values(monkeypatch):
+    """`_query_timeout()` returns an `httpx.Timeout` with split connect/read.
+
+    Not a single scalar — a short connect plus a generously larger read, so a
+    slow large-cold-shard query on a HEALTHY DP isn't killed while a dead DP
+    still fast-fails on connect.
+    """
+    import httpx
+    import services.query_api.query_proxy as qp
+
+    for var in (
+        "RB_QUERY_DP_READ_TIMEOUT_S",
+        "RB_QUERY_DP_CONNECT_TIMEOUT_S",
+        "RB_QUERY_DP_TIMEOUT_S",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    t = qp._query_timeout()
+    assert isinstance(t, httpx.Timeout)
+    # Read default must be clearly > the old 5s so a large cold shard survives.
+    assert t.read is not None and t.read >= 30.0, (
+        f"read timeout default must be >= 30s (was the old 5s); got {t.read}"
+    )
+    # Connect must be short (fast-fail a dead DP) and well under the read.
+    assert t.connect is not None and t.connect <= 10.0, (
+        f"connect timeout default must be short (<=10s); got {t.connect}"
+    )
+    assert t.connect < t.read, "connect must be shorter than read"
+    # write/pool must be set (httpx requires all four, or a default).
+    assert t.write is not None and t.pool is not None
+
+
+def test_query_timeout_read_env_override(monkeypatch):
+    """`RB_QUERY_DP_READ_TIMEOUT_S` overrides the read timeout, read live."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.delenv("RB_QUERY_DP_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "120")
+    t = qp._query_timeout()
+    assert t.read == 120.0
+
+
+def test_query_timeout_connect_env_override(monkeypatch):
+    """`RB_QUERY_DP_CONNECT_TIMEOUT_S` overrides the connect timeout, read live."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.setenv("RB_QUERY_DP_CONNECT_TIMEOUT_S", "1.5")
+    t = qp._query_timeout()
+    assert t.connect == 1.5
+
+
+def test_query_timeout_legacy_env_still_sets_read(monkeypatch):
+    """The legacy `RB_QUERY_DP_TIMEOUT_S` knob still tunes the READ timeout.
+
+    Backwards-compat: a deployment that set the old single-scalar knob keeps
+    tuning the (now read) timeout; the dedicated read knob takes precedence
+    when both are set.
+    """
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.delenv("RB_QUERY_DP_READ_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("RB_QUERY_DP_TIMEOUT_S", "45")
+    t = qp._query_timeout()
+    assert t.read == 45.0
+
+
+def test_query_timeout_read_knob_precedence_over_legacy(monkeypatch):
+    """The dedicated read knob wins over the legacy scalar when both are set."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.setenv("RB_QUERY_DP_TIMEOUT_S", "7")
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "90")
+    t = qp._query_timeout()
+    assert t.read == 90.0
+
+
+def test_query_timeout_bad_env_falls_back_to_defaults(monkeypatch):
+    """A non-numeric env value falls back to the sane defaults, not a crash."""
+    import httpx
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "not-a-number")
+    monkeypatch.setenv("RB_QUERY_DP_CONNECT_TIMEOUT_S", "garbage")
+    t = qp._query_timeout()
+    assert isinstance(t, httpx.Timeout)
+    assert t.read >= 30.0 and t.connect <= 10.0
+
+
+@pytest.mark.parametrize("bad_value", ["-5", "0", "-0.5", "0.0"])
+def test_query_timeout_read_nonpositive_falls_back_to_default(monkeypatch, bad_value):
+    """A negative/zero read knob is INVALID → default, NOT clamped to ~0.
+
+    Clamping `-5`/`0` down to a sub-second budget would 504 essentially every
+    real query (the opposite of intent). With no legacy knob set it must
+    resolve to the 30s default.
+    """
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.delenv("RB_QUERY_DP_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", bad_value)
+    t = qp._query_timeout()
+    assert t.read == qp._DEFAULT_READ_TIMEOUT_S
+    assert t.read >= 30.0, f"non-positive read knob must not clamp to ~0; got {t.read}"
+
+
+@pytest.mark.parametrize("bad_value", ["-5", "0", "-0.5", "0.0"])
+def test_query_timeout_connect_nonpositive_falls_back_to_default(monkeypatch, bad_value):
+    """A negative/zero connect knob is INVALID → default, NOT clamped to ~0."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.setenv("RB_QUERY_DP_CONNECT_TIMEOUT_S", bad_value)
+    t = qp._query_timeout()
+    assert t.connect == qp._DEFAULT_CONNECT_TIMEOUT_S
+
+
+@pytest.mark.parametrize("bad_value", ["", "   ", "bad", "-5", "0"])
+def test_query_timeout_invalid_read_falls_through_to_legacy(monkeypatch, bad_value):
+    """An empty/garbage/non-positive NEW read knob must NOT mask a valid legacy.
+
+    `RB_QUERY_DP_READ_TIMEOUT_S=''` (or 'bad'/'-5'/'0') with a valid legacy
+    `RB_QUERY_DP_TIMEOUT_S=45` must resolve to 45 (legacy), not 30 (default).
+    """
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", bad_value)
+    monkeypatch.setenv("RB_QUERY_DP_TIMEOUT_S", "45")
+    t = qp._query_timeout()
+    assert t.read == 45.0
+
+
+def test_query_timeout_empty_read_knob_treated_as_unset(monkeypatch):
+    """An empty-string new read knob is treated the same as unset → default."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.delenv("RB_QUERY_DP_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "")
+    t = qp._query_timeout()
+    assert t.read == qp._DEFAULT_READ_TIMEOUT_S
+
+
+def test_query_timeout_valid_read_still_wins_over_legacy(monkeypatch):
+    """Precedence unchanged: a VALID new read knob still beats the legacy knob."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.setenv("RB_QUERY_DP_TIMEOUT_S", "45")
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "90")
+    t = qp._query_timeout()
+    assert t.read == 90.0
+
+
+def test_query_timeout_tiny_positive_read_floored(monkeypatch):
+    """A legitimately-tiny POSITIVE value keeps the 0.1s floor (not rejected)."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.delenv("RB_QUERY_DP_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "0.001")
+    t = qp._query_timeout()
+    assert t.read == 0.1
+
+
+def test_build_client_uses_configured_timeout(monkeypatch):
+    """`_build_client` bakes the configured `httpx.Timeout` into the client.
+
+    The persistent per-pool client must carry the split connect/read timeout
+    so every request through it inherits the generous read budget for large
+    cold shards.
+    """
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.delenv("RB_QUERY_DP_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "33")
+    monkeypatch.setenv("RB_QUERY_DP_CONNECT_TIMEOUT_S", "2")
+
+    client = qp._build_client("http://dp.internal:8090")
+    try:
+        t = client.timeout
+        assert t.read == 33.0
+        assert t.connect == 2.0
+    finally:
+        import asyncio
+
+        asyncio.run(client.aclose())
+
+
+def test_slow_within_read_timeout_succeeds_where_old_5s_failed(monkeypatch):
+    """A slow-but-within-read-timeout DP response succeeds.
+
+    Simulates the large-cold-shard case: the DP takes ~0.2s to answer, which
+    is well within the (>=30s) read timeout but would have blown the old 5s
+    scalar if it had been, say, 6s. We assert the proxy returns the DP's 200
+    and that the per-request timeout it passed has a read budget >= 30s — the
+    headroom that lets a genuine 6s+ cold-shard query through.
+    """
+    import asyncio
+
+    import httpx
+    import services.query_api.query_proxy as qp
+
+    _stub_pool(monkeypatch)
+    monkeypatch.delenv("RB_QUERY_DP_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("RB_QUERY_DP_READ_TIMEOUT_S", raising=False)
+
+    seen = {}
+
+    class _FakeResp:
+        content = b'{"matches": []}'
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+    class _FakeClient:
+        async def request(self, *_a, **kw):
+            seen["timeout"] = kw.get("timeout")
+            # A slow DP — comfortably inside the generous read budget.
+            await asyncio.sleep(0.2)
+            return _FakeResp()
+
+    monkeypatch.setattr(qp, "_get_client", lambda _base: _FakeClient())
+
+    async def _run():
+        return await qp._proxy("POST", "/v1/query", "ten_slow", body=b"{}")
+
+    resp = asyncio.run(_run())
+    assert resp.status_code == 200
+    t = seen["timeout"]
+    assert isinstance(t, httpx.Timeout)
+    assert t.read >= 30.0, (
+        "the per-request read budget must clear 30s so a 6s+ large-cold-shard "
+        f"query is not killed; got {t.read}"
+    )
+
+
+def test_connect_failure_still_fast_fails_to_503(monkeypatch):
+    """A connect failure still fast-fails the connect-retry chain → 503.
+
+    The split timeout must not regress the connect path: a dead DP raising
+    ConnectTimeout/ConnectError is still retried then mapped to 503
+    `query_unavailable` (a query is read-only and safe to retry on connect).
+    """
+    import asyncio
+
+    import httpx
+    import services.query_api.query_proxy as qp
+
+    _stub_pool(monkeypatch)
+    monkeypatch.setenv("RB_QUERY_DP_CONNECT_RETRIES", "1")
+    monkeypatch.setenv("RB_QUERY_DP_CONNECT_BACKOFF_S", "0")
+    calls = {"n": 0}
+
+    class _FakeClient:
+        async def request(self, *_a, **_kw):
+            calls["n"] += 1
+            raise httpx.ConnectTimeout("dead DP")
+
+    monkeypatch.setattr(qp, "_get_client", lambda _base: _FakeClient())
+
+    async def _run():
+        return await qp._proxy("POST", "/v1/query", "ten_dead", body=b"{}")
+
+    resp = asyncio.run(_run())
+    assert resp.status_code == 503
+    import json
+
+    assert json.loads(resp.body)["error"]["code"] == "query_unavailable"
+    # 1 initial + 1 retry.
+    assert calls["n"] == 2
+
+
+def test_read_timeout_still_maps_to_504(monkeypatch):
+    """The ReadTimeout→504 `query_timeout` mapping is preserved (not retried).
+
+    Even with the generous read budget, a DP that blows the (larger) read
+    timeout still maps to 504 `query_timeout` and is NOT retried — the DP may
+    have done work.
+    """
+    import asyncio
+    import json
+
+    import httpx
+    import services.query_api.query_proxy as qp
+
+    _stub_pool(monkeypatch)
+    monkeypatch.setenv("RB_QUERY_DP_CONNECT_RETRIES", "3")
+    calls = {"n": 0}
+
+    class _FakeClient:
+        async def request(self, *_a, **_kw):
+            calls["n"] += 1
+            raise httpx.ReadTimeout("still too slow")
+
+    monkeypatch.setattr(qp, "_get_client", lambda _base: _FakeClient())
+
+    async def _run():
+        return await qp._proxy("POST", "/v1/query", "ten_to", body=b"{}")
+
+    resp = asyncio.run(_run())
+    assert resp.status_code == 504
+    assert json.loads(resp.body)["error"]["code"] == "query_timeout"
+    assert calls["n"] == 1, "a read timeout must not be retried"

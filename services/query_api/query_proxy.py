@@ -387,15 +387,127 @@ _CLIENTS: Dict[str, httpx.AsyncClient] = {}
 _CLIENTS_LOCK = threading.Lock()
 
 
-def _query_timeout() -> float:
-    """CP→DP query timeout in seconds (env-tunable, default 5s).
+# --- CP→DP timeout defaults (rationale) -----------------------------------
+#
+# A single ~5s scalar timeout was wrong for this proxy: it conflated two very
+# different waits. A query that resolves a large COLD consolidated shard does
+# the first S3 GET of that shard plus a large-shard deserialise on the DP, and
+# that work legitimately runs WELL past 5s on a perfectly healthy DP — the
+# 6 GB-shard first-GET measured ~100s in the mmap bench (see
+# docs/architecture/ssd-cache.md). Under the old scalar the CP's
+# `httpx.ReadTimeout` fired ~95s before the DP would have answered, turning a
+# slow-but-correct query into a spurious 504.
+#
+# The fix splits the budget by what each phase actually means:
+#
+#   connect (default 3s): a TCP/TLS handshake to a healthy DP on the private
+#     network is sub-second; 3s is generous headroom for a transient blip yet
+#     still FAST-FAILS a dead/unreachable DP, so the connect-retry chain
+#     (_connect_retries) and the 503 `query_unavailable` mapping stay snappy
+#     instead of waiting out a multi-second read budget on a host that will
+#     never answer.
+#
+#   read (default 30s): the time the DP is allowed to spend producing the
+#     response body. 30s is ~6x the old scalar — comfortably clears a genuine
+#     large-cold-shard fetch+deserialise on a healthy DP — while still bounding
+#     a truly stuck DP so a client is not held forever. We deliberately do NOT
+#     ship the bench's 120s as the prod default: 120s was an overlay value to
+#     stop the bench's 6 GB-shard Docker-network GET from being killed, and a
+#     2-minute prod default would mask real DP pathologies and pin a CP worker
+#     for two minutes per stuck request. Operators with genuinely huge cold
+#     shards raise RB_QUERY_DP_READ_TIMEOUT_S to taste (the bench sets 120s).
+#
+#   write/pool (default 5s): small request body (a query + vector) and a
+#     bounded local connection pool — neither phase is the large-cold-shard
+#     bottleneck, so a short, sane bound is fine.
+_DEFAULT_CONNECT_TIMEOUT_S = 3.0
+_DEFAULT_READ_TIMEOUT_S = 30.0
+_DEFAULT_WRITE_TIMEOUT_S = 5.0
+_DEFAULT_POOL_TIMEOUT_S = 5.0
 
-    Read live so an operator or a test can retune it without re-importing.
+
+def _parse_positive_timeout_s(raw: str | None) -> float | None:
+    """Parse a timeout-seconds env value, returning None for INVALID input.
+
+    Invalid means: unset (`None`), empty/whitespace-only, non-numeric, or a
+    parsed value `<= 0`. A non-positive read/connect budget is never what an
+    operator wants — clamping it down to ~0 would turn a `-5`/`0` typo into a
+    sub-second budget that 504s essentially every real query (the opposite of
+    intent). Returning None lets callers fall back to the next source (legacy
+    knob, then the hard default) instead of clamping invalid input.
+
+    A `0.1s` floor is applied only to legitimately-tiny POSITIVE values, so a
+    deliberate small budget is honoured while a non-positive value is rejected.
     """
+    if raw is None or raw.strip() == "":
+        return None
     try:
-        return max(0.1, float(os.getenv("RB_QUERY_DP_TIMEOUT_S", "5")))
+        value = float(raw)
     except (TypeError, ValueError):
-        return 5.0
+        return None
+    if value <= 0:
+        return None
+    return max(0.1, value)
+
+
+def _read_timeout_s() -> float:
+    """Resolve the CP→DP READ timeout in seconds (env-tunable).
+
+    Precedence: the dedicated `RB_QUERY_DP_READ_TIMEOUT_S` knob wins; falling
+    back to the LEGACY single-scalar `RB_QUERY_DP_TIMEOUT_S` (which used to be
+    the whole timeout and is, conceptually, the read budget) so an existing
+    deployment that tuned the old knob keeps tuning the read timeout; finally
+    the 30s default. Read live so an operator or a test can retune without
+    re-importing.
+
+    An unset OR invalid (empty / non-numeric / `<=0`) new read knob falls
+    THROUGH the legacy knob before the hard default — so an empty/garbage new
+    knob never masks a valid legacy knob, and a non-positive value falls back
+    instead of being clamped to a near-zero budget.
+    """
+    value = _parse_positive_timeout_s(os.getenv("RB_QUERY_DP_READ_TIMEOUT_S"))
+    if value is None:
+        # Backwards-compat: the legacy scalar knob now tunes the read budget.
+        value = _parse_positive_timeout_s(os.getenv("RB_QUERY_DP_TIMEOUT_S"))
+    if value is None:
+        return _DEFAULT_READ_TIMEOUT_S
+    return value
+
+
+def _connect_timeout_s() -> float:
+    """Resolve the CP→DP CONNECT timeout in seconds (env-tunable, default 3s).
+
+    Short so a dead/unreachable DP fast-fails the connect-retry chain instead
+    of waiting out the (much larger) read budget. An empty / non-numeric /
+    non-positive value falls back to the default rather than being clamped to a
+    near-zero budget. Read live.
+    """
+    value = _parse_positive_timeout_s(os.getenv("RB_QUERY_DP_CONNECT_TIMEOUT_S"))
+    if value is None:
+        return _DEFAULT_CONNECT_TIMEOUT_S
+    return value
+
+
+def _query_timeout() -> httpx.Timeout:
+    """CP→DP query timeout as a SPLIT `httpx.Timeout` (env-tunable).
+
+    Separate connect vs read (plus write/pool) instead of one scalar: a SHORT
+    connect fast-fails a dead DP, while a generously LARGER read lets a slow
+    large-cold-shard query on a HEALTHY DP finish. See the rationale block and
+    the per-knob helpers above. Read live so an operator or a test can retune
+    it without re-importing.
+
+    Env knobs (all `RB_QUERY_DP_*`, matching the existing convention here):
+      - `RB_QUERY_DP_READ_TIMEOUT_S` — read budget (default 30s); the legacy
+        `RB_QUERY_DP_TIMEOUT_S` still works as a fallback for the read budget.
+      - `RB_QUERY_DP_CONNECT_TIMEOUT_S` — connect budget (default 3s).
+    """
+    return httpx.Timeout(
+        connect=_connect_timeout_s(),
+        read=_read_timeout_s(),
+        write=_DEFAULT_WRITE_TIMEOUT_S,
+        pool=_DEFAULT_POOL_TIMEOUT_S,
+    )
 
 
 def _connect_retries() -> int:
@@ -429,12 +541,18 @@ def _build_client(base_url: str) -> httpx.AsyncClient:
     """Construct the persistent `httpx.AsyncClient` for one DP pool.
 
     HTTP/2 keep-alive enabled and a bounded connection pool, per the contract.
-    The timeout is applied per-request (it is env-tunable and read live) rather
-    than baked into the client.
+    The split connect/read `httpx.Timeout` (see `_query_timeout`) is baked in
+    as the client default so every request through this persistent client
+    inherits the generous read budget that a large COLD-shard query needs. It
+    is ALSO passed per-request in `_proxy` (read live) so an operator can
+    retune the timeout at runtime without rebuilding the client, and so a
+    test-registered client (`register_dp_client`) — built without this default
+    — still gets the configured split timeout on each call.
     """
     return httpx.AsyncClient(
         base_url=base_url,
         http2=True,
+        timeout=_query_timeout(),
         limits=httpx.Limits(
             max_connections=int(os.getenv("RB_QUERY_DP_MAX_CONNECTIONS", "100")),
             max_keepalive_connections=int(
