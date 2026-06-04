@@ -191,13 +191,17 @@ gets a dedicated test. *Implemented* as `power(embedding <-> q, 2)` in the recal
 the cold shard's FAISS L2² distances.
 
 **Dedup:** a re-upserted id can be in both tiers during the consolidation grace window;
-**recall wins** (its version is newer). Recall tombstones suppress matching consolidated ids.
-The merge (`services.query_api.v1_query._merge_recall_and_cold`) keys on `id`: a recall **live**
-row replaces the cold match for that id; a recall **tombstone** drops the cold match and
-contributes nothing; the survivors are sorted ascending by L2² and truncated to `top_k`.
+**recall is authoritative** for any id above the watermark (its version is newer). The merge
+(`services.query_api.v1_query._merge_recall_and_cold`) keys suppression on the FULL set of recall
+ids above the watermark: a recall row for id X — **live, tombstoned, filtered-out, or
+ranked-past-`top_k`** — always drops the stale cold copy of X. Only a **filter-passing live**
+recall row contributes an actual match; a tombstone, or a live row that fails the query filter,
+suppresses its cold twin but adds nothing (so an authoritative re-upsert that no longer matches
+the filter cannot let a stale, filter-matching cold copy leak). The survivors are sorted ascending
+by L2² and truncated to `top_k`.
 
 **No consolidated shard + recall has data → synchronous recall answer.** When the dataset has
-no shard yet (`get_latest_shard` → none) the watermark is `0`, so every recall row qualifies and
+no shard yet (`list_shards` → empty) the watermark is `0`, so every recall row qualifies and
 the query is answered **synchronously from recall** — it does **not** fall through to the
 `ephemeral` empty+`job_id` path (that path is reserved for "nothing can answer": no shard AND no
 recall row). This is the read-your-writes property for a brand-new dataset.
@@ -220,7 +224,7 @@ or added matches; the label only describes the cold cache. `recall` is the dedic
 **Watermark/shard pairing (I3) in code.** The cold search (`_hot_search`) reports the exact
 shard row it resolved back to `run_query` (via an out-dict), and the recall scan is filtered with
 *that* shard's `consolidated_lsn` — never a watermark resolved by an independent
-`get_latest_shard` call — so a stale cached shard version can never open a partition gap.
+`list_shards` lookup — so a stale cached shard version can never open a partition gap.
 
 ## Invariants
 
