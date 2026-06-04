@@ -976,7 +976,13 @@ def _apply_recall_migrations(dsn: str) -> None:
     recall schema without a ledger to reconcile.
     """
     migrations_dir = Path(__file__).parent / "migrations" / "recall"
-    conn = psycopg2.connect(dsn)
+    # Route the migrator's dedicated connection through the single recall
+    # connection seam too, so EVERY recall connection — pooled, dedicated, and
+    # the migration runner — carries the txn-mode `prepare_threshold=None`
+    # marker. The migrator's `pg_advisory_xact_lock` is TRANSACTION-scoped and
+    # its DDL runs in one transaction on this dedicated (non-pooled) connection,
+    # so `_recall_connect()`'s contract is a perfect fit.
+    conn = _recall_connect(dsn)
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
@@ -1092,10 +1098,15 @@ def _recall_conn() -> "psycopg2.extensions.connection":
     A brand-new connection to `RB_RECALL_DSN` (a full TCP + TLS + auth
     handshake). This is NO LONGER the per-op recall path: every recall CRUD /
     consolidation function now checks a connection out of the recall pool via
-    `recall_pooled_conn()` instead (see below). `_recall_conn()` is retained for
-    the migration runner's dedicated-connection needs and as a low-level
-    factory, never as the hot per-query path it used to be (~48ms/op of pure
-    handshake when one was opened per recall op).
+    `recall_pooled_conn()` instead (see below).
+
+    RETAINED FOR TESTS / LOW-LEVEL USE: this has no production callers today (the
+    migration runner mints its dedicated connection via `_recall_connect()`
+    directly, and the hot path is pooled). It is kept as the thin
+    DSN-resolving + recall-off-guard wrapper around `_recall_connect()` for the
+    unit suite (which monkeypatches / drives it) and as a low-level dedicated-
+    connection factory — not dead code. It was never the hot per-query path it
+    used to be (~48ms/op of pure handshake when one was opened per recall op).
 
     Lazy by construction: only reached when `recall_enabled()` is True. With the
     flag off no caller reaches here and no recall pool is built, so no connection
@@ -1111,7 +1122,87 @@ def _recall_conn() -> "psycopg2.extensions.connection":
         raise RuntimeError(
             "recall tier is off (RB_RECALL_DSN unset); no recall connection"
         )
-    return psycopg2.connect(dsn)
+    return _recall_connect(dsn)
+
+
+# --- Recall-tier connection factory: pgbouncer TRANSACTION-mode safety -----
+#
+# The recall tier is run behind pgbouncer in TRANSACTION pooling mode in prod
+# (a server connection is held only for the duration of a transaction, then
+# returned to pgbouncer's pool — so NO session-level state may span
+# transactions). EVERY recall connection — pooled (`_get_recall_pool`), the
+# dedicated factory (`_recall_conn`), AND the migration runner
+# (`_apply_recall_migrations`) — is minted HERE so that txn-mode guarantee
+# lives in exactly one place.
+#
+# TXN-MODE SAFETY AUDIT of the recall code path (recall_upsert_vectors,
+# recall_delete_vector, recall_search, recall_list_rows, recall_get_vector*,
+# recall_partition_count, recall_trim, recall_snapshot_for_consolidation,
+# recall_idle_partitions, and the recall LSN-block allocation):
+#
+#   * Server-side PREPARED STATEMENTS — psycopg2 (this codebase; psycopg3 is NOT
+#     installed) does NOT emit named server-side prepared statements: a
+#     parameterised `cur.execute` uses the unnamed statement, bound+executed in
+#     one round-trip, never persisted on the server across checkouts. So there is
+#     no named prepared statement to outlive a pgbouncer-pooled server
+#     connection. (psycopg3's `prepare_threshold` — the knob the task names — does
+#     not exist on psycopg2.connect; the equivalent guarantee is structural here.)
+#     `prepare_threshold` is set to None as an EXPLICIT, FORWARD-COMPATIBLE marker
+#     of intent: documented, asserted in the unit suite, and the single seam a
+#     future psycopg3 migration must keep at None for txn-mode safety. psycopg2
+#     silently ignores the unknown kwarg, so behaviour is unchanged today.
+#   * SET / session GUCs — none. No `SET`, no `set_session()`, no per-connection
+#     options string; isolation stays the server default (READ COMMITTED) and
+#     each recall op relies only on a STATEMENT-level snapshot (recall_search /
+#     recall_list_rows / recall_snapshot_for_consolidation are single-statement
+#     by design — see their docstrings), never on session-spanning state.
+#   * LISTEN/NOTIFY — none on the recall tier (catalog NOTIFY is control-plane
+#     only).
+#   * ADVISORY LOCKS across transactions — none on the recall path. The recall
+#     MIGRATION runner (`_apply_recall_migrations`) takes `pg_advisory_xact_lock`
+#     (TRANSACTION-scoped, auto-released at commit/rollback) on a DEDICATED,
+#     non-pooled connection — txn-mode-safe and not on the hot pooled path. The
+#     only SESSION-level advisory lock (`dataset_build_lock`, autocommit) is on
+#     the CONTROL-PLANE connection (`_conn()`), NOT the recall tier, and uses a
+#     dedicated connection it owns and closes — it never touches a pgbouncer-
+#     pooled recall checkout.
+#   * Server-side NAMED CURSORS — none. Every recall cursor is a plain client
+#     cursor; results are `fetchall()`/`fetchone()`'d within the same
+#     transaction, so no portal spans a checkout.
+#   * Two statements assuming a shared session beyond one txn — none. Every
+#     recall op opens ONE transaction on ONE `recall_pooled_conn()` checkout and
+#     commits/rolls back before the connection is returned (the multi-statement
+#     ops — upsert's LSN-alloc+UPSERT, delete's LSN-alloc+tombstone — are the
+#     SAME single transaction on the SAME checkout). Nothing is carried across.
+#
+# CONCLUSION: the recall path was ALREADY txn-mode-pgbouncer-safe by
+# construction; this factory only HARDENS and DOCUMENTS that (the
+# `prepare_threshold=None` marker + the single-seam guarantee), it does not fix
+# an unsafe operation.
+
+_RECALL_PREPARE_THRESHOLD = None  # txn-mode marker: never persist named prepared stmts
+
+
+def _recall_connect(dsn: str) -> "psycopg2.extensions.connection":
+    """Open ONE recall connection in a pgbouncer-TRANSACTION-mode-safe way.
+
+    The single seam through which every recall connection (pooled, dedicated,
+    and the migration runner) is created, so the transaction-pooling guarantee
+    documented above lives in one place. Sets `prepare_threshold=None` so no NAMED server-side prepared
+    statement is ever created on a recall connection — the property that lets a
+    server connection be safely returned to pgbouncer's transaction pool after
+    each transaction without leaking session state to the next borrower.
+
+    `prepare_threshold` is a psycopg3 knob; psycopg2 (the installed driver) never
+    auto-prepares. Passing it as `None` is a deliberate no-op on psycopg2:
+    `psycopg2.extensions.make_dsn` DROPS kwargs whose value is None, so the
+    connection params are byte-identical to a plain `psycopg2.connect(dsn)` today
+    — the safety on psycopg2 is structural, this is only the documented, tested
+    marker. (NOTE: a NON-None value here — e.g. an int — would raise psycopg2's
+    "invalid connection option"; the txn-safe value is None, so keep it None.) A
+    future psycopg3 migration MUST keep this at None to stay txn-mode-safe.
+    """
+    return psycopg2.connect(dsn, prepare_threshold=_RECALL_PREPARE_THRESHOLD)
 
 
 # --- Recall-tier application-side connection pool --------------------------
@@ -1201,10 +1292,20 @@ def _get_recall_pool(
                     except Exception:
                         pass
                 maxconn = maxconn_override or _recall_pool_max_size()
+                # `ThreadedConnectionPool` forwards **kwargs to `psycopg2.connect`
+                # for EVERY backend it opens, so threading the txn-mode marker
+                # (`prepare_threshold=None`) through here makes every POOLED recall
+                # connection match `_recall_connect`'s pgbouncer-transaction-mode
+                # guarantee — no named server-side prepared statement is ever
+                # created on a recall connection, so a server connection can be
+                # safely recycled by pgbouncer's transaction pool after each txn.
+                # (None is dropped by psycopg2's make_dsn → byte-identical params
+                # today; it is the explicit, tested, psycopg3-forward marker.)
                 _RECALL_POOL = psycopg2.pool.ThreadedConnectionPool(
                     minconn=_RECALL_POOL_MIN,
                     maxconn=max(_RECALL_POOL_MIN, maxconn),
                     dsn=dsn,
+                    prepare_threshold=_RECALL_PREPARE_THRESHOLD,
                 )
                 _RECALL_POOL_DSN = dsn
     return _RECALL_POOL

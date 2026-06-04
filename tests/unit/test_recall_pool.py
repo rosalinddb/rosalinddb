@@ -359,8 +359,9 @@ def test_recall_pool_rebuilds_when_dsn_changes(state_on, monkeypatch):
     # Stub the constructor so no real connection is attempted.
     built = {}
 
-    def _fake_ctor(minconn, maxconn, dsn):
+    def _fake_ctor(minconn, maxconn, dsn, **kwargs):
         built["dsn"] = dsn
+        built["kwargs"] = kwargs
         return _FakePool(capacity=1)
 
     monkeypatch.setattr(state.psycopg2.pool, "ThreadedConnectionPool", _fake_ctor)
@@ -370,6 +371,9 @@ def test_recall_pool_rebuilds_when_dsn_changes(state_on, monkeypatch):
     assert closed["n"] == 1, "the stale pool (old DSN) must be closed on rebuild"
     assert built["dsn"] == "postgresql://u:p@OTHER:5432/recall2"
     assert pool is not old
+    # The rebuilt pool still carries the pgbouncer-txn-mode marker through to
+    # every backend it opens (see test_recall_pool_built_with_prepare_threshold).
+    assert built["kwargs"].get("prepare_threshold", "MISSING") is None
 
 
 # --- Block-with-timeout checkout (mirrors pooled_conn) ---------------------
@@ -602,3 +606,246 @@ def test_close_recall_pool_closes_and_clears(state_on, monkeypatch):
     assert closed["n"] == 1
     assert state._RECALL_POOL is None
     assert state._RECALL_POOL_DSN is None
+
+
+# --- pgbouncer TRANSACTION-mode safety (task #16) --------------------------
+#
+# The recall tier runs behind pgbouncer in transaction pooling mode in prod: a
+# server connection is held only for the duration of a transaction, so NO
+# session-level state may span transactions. These tests pin the app-side
+# hardening that makes the recall connections safe to recycle that way:
+#
+#   (1) every recall connection (pooled + dedicated) is minted with the
+#       txn-mode marker `prepare_threshold=None`, so no NAMED server-side
+#       prepared statement is ever created on a recall connection (the property
+#       that lets pgbouncer hand the server connection to the next borrower after
+#       each transaction without leaking session state); and
+#   (2) each recall op is a SELF-CONTAINED single transaction on a SINGLE pool
+#       checkout — commit/rollback happens before the connection is returned, so
+#       nothing spans a checkout. (The per-op single-checkout property is also
+#       proven by the upsert/search/list tests above; these add the explicit
+#       txn-mode framing.)
+#
+# These are hermetic: no pgbouncer, no Docker, no real pgvector.
+
+
+def test_recall_connect_sets_prepare_threshold_none(state_on, monkeypatch):
+    """`_recall_connect()` mints recall connections with `prepare_threshold=None`.
+
+    The txn-mode marker: psycopg2 never auto-prepares (and drops the None kwarg),
+    so this is a no-op TODAY, but it is the explicit, forward-compatible guarantee
+    that NO named server-side prepared statement persists across a pgbouncer-
+    pooled checkout. The dedicated factory `_recall_conn()` routes through here too.
+    """
+    state = state_on
+    seen = {}
+
+    def _spy_connect(dsn, **kwargs):
+        seen["dsn"] = dsn
+        seen["kwargs"] = kwargs
+        return object()  # a stand-in connection; we only inspect the call
+
+    monkeypatch.setattr(state.psycopg2, "connect", _spy_connect)
+
+    conn = state._recall_connect(state._recall_dsn())
+    assert conn is not None
+    assert seen["dsn"] == state._recall_dsn()
+    assert "prepare_threshold" in seen["kwargs"], (
+        "recall connections must pass the txn-mode prepare_threshold marker"
+    )
+    assert seen["kwargs"]["prepare_threshold"] is None, (
+        "prepare_threshold must be None so no named prepared stmt persists "
+        "across a pgbouncer transaction-pool checkout"
+    )
+
+
+def test_recall_conn_dedicated_factory_routes_through_recall_connect(
+    state_on, monkeypatch
+):
+    """The dedicated `_recall_conn()` also goes through the txn-mode-safe factory.
+
+    The migration runner / low-level factory path must carry the same guarantee
+    as the pooled path — a single seam (`_recall_connect`) for ALL recall
+    connections.
+    """
+    state = state_on
+    seen = {}
+
+    def _spy_connect(dsn, **kwargs):
+        seen["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(state.psycopg2, "connect", _spy_connect)
+    state._recall_conn()
+    assert seen["kwargs"].get("prepare_threshold", "MISSING") is None, (
+        "_recall_conn() must mint connections with prepare_threshold=None"
+    )
+
+
+class _FakeMigrateCursor:
+    """A cursor stub for the migration runner: records SQL, replays the ledger.
+
+    `fetchall()` returns every known migration version as already-applied, so
+    `_apply_recall_migrations` skips the per-version `.sql` file reads + DDL —
+    keeping the test hermetic (no filesystem, no real database) while still
+    exercising the connection mint + advisory-lock + ledger statements.
+    """
+
+    def __init__(self, applied):
+        self._applied = applied
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, *a, **k):
+        pass
+
+    def fetchall(self):
+        return [(v,) for v in self._applied]
+
+
+class _FakeMigrateConn:
+    """A connection stub supporting `with conn, conn.cursor() as cur` use."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self, *a, **k):
+        return self._cur
+
+    def close(self):
+        pass
+
+
+def test_apply_recall_migrations_mints_connection_with_prepare_threshold_none(
+    state_on, monkeypatch
+):
+    """The MIGRATION runner also mints its connection with `prepare_threshold=None`.
+
+    `_apply_recall_migrations()` now routes its dedicated connection through
+    `_recall_connect()` too, so the txn-mode marker covers EVERY recall
+    connection — pooled, dedicated, AND the migrator — making the "minted HERE"
+    invariant literally true.
+    """
+    state = state_on
+    seen = {}
+
+    def _spy_connect(dsn, **kwargs):
+        seen["dsn"] = dsn
+        seen["kwargs"] = kwargs
+        return _FakeMigrateConn(_FakeMigrateCursor(state._RECALL_MIGRATION_VERSIONS))
+
+    monkeypatch.setattr(state.psycopg2, "connect", _spy_connect)
+    state._apply_recall_migrations(state._recall_dsn())
+
+    assert seen["dsn"] == state._recall_dsn()
+    assert "prepare_threshold" in seen["kwargs"], (
+        "the migration runner must mint its connection through the txn-mode seam"
+    )
+    assert seen["kwargs"]["prepare_threshold"] is None, (
+        "_apply_recall_migrations() must mint its connection with "
+        "prepare_threshold=None (the single-seam txn-mode invariant)"
+    )
+
+
+def test_recall_pool_built_with_prepare_threshold_none(state_on, monkeypatch):
+    """`_get_recall_pool()` forwards `prepare_threshold=None` to the pool ctor.
+
+    `ThreadedConnectionPool` forwards **kwargs to `psycopg2.connect` for every
+    backend it opens, so threading the marker through here makes EVERY pooled
+    recall connection txn-mode-safe, not just the dedicated factory.
+    """
+    state = state_on
+    built = {}
+
+    def _fake_ctor(minconn, maxconn, dsn, **kwargs):
+        built["dsn"] = dsn
+        built["kwargs"] = kwargs
+        return _FakePool(capacity=1)
+
+    monkeypatch.setattr(state.psycopg2.pool, "ThreadedConnectionPool", _fake_ctor)
+    # Ensure a fresh build (no pool pinned from a prior test).
+    monkeypatch.setattr(state, "_RECALL_POOL", None)
+    monkeypatch.setattr(state, "_RECALL_POOL_DSN", None)
+
+    state._get_recall_pool()
+    assert "prepare_threshold" in built["kwargs"], (
+        "the recall pool must forward the txn-mode prepare_threshold marker to "
+        "every backend it opens"
+    )
+    assert built["kwargs"]["prepare_threshold"] is None
+
+
+def test_recall_prepare_threshold_marker_is_none():
+    """The module-level txn-mode marker is None (the only psycopg2-safe value).
+
+    A non-None value would (a) make psycopg2's make_dsn raise "invalid connection
+    option" and (b) re-enable named prepared statements under psycopg3 — both
+    break txn-mode safety. Pin it.
+    """
+    import adapters.state.state as state_mod
+
+    assert state_mod._RECALL_PREPARE_THRESHOLD is None
+
+
+def test_each_recall_op_is_one_txn_per_single_checkout(state_on, monkeypatch):
+    """A recall op opens ONE transaction on ONE checkout, committed before return.
+
+    The txn-mode property at the operation level: a server connection behind
+    pgbouncer is held only for one transaction. `recall_get_vector` (a read)
+    must check a connection out exactly once, run its single statement, commit,
+    and return the connection — nothing spans the checkout. (The multi-statement
+    write ops are covered by the upsert/delete tests; this pins a representative
+    read.)
+    """
+    state = state_on
+
+    class _RowCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            self.last_sql = sql
+
+        def fetchone(self):
+            return ({"k": "v"}, False)  # (metadata, deleted) -> a live row
+
+    class _OneTxnConn:
+        def __init__(self):
+            self.commits = 0
+            self.rollbacks = 0
+            self._cur = _RowCursor()
+
+        def cursor(self, *a, **k):
+            return self._cur
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    conn = _OneTxnConn()
+    pool = _SingleConnPool(conn)
+    monkeypatch.setattr(state, "_RECALL_POOL", pool)
+    monkeypatch.setattr(state, "_RECALL_POOL_DSN", state._recall_dsn())
+
+    status, meta = state.recall_get_vector("t1", "ds", "id-1", watermark=0)
+    assert status == "live" and meta == {"k": "v"}
+    # ONE checkout backed the whole op; committed once; returned once.
+    assert pool.checkouts == 1, "a recall read must use a single pooled checkout"
+    assert pool.returns == 1, "the connection must be returned exactly once"
+    assert conn.commits == 1, "the read txn commits once before the conn is returned"
+    assert conn.rollbacks == 0

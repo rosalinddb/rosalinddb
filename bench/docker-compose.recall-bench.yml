@@ -18,11 +18,14 @@
 #     host ports on ANY compose version with zero risk to the running stack.
 #   * It keeps service shapes (images, commands, env, depends_on, healthchecks,
 #     migrator boot sequence) aligned with the root compose; the deltas are:
-#       1. RECALL ON. RB_RECALL=true + RB_RECALL_DSN -> the `pgvector` service on
-#          every recall-touching service (cp / query_dp / index_builder /
-#          ephemeral_runner) and the migrator (so `migrate_recall` runs). POST
-#          /vectors then returns 200 synchronously; an immediate query reads its
-#          writes.
+#       1. RECALL ON, BEHIND PGBOUNCER. RB_RECALL=true + RB_RECALL_DSN ->
+#          the `pgbouncer` service (transaction pooling), which targets the recall
+#          `pgvector` db — the prod topology. Set on every recall-touching service
+#          (cp / query_dp / index_builder / ephemeral_runner) and the migrator (so
+#          `migrate_recall` runs). POST /vectors then returns 200 synchronously;
+#          an immediate query reads its writes. The recall code path is
+#          transaction-mode safe (no session state spans a txn) — see the
+#          `pgbouncer` service comment.
 #       2. INTERFERENCE OFF. RB_ENABLE_QUOTAS=false + RB_REQUIRE_AUTH=false, so
 #          the bench measures the recall DATA path, not auth/quota/rate-limit.
 #          Every request resolves to the single built-in `default` tenant; agents
@@ -115,6 +118,9 @@ services:
           memory: 512m
 
   # The recall tier under test — a SEPARATE data-plane pgvector instance.
+  # In this stack the app services + migrator do NOT talk to pgvector directly:
+  # they reach it through `pgbouncer` (transaction pooling), the way Postgres is
+  # run in prod. pgvector publishes a host port only for direct inspection.
   pgvector:
     image: pgvector/pgvector:pg15
     environment:
@@ -136,10 +142,79 @@ services:
           cpus: '1.0'
           memory: 1g
 
+  # pgbouncer in TRANSACTION pooling mode in front of the recall pgvector — the
+  # canonical "how to run recall in prod" reference. Every recall-touching app
+  # service + the migrator point `RB_RECALL_DSN` at THIS service (port 6432),
+  # which targets the recall `pgvector` `recall` db. In transaction mode a server
+  # connection is held only for the duration of a transaction, then returned to
+  # pgbouncer's pool — so the recall code path must hold NO session-level state
+  # across transactions. It does not: every recall op is a single self-contained
+  # transaction on a single app-side pool checkout, and recall connections are
+  # minted with `prepare_threshold=None` so no named server-side prepared
+  # statement persists across a pooled checkout (adapters/state/state.py,
+  # `_recall_connect` + the txn-mode audit there).
+  #
+  # HONEST SCOPE: on THIS single host pgbouncer buys little — the app-side pool
+  # (#15) already amortises connection setup, and the benchmark showed the recall
+  # cost is query work + RTT, not connect handshakes. pgbouncer's payoff is
+  # connection MULTIPLEXING across MANY app replicas (each app pool * replicas can
+  # far exceed the recall instance's backend cap). It is wired here so the recall
+  # reference stack matches prod and the txn-mode contract is exercised, not for a
+  # single-host speedup. See docs/architecture/recall-consolidate.md, "Running
+  # recall behind pgbouncer".
+  #
+  # edoburu/pgbouncer is a small, maintained image that renders pgbouncer.ini +
+  # userlist.txt from env (no extra config files to mount): DB_* set the upstream,
+  # POOL_MODE=transaction, AUTH_TYPE=scram-sha-256 (postgres:15 stores
+  # scram-sha-256 verifiers by default).
+  pgbouncer:
+    image: edoburu/pgbouncer:1.23.1-p2
+    environment:
+      DB_HOST: pgvector
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: recall
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      LISTEN_PORT: "6432"
+      # Many client (app) connections multiplexed onto a small server pool — the
+      # whole point of transaction pooling. The server-side pool is kept well
+      # under the recall pgvector's backend cap; the app-side pools (#15,
+      # RB_RECALL_POOL_MAX per process * replicas) fan in through here.
+      MAX_CLIENT_CONN: "${RB_BENCH_PGB_MAX_CLIENT_CONN:-200}"
+      DEFAULT_POOL_SIZE: "${RB_BENCH_PGB_DEFAULT_POOL_SIZE:-20}"
+      # transaction mode forbids server-side prepared statements being tracked
+      # across pooled txns; 0 disables pgbouncer's prepared-statement support
+      # entirely (the recall path creates none — belt-and-suspenders).
+      MAX_PREPARED_STATEMENTS: "0"
+    ports:
+      # Host port for direct inspection (psql) only; app services use the
+      # in-network `pgbouncer:6432`.
+      - "${RB_BENCH_PGBOUNCER_PORT:-16432}:6432"
+    depends_on:
+      pgvector:
+        condition: service_healthy
+    healthcheck:
+      # pg_isready against pgbouncer's own port confirms it is accepting clients.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U postgres -d recall"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128m
+
   # One-shot migrator — RB_RECALL_DSN set so it applies the recall-tier schema
-  # (`migrate_recall`) against pgvector before any app boots. Same boot sequence
-  # as the root compose: wait for control-plane PG, then the recall instance,
-  # then run migrate (fails loudly if the recall instance is unreachable).
+  # (`migrate_recall`) against pgvector THROUGH pgbouncer before any app boots.
+  # Same boot sequence as the root compose: wait for control-plane PG, then the
+  # recall tier (now via pgbouncer), then run migrate (fails loudly if the recall
+  # tier is unreachable). The recall migrator wraps its DDL + pg_advisory_xact_lock
+  # in a single transaction on a dedicated connection, which is transaction-mode
+  # safe through pgbouncer.
   migrator:
     build:
       context: ..
@@ -154,24 +229,27 @@ services:
           python -c "import psycopg2, os; psycopg2.connect(os.environ['DATABASE_URL']).close()" 2>/dev/null && break
           sleep 1
         done
-        echo "migrator: RB_RECALL_DSN set — waiting for the recall pgvector instance..."
+        echo "migrator: RB_RECALL_DSN set — waiting for the recall tier (via pgbouncer)..."
         recall_ok=0
         for i in $$(seq 1 30); do
           python -c "import psycopg2, os; psycopg2.connect(os.environ['RB_RECALL_DSN']).close()" 2>/dev/null && recall_ok=1 && break
           sleep 1
         done
         if [ "$$recall_ok" != "1" ]; then
-          echo "migrator: recall pgvector instance unreachable after 30 tries — failing loudly." >&2
+          echo "migrator: recall tier (pgbouncer -> pgvector) unreachable after 30 tries — failing loudly." >&2
           exit 1
         fi
         exec python -m scripts.migrate
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
-      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgbouncer:6432/recall}"
     depends_on:
       postgres:
         condition: service_healthy
-      pgvector:
+      # The migrator reaches the recall tier THROUGH pgbouncer (RB_RECALL_DSN ->
+      # pgbouncer:6432), so it waits for pgbouncer healthy; pgbouncer in turn
+      # depends_on pgvector healthy, so the recall instance is up transitively.
+      pgbouncer:
         condition: service_healthy
     restart: "no"
 
@@ -195,7 +273,7 @@ services:
       QUERY_DP_URL: http://query_dp:8080
       # Recall ON, interference OFF.
       RB_RECALL: "true"
-      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgbouncer:6432/recall}"
       RB_REQUIRE_AUTH: "false"
       RB_ENABLE_QUOTAS: "false"
       # Keep consolidation from churning mid-run.
@@ -206,7 +284,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      pgvector:
+      # Recall reached via pgbouncer (transaction pooling); pgbouncer itself
+      # depends_on pgvector healthy, so the recall instance is up transitively.
+      pgbouncer:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -241,14 +321,16 @@ services:
       INDEXES_PREFIX: s3://vectors/indexes
       JWT_SECRET: "${JWT_SECRET:-dev-secret}"
       RB_RECALL: "true"
-      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgbouncer:6432/recall}"
       RB_REQUIRE_AUTH: "false"
       RB_ENABLE_QUOTAS: "false"
       CACHE_DIR: /home/rosalind/cache
     depends_on:
       postgres:
         condition: service_healthy
-      pgvector:
+      # Recall reached via pgbouncer (transaction pooling); pgbouncer itself
+      # depends_on pgvector healthy, so the recall instance is up transitively.
+      pgbouncer:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -318,7 +400,7 @@ services:
       INDEXES_PREFIX: s3://vectors/indexes
       JWT_SECRET: "${JWT_SECRET:-dev-secret}"
       RB_RECALL: "true"
-      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgbouncer:6432/recall}"
       RB_REQUIRE_AUTH: "false"
       RB_ENABLE_QUOTAS: "false"
       RB_RECALL_MAX_ROWS: "${RB_RECALL_MAX_ROWS:-1000000}"
@@ -326,7 +408,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      pgvector:
+      # Recall reached via pgbouncer (transaction pooling); pgbouncer itself
+      # depends_on pgvector healthy, so the recall instance is up transitively.
+      pgbouncer:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -360,14 +444,16 @@ services:
       INDEXES_PREFIX: s3://vectors/indexes
       JWT_SECRET: "${JWT_SECRET:-dev-secret}"
       RB_RECALL: "true"
-      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgvector:5432/recall}"
+      RB_RECALL_DSN: "${RB_RECALL_DSN:-postgresql://postgres:postgres@pgbouncer:6432/recall}"
       RB_REQUIRE_AUTH: "false"
       RB_ENABLE_QUOTAS: "false"
       CACHE_DIR: /home/rosalind/cache
     depends_on:
       postgres:
         condition: service_healthy
-      pgvector:
+      # Recall reached via pgbouncer (transaction pooling); pgbouncer itself
+      # depends_on pgvector healthy, so the recall instance is up transitively.
+      pgbouncer:
         condition: service_healthy
       redis:
         condition: service_healthy

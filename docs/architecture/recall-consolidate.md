@@ -135,6 +135,58 @@ later shrink to per-tenant.
 per-write path never touches the control-plane PG. The control-plane PG sees the recall tier only
 as a low-frequency `consolidated_lsn` update at consolidation time — never per write.
 
+## Running recall behind pgbouncer
+
+In production the recall tier is run the way Postgres is run elsewhere: **behind pgbouncer in
+TRANSACTION pooling mode**. The full connection topology is:
+
+```
+   app process  ──►  app-side pool (#15, RB_RECALL_POOL_MAX)  ──►  RB_RECALL_DSN
+                                                                       │
+                                                            pgbouncer (transaction mode)
+                                                                       │
+                                                            recall pgvector (RB_RECALL_DSN target db)
+```
+
+`RB_RECALL_DSN` points at **pgbouncer**, which targets the recall pgvector database. Each app
+process keeps its own small app-side pool (the `ThreadedConnectionPool` added in #15); those
+pools fan in to pgbouncer, which multiplexes them onto a small set of real pgvector backends.
+A wired reference is `bench/docker-compose.recall-bench.yml` (the `pgbouncer` service +
+`RB_RECALL_DSN: …@pgbouncer:6432/recall` on every recall-touching service and the migrator).
+
+### Transaction-mode safety (the contract the recall code keeps)
+
+In transaction pooling mode a server (pgvector) connection is held only for the **duration of one
+transaction**, then returned to pgbouncer's pool and potentially handed to a *different* client.
+So **no session-level state may span transactions**. The recall code path is safe by construction
+(audited in `adapters/state/state.py`, `_recall_connect`):
+
+| Hazard in transaction mode | Recall path |
+|---|---|
+| Server-side **named prepared statements** persisting across a checkout | None. psycopg2 (the driver) never emits named server-side prepared statements; recall connections are additionally minted with `prepare_threshold=None` as an explicit, tested, psycopg3-forward marker. |
+| `SET` / session GUCs | None. Isolation is the server default (READ COMMITTED); each single-statement read (`recall_search`, `recall_list_rows`, the consolidation snapshot) relies only on a **statement-level** snapshot, never session state. |
+| `LISTEN`/`NOTIFY` | None on the recall tier (catalog NOTIFY is control-plane only). |
+| Advisory locks held **across** transactions | None. The recall migrator uses `pg_advisory_xact_lock` (transaction-scoped) on a dedicated connection; the only session-level advisory lock (`dataset_build_lock`) is control-plane, not recall. |
+| Server-side **named cursors** | None. Plain client cursors, fetched within the same transaction. |
+| Two statements assuming a shared session beyond one txn | None. Every recall op is **one self-contained transaction on one app-side checkout** — including the multi-statement write ops (LSN-block alloc + UPSERT; LSN alloc + tombstone), which are the *same* transaction. |
+
+### Honest scope: when pgbouncer actually helps
+
+pgbouncer is the **horizontal / prod-scale** option, not a single-host speedup. On a single host
+the app-side pool (#15) already captures essentially all of the latency win: the recall-bench
+finding was that the recall cost is **query work + RTT**, not connection setup, and the app-side
+pool already amortises connection setup across requests. Adding pgbouncer on the same host neither
+removes RTT nor speeds up the pgvector scan.
+
+Where pgbouncer pays off is **connection multiplexing across many app replicas**. Each app
+process holds up to `RB_RECALL_POOL_MAX` recall connections; with R replicas the naive ceiling is
+`R × RB_RECALL_POOL_MAX` real backends against one recall instance, which quickly exceeds
+pgvector's `max_connections`. pgbouncer in transaction mode lets a large number of *client*
+connections share a small, bounded set of *server* backends, so you can scale app replicas
+without scaling (or exhausting) the recall instance's backend cap. Size the app-side pools and
+pgbouncer's `default_pool_size` together so the server-side pool stays under the recall instance's
+connection limit.
+
 ## The watermark (the seam)
 
 > Diagram: the "snap" before/after picture is [`diagrams/recall-consolidate-watermark.puml`](diagrams/recall-consolidate-watermark.puml).
@@ -382,7 +434,8 @@ fixed-dimension schema migration (e.g. a table/partition per embedding dimension
 | `RB_RECALL_MAX_ROWS` | `2000` | Per-(tenant,dataset) recall-row cap that forces a consolidation (after a recall write, if the partition row count exceeds this, a `CONSOLIDATE` is enqueued — also bounds the union's brute-force recall scan) |
 | `RB_RECALL_IDLE_S` | `60` | Idle window after which a dataset is consolidated to zero recall rows (the builder's idle-tick sweep enqueues `CONSOLIDATE` for any partition whose newest write is older than this → drains to 0 → idle queries skip pgvector entirely) |
 | `RB_RECALL_INDEX` | `bruteforce` | `hnsw` to add a pgvector ANN index (escape hatch — requires a fixed-dimension schema migration first, since the v1 `recall_vectors.embedding` is an unparameterised `vector` for mixed per-dataset dims) |
-| `RB_RECALL_DSN` | separate recall pgvector instance | DSN of the recall tier (data-plane), isolated from the control-plane PG by default. A single-tenant self-hoster MAY point it at the control-plane DSN to accept shared-fate. |
+| `RB_RECALL_DSN` | separate recall pgvector instance | DSN of the recall tier (data-plane), isolated from the control-plane PG by default. A single-tenant self-hoster MAY point it at the control-plane DSN to accept shared-fate. In prod this points at **pgbouncer** (transaction mode), which targets the recall pgvector db — see §Running recall behind pgbouncer. |
+| `RB_RECALL_POOL_MAX` | `10` | Per-process app-side recall connection-pool ceiling (the #15 `ThreadedConnectionPool` against `RB_RECALL_DSN`). Independent of the control-plane `RB_PG_POOL_MAX`. Size it with pgbouncer's `default_pool_size` so the server-side pool stays under the recall instance's `max_connections` across all app replicas. |
 
 ## TDD test plan
 
