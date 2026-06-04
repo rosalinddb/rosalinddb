@@ -14,8 +14,11 @@ schemas and error codes. The response shape is exactly:
 
 ```json
 { "matches": [{ "id": "<string>", "score": <float>, "metadata": {} }],
-  "latency_ms": <int>, "mode": "hot|cold|ephemeral", "job_id": "<string?>" }
+  "latency_ms": <int>, "mode": "hot|cold|recall|ephemeral", "job_id": "<string?>" }
 ```
+
+(`recall` appears only when the recall tier is enabled — see "Recall-tier
+union" below; with `RB_RECALL` off the modes are exactly `hot|cold|ephemeral`.)
 
 ## Where it is served
 
@@ -89,10 +92,63 @@ distance.
   process's local cache.
 - `cold` — served from FAISS, but the shard was loaded into the cache for
   the first time on this request.
-- `ephemeral` — the dataset has no shard yet (not `indexed`). The query is
+- `recall` — **only with `RB_RECALL` on** (see "Recall-tier union" below): the
+  dataset has **no consolidated shard yet**, but the recall tier had matching
+  data, so the result was served **synchronously from recall**. There is **no**
+  `job_id` — this is the read-your-writes case, not the async ephemeral one. The
+  `mode` field always reflects the **cold-shard cache state**; `recall` means
+  "the cold cache contributed nothing, recall answered."
+- `ephemeral` — the dataset has no shard yet (not `indexed`) **and** (with
+  `RB_RECALL` on) the recall tier had no matching data either. The query is
   enqueued on `RUN_EPHEMERAL_QUERY`; the immediate response carries
   `matches: []` plus a `job_id`. Poll `GET /v1/query/status/{job_id}` until
   `{"ready": true, ...}`.
+
+When a cold shard **does** exist, `mode` is `hot` or `cold` exactly as today —
+even when recall also contributed to (or overrode entries in) the result. The
+recall contribution is invisible in the `mode` label by design; it is the same
+top-K answer shape regardless of which tier each match came from.
+
+## Recall-tier union (`RB_RECALL`)
+
+> Default **off**. With `RB_RECALL` unset (or no `RB_RECALL_DSN`) `POST /v1/query`
+> is **byte-identical** to the pure-cold path documented above — no recall
+> connection is ever opened.
+
+When the recall tier is on, `POST /v1/query` searches **both** tiers and merges
+them (see [`recall-consolidate.md`](../architecture/recall-consolidate.md),
+"Read path — the union"):
+
+1. **Consolidated (cold)** — the existing FAISS search over the newest shard
+   (via the SSD/RAM shard cache). Returns matches with **L2-squared** distances
+   and the `hot`/`cold` cache `mode`. Unchanged.
+2. **Recall** — a brute-force **exact** L2 scan over `recall_vectors` in the
+   separate recall pgvector instance (`RB_RECALL_DSN`), scoped to
+   `tenant_id = ? AND dataset = ? AND lsn > :watermark`, applying the **same**
+   AND-of-equals metadata filter as the cold path.
+
+**Metric alignment (correctness-critical).** The cold tier returns FAISS
+**L2-squared** distances; pgvector's `<->` returns **plain** Euclidean L2. The
+recall scan **squares** pgvector's distance (`power(embedding <-> q, 2)`) over
+the **identical un-normalised** vectors so both tiers' `score`s are directly
+comparable. Squaring is monotonic, so the union sorts correctly; without it the
+ranking is silently wrong (it has a dedicated test).
+
+**The watermark (`:watermark`).** It is the `consolidated_lsn` of the shard the
+cold search **actually resolved** — never a value read independently (invariant
+I3). The recall tier owns `lsn > consolidated_lsn`; the cold shard owns `<=`, so
+the union is **complete and non-double-counting** (invariant I1). When no shard
+exists yet, the watermark is `0` and **all** recall rows qualify.
+
+**Merge — dedup recall-wins.** The two result sets are unioned and deduped by
+`id`:
+
+- A recall **live** row for an id **overrides** a cold match for that id (recall
+  is newer — its LSN sits above the watermark).
+- A recall **tombstone** (`deleted=true`) for an id **suppresses** the cold
+  match for that id and contributes no match (a deleted vector never appears).
+- The surviving matches are sorted **ascending by L2²** and truncated to
+  `top_k`.
 
 ## `filter`
 
