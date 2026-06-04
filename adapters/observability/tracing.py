@@ -117,6 +117,37 @@ def list_shards_span(tenant: str | None = None, dataset: str | None = None):
     return span("state.list_shards", {"rosalinddb.tenant_id": tenant, "rosalinddb.dataset": dataset})
 
 
+def recall_search_span(
+    tenant: str | None = None,
+    dataset: str | None = None,
+    top_k: int | None = None,
+    watermark: int | None = None,
+):
+    """`recall.search` span — the recall half of the query union.
+
+    Sibling of `query.hot_search` for the recall tier. Previously the recall
+    brute-force scan had NO span, so recall latency was invisible in a trace even
+    though the union waits on it on the query critical path. This times the whole
+    `recall_search` call (the single-snapshot SQL scan + the Python suppress/match
+    split).
+
+    `top_k` and `watermark` are stamped at span open; `rows_scanned` (the count
+    the single scan returned) and `match_count` are stamped by the caller once the
+    scan completes, so a trace shows how big the recall set was vs how many became
+    matches. Only ever opened on the recall path (`recall_search` runs only when
+    `recall_enabled()` is True).
+    """
+    attrs: dict = {
+        "rosalinddb.tenant_id": tenant,
+        "rosalinddb.dataset": dataset,
+    }
+    if top_k is not None:
+        attrs["rosalinddb.top_k"] = top_k
+    if watermark is not None:
+        attrs["rosalinddb.watermark"] = watermark
+    return span("recall.search", attrs)
+
+
 def state_connect_span(reused: bool | None = None):
     """`state.connect` span — one Postgres connection checkout.
 

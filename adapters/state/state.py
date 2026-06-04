@@ -29,7 +29,8 @@ import psycopg2
 import psycopg2.pool
 from psycopg2.extras import RealDictCursor, execute_values
 
-from adapters.observability.tracing import state_connect_span
+from adapters.observability import metrics as obs_metrics
+from adapters.observability.tracing import recall_search_span, state_connect_span
 
 
 _MEMORY_MODE = os.getenv("DATABASE_URL", "memory://local").startswith("memory://")
@@ -1474,24 +1475,37 @@ def recall_search(
     so it never runs — and never opens a recall connection — with the flag off.
     """
     qlit = _to_pgvector_literal(vector)
-    # ONE statement, ONE MVCC snapshot. Select every row above the watermark with
-    # its `deleted` flag and FAISS-aligned squared-L2 `score`, and split it in
-    # Python: `suppress_ids` = every id, `matches` = the live, filter-passing,
-    # top_k-closest subset. DO NOT split this back into two scans — two
-    # `cur.execute`s are two READ COMMITTED snapshots and a between-scan commit
-    # re-opens the b1 over-suppression race (see the docstring).
-    #
-    # `power(embedding <-> %s, 2)` squares pgvector's plain-L2 `<->` so the score
-    # matches FAISS L2². The query vector is bound TWICE — once for the score
-    # expression, once for the ORDER BY — so the same literal drives both. The
-    # `ORDER BY` ranks ALL rows (live and tombstoned) by raw distance, but the
-    # Python split filters tombstones out by the `deleted` flag, so ordering never
-    # lets a tombstone become a match. No SQL `LIMIT`: the `top_k` truncation
-    # happens in Python over the live-only subset (the recall set is small by
-    # construction — bounded by consolidation cadence, not data size).
-    with recall_pooled_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
+    flt = flt or {}
+    # `recall.search` span + `rosalinddb.recall_search.duration` metric (task #20):
+    # the recall half of the union was previously invisible in traces/metrics even
+    # though the query critical path waits on it. The span times the whole call
+    # (the single-snapshot SQL scan + the Python suppress/match split) and is
+    # stamped with `rows_scanned` (the single scan's row count) and `match_count`
+    # once known. Only ever reached on the recall path (`recall_search` runs only
+    # when `recall_enabled()` is True), so this never fires with the flag off.
+    started = time.perf_counter()
+    with recall_search_span(
+        tenant=tenant_id, dataset=dataset, top_k=top_k, watermark=watermark
+    ) as _span:
+        # ONE statement, ONE MVCC snapshot. Select every row above the watermark
+        # with its `deleted` flag and FAISS-aligned squared-L2 `score`, and split
+        # it in Python: `suppress_ids` = every id, `matches` = the live,
+        # filter-passing, top_k-closest subset. DO NOT split this back into two
+        # scans — two `cur.execute`s are two READ COMMITTED snapshots and a
+        # between-scan commit re-opens the b1 over-suppression race (see docstring).
+        #
+        # `power(embedding <-> %s, 2)` squares pgvector's plain-L2 `<->` so the
+        # score matches FAISS L2². The query vector is bound TWICE — once for the
+        # score expression, once for the ORDER BY — so the same literal drives
+        # both. The `ORDER BY` ranks ALL rows (live and tombstoned) by raw
+        # distance, but the Python split filters tombstones out by the `deleted`
+        # flag, so ordering never lets a tombstone become a match. No SQL `LIMIT`:
+        # the `top_k` truncation happens in Python over the live-only subset (the
+        # recall set is small by construction — bounded by consolidation cadence,
+        # not data size).
+        with recall_pooled_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
 SELECT id,
        deleted,
        power(embedding <-> %s, 2) AS score,
@@ -1499,55 +1513,70 @@ SELECT id,
 FROM recall_vectors
 WHERE tenant_id = %s AND dataset = %s AND lsn > %s
 ORDER BY embedding <-> %s ASC
-            """,
-            (qlit, tenant_id, dataset, watermark, qlit),
-        )
-        rows = cur.fetchall()
+                """,
+                (qlit, tenant_id, dataset, watermark, qlit),
+            )
+            rows = cur.fetchall()
 
-    flt = flt or {}
-    # `suppress_ids`: EVERY id the single scan returned (live AND tombstoned).
-    # Recall is authoritative for `lsn > watermark`, so the stale cold copy of any
-    # such id is always dropped — whether the recall row is a tombstone, fails the
-    # filter, or ranks past `top_k`. The cold id's FAISS distance is over the
-    # CONSOLIDATED embedding, which may differ from the (stale) recall embedding,
-    # so we cannot assume the cold match ranks beyond `top_k` just because the
-    # recall row does. Because suppress and matches come from the SAME snapshot's
-    # rows, `suppress_ids ⊇ match_ids` always holds (the b1 fix).
-    suppress_ids: set = set()
-    matches: List[dict] = []
-    live_count = 0
-    for rid, deleted, score, metadata in rows:
-        # Every returned id suppresses its cold twin, ALWAYS — added before any
-        # match/filter/top_k decision so a tombstone, a filter-failing row, or a
-        # past-top_k row still drops its stale cold copy.
-        suppress_ids.add(rid)
-        # Tombstone: NEVER a match. It only suppresses (already added above).
-        # Splitting on the explicit `deleted` flag — not a `NOT deleted` WHERE
-        # clause — is what keeps the no-leak property safe even though the scan
-        # has no SQL `LIMIT` and orders all rows together by raw distance.
-        if deleted:
-            continue
-        # Live row past the top_k closest live survivors: it cannot be a MATCH
-        # (the `top_k` closer live rows already beat it). Its id is already in
-        # `suppress_ids`, so skip it as a candidate and keep scanning (so its
-        # later id is still suppressed, even though it is not a match).
-        if live_count >= top_k:
-            continue
-        # `metadata` is JSONB → psycopg2 decodes it to a Python dict (or None for
-        # a SQL NULL); coalesce None to `{}`.
-        meta = metadata or {}
-        # Live row: apply the AND-of-equals filter to decide whether it is a
-        # MATCH. A live row that fails the filter is NOT a match — but its id is
-        # ALREADY in `suppress_ids`, so the stale cold copy is still dropped (the
-        # P1 fix: an authoritative live re-upsert that fails the query filter must
-        # not let a stale, filter-matching cold copy leak). The predicate must
-        # match `metadata_matches_filter` exactly (type+value, no coercion).
-        if flt and not _metadata_matches_filter(meta, flt):
-            continue
-        matches.append(
-            {"id": rid, "score": float(score), "metadata": meta, "deleted": False}
-        )
-        live_count += 1
+        # `suppress_ids`: EVERY id the single scan returned (live AND tombstoned).
+        # Recall is authoritative for `lsn > watermark`, so the stale cold copy of
+        # any such id is always dropped — whether the recall row is a tombstone,
+        # fails the filter, or ranks past `top_k`. The cold id's FAISS distance is
+        # over the CONSOLIDATED embedding, which may differ from the (stale) recall
+        # embedding, so we cannot assume the cold match ranks beyond `top_k` just
+        # because the recall row does. Because suppress and matches come from the
+        # SAME snapshot's rows, `suppress_ids ⊇ match_ids` always holds (b1 fix).
+        suppress_ids: set = set()
+        matches: List[dict] = []
+        live_count = 0
+        for rid, deleted, score, metadata in rows:
+            # Every returned id suppresses its cold twin, ALWAYS — added before any
+            # match/filter/top_k decision so a tombstone, a filter-failing row, or
+            # a past-top_k row still drops its stale cold copy.
+            suppress_ids.add(rid)
+            # Tombstone: NEVER a match. It only suppresses (already added above).
+            # Splitting on the explicit `deleted` flag — not a `NOT deleted` WHERE
+            # clause — is what keeps the no-leak property safe even though the scan
+            # has no SQL `LIMIT` and orders all rows together by raw distance.
+            if deleted:
+                continue
+            # Live row past the top_k closest live survivors: it cannot be a MATCH
+            # (the `top_k` closer live rows already beat it). Its id is already in
+            # `suppress_ids`, so skip it as a candidate and keep scanning (so its
+            # later id is still suppressed, even though it is not a match).
+            if live_count >= top_k:
+                continue
+            # `metadata` is JSONB → psycopg2 decodes it to a Python dict (or None
+            # for a SQL NULL); coalesce None to `{}`.
+            meta = metadata or {}
+            # Live row: apply the AND-of-equals filter to decide whether it is a
+            # MATCH. A live row that fails the filter is NOT a match — but its id
+            # is ALREADY in `suppress_ids`, so the stale cold copy is still dropped
+            # (the P1 fix: an authoritative live re-upsert that fails the query
+            # filter must not let a stale, filter-matching cold copy leak). The
+            # predicate must match `metadata_matches_filter` exactly (type+value).
+            if flt and not _metadata_matches_filter(meta, flt):
+                continue
+            matches.append(
+                {"id": rid, "score": float(score), "metadata": meta, "deleted": False}
+            )
+            live_count += 1
+
+        # Stamp the scan size + match count on the span (tenant/dataset/top_k/
+        # watermark were stamped at span open). `rows` is the single scan's full
+        # row count (recall rows above the watermark); `match_count` is the live
+        # filter-passing top_k subset.
+        try:
+            _span.set_attribute("rosalinddb.rows_scanned", len(rows))
+            _span.set_attribute("rosalinddb.match_count", len(matches))
+        except Exception:  # noqa: BLE001 — never let observability break the query
+            pass
+
+    # Recall query-duration histogram (ms), mirroring the cold query-duration
+    # metric. Recorded after the span closes so it captures the whole call.
+    obs_metrics.record_recall_search_duration(
+        (time.perf_counter() - started) * 1000.0
+    )
     return suppress_ids, matches
 
 

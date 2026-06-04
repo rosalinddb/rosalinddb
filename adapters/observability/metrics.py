@@ -97,6 +97,14 @@ def _get_instruments() -> dict:
                 unit="ms",
                 description="Vector query latency in milliseconds.",
             ),
+            "recall_search.duration": meter.create_histogram(
+                "rosalinddb.recall_search.duration",
+                unit="ms",
+                description=(
+                    "Recall-tier brute-force search latency in milliseconds "
+                    "(the recall half of the query union)."
+                ),
+            ),
             "index_build.duration": meter.create_histogram(
                 "rosalinddb.index_build.duration",
                 unit="ms",
@@ -176,6 +184,21 @@ def record_query(mode: str) -> None:
 def record_query_duration(duration_ms: float, mode: str) -> None:
     """`rosalinddb.query.duration` histogram sample (ms), tagged by `mode`."""
     _get_instruments()["query.duration"].record(float(duration_ms), {"mode": mode})
+
+
+def record_recall_search_duration(duration_ms: float, mode: str = "recall") -> None:
+    """`rosalinddb.recall_search.duration` histogram sample (ms).
+
+    The recall-tier mirror of `record_query_duration` — recall latency was
+    previously invisible (no span, no metric). `mode` is a low-cardinality label
+    (default `recall`) kept symmetric with the query-duration histogram so the
+    two can be compared in one dashboard; NO tenant/dataset label (cardinality
+    budget). Exported through the OTel→Prometheus pipeline (namespace `rb`) as
+    `rb_rosalinddb_recall_search_duration_milliseconds`.
+    """
+    _get_instruments()["recall_search.duration"].record(
+        float(duration_ms), {"mode": mode}
+    )
 
 
 def record_shard_cache(result: str) -> None:
