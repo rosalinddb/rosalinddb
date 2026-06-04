@@ -61,6 +61,7 @@ from adapters.state.state import (
     recall_delete_vector,
     recall_enabled,
     recall_get_vector,
+    recall_get_vector_with_embedding,
     recall_list_rows,
     recall_partition_count,
     recall_upsert_vectors,
@@ -751,21 +752,43 @@ def _watermark_of(shard: Optional[dict]) -> int:
         return 0
 
 
+def _is_truthy_query_flag(value: Optional[str]) -> bool:
+    """Parse a query-string boolean flag (`?include_values=true`).
+
+    Treats `true`/`1`/`yes`/`on` (case-insensitive), and a bare valueless flag
+    (`?include_values`, which FastAPI surfaces as the empty string), as True.
+    Everything else (absent → `None`, `false`, `0`, ...) is False.
+    """
+    if value is None:
+        return False
+    return value.strip().lower() in ("", "true", "1", "yes", "on")
+
+
 @app.get("/v1/datasets/{name}/vectors/{vector_id}")
 def get_vector_endpoint(
     name: str,
     vector_id: str,
+    include_values: Optional[str] = None,
     tenant_id: str = Depends(current_tenant_id),
     _rl: None = Depends(rate_limit),
 ):
-    """Get one vector by id. Returns `{id, metadata}`.
+    """Get one vector by id. Returns `{id, metadata}` (`{id, metadata, embedding}`
+    when `?include_values=true` and the vector is recall-resident).
 
     Resolves the newest shard, reads its sidecar, hashes `vector_id` with the
     builder's SHA1->int64, and looks it up. `404 not_found` when there is no
     shard yet or the id is absent. A missing/cross-tenant dataset is
     `404 dataset_not_found` (tenant scoping is enforced by `get_dataset` /
-    `get_latest_shard`). `?include_values` is a noted follow-up — v1 returns
-    metadata only.
+    `get_latest_shard`).
+
+    `?include_values=true` (the cheap recall path): a LIVE recall row's stored
+    `embedding` is a plain `vector` COLUMN on `recall_vectors`, so it is returned
+    via a single SELECT (no FAISS). This backs the mem0 adapter's metadata-only
+    `update`, which must re-upsert WITHOUT clobbering the real embedding. For a
+    CONSOLIDATED (cold-only) id, returning values would require a FAISS
+    `reconstruct` against the shard — deferred — so `embedding` is OMITTED from
+    the response (the caller treats the absence as "not recall-resident"). The
+    metadata-only response shape is unchanged when `include_values` is unset.
 
     Recall union (`RB_RECALL`, default OFF): when on, the recall tier is
     AUTHORITATIVE for any id above the resolved shard's watermark. A LIVE recall
@@ -778,21 +801,37 @@ def get_vector_endpoint(
     if state_mod.get_dataset(tenant_id, name) is None:
         return _err(404, "dataset_not_found", f"Dataset '{name}' not found")
 
+    want_values = _is_truthy_query_flag(include_values)
+
     # Recall union. Resolve the shard ONCE so the recall watermark and the cold
     # sidecar come from the SAME shard (I3 pairing). With the flag off this whole
     # branch is skipped and no recall connection is ever opened.
     if recall_enabled():
         sidecar, watermark = _resolve_shard_sidecar_and_watermark(tenant_id, name)
-        status, metadata = recall_get_vector(tenant_id, name, vector_id, watermark)
-        if status == "live":
-            # Recall-wins: a live row above the watermark is the authoritative
-            # version, newer than any consolidated copy.
-            return {"id": vector_id, "metadata": metadata or {}}
-        if status == "tombstone":
-            # Deleted in recall — authoritative; do NOT fall back to the cold copy.
-            return _err(404, "not_found", f"Vector '{vector_id}' not found")
-        # status is None: no recall row above the watermark — fall through to the
-        # cold sidecar (the id, if any, is consolidated below the watermark).
+        if want_values:
+            # `include_values` recall path: also read the stored embedding column.
+            status, metadata, embedding = recall_get_vector_with_embedding(
+                tenant_id, name, vector_id, watermark
+            )
+            if status == "live":
+                resp = {"id": vector_id, "metadata": metadata or {}}
+                if embedding is not None:
+                    resp["embedding"] = embedding
+                return resp
+            if status == "tombstone":
+                return _err(404, "not_found", f"Vector '{vector_id}' not found")
+            # status is None: not recall-resident — fall through to the cold lookup.
+        else:
+            status, metadata = recall_get_vector(tenant_id, name, vector_id, watermark)
+            if status == "live":
+                # Recall-wins: a live row above the watermark is the authoritative
+                # version, newer than any consolidated copy.
+                return {"id": vector_id, "metadata": metadata or {}}
+            if status == "tombstone":
+                # Deleted in recall — authoritative; do NOT fall back to the cold copy.
+                return _err(404, "not_found", f"Vector '{vector_id}' not found")
+            # status is None: no recall row above the watermark — fall through to
+            # the cold sidecar (the id, if any, is consolidated below the watermark).
     else:
         sidecar = _newest_sidecar(tenant_id, name)
 
@@ -801,6 +840,9 @@ def get_vector_endpoint(
     entry = sidecar.get(str(id_to_int64(vector_id)))
     if entry is None:
         return _err(404, "not_found", f"Vector '{vector_id}' not found")
+    # Cold-only hit. `?include_values` cannot reconstruct the embedding here (a
+    # FAISS `reconstruct` is deferred), so the response stays metadata-only — the
+    # absent `embedding` signals "not recall-resident" to the caller.
     return {"id": entry.get("id", vector_id), "metadata": entry.get("metadata") or {}}
 
 

@@ -195,6 +195,69 @@ def test_get_recall_only_no_cold_shard(env, monkeypatch):
     assert r.json() == {"id": "fact-1", "metadata": {"t": "peanuts"}}
 
 
+def test_get_include_values_returns_embedding_for_recall_resident(env, monkeypatch):
+    """?include_values=true returns the recall row's stored embedding."""
+    _enable_recall(env, monkeypatch)
+    monkeypatch.setattr(
+        env.main,
+        "recall_get_vector_with_embedding",
+        lambda t, d, vid, wm: ("live", {"v": "recall"}, [1.0, 2.0, 3.0, 4.0]),
+    )
+    s = _signup(env.client)
+    _make_dataset(env, s["token"])
+
+    r = env.client.get(
+        "/v1/datasets/ds/vectors/doc-1?include_values=true", headers=_auth(s["token"])
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "id": "doc-1",
+        "metadata": {"v": "recall"},
+        "embedding": [1.0, 2.0, 3.0, 4.0],
+    }
+
+
+def test_get_include_values_omitted_for_cold_only(env, monkeypatch):
+    """A cold-only id cannot reconstruct the vector → embedding OMITTED (no zeros)."""
+    _enable_recall(env, monkeypatch)
+    # No recall row for this id → fall back to cold, which has no embedding to give.
+    monkeypatch.setattr(
+        env.main,
+        "recall_get_vector_with_embedding",
+        lambda t, d, vid, wm: (None, None, None),
+    )
+    s = _signup(env.client)
+    _make_dataset(env, s["token"])
+    env.write(s["tenant_id"], "ds", [("doc-1", {"v": "cold"})])
+
+    r = env.client.get(
+        "/v1/datasets/ds/vectors/doc-1?include_values=true", headers=_auth(s["token"])
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {"id": "doc-1", "metadata": {"v": "cold"}}
+    assert "embedding" not in body  # never a placeholder
+
+
+def test_get_include_values_tombstone_404(env, monkeypatch):
+    """include_values honours the recall tombstone (404, no fallback)."""
+    _enable_recall(env, monkeypatch)
+    monkeypatch.setattr(
+        env.main,
+        "recall_get_vector_with_embedding",
+        lambda t, d, vid, wm: ("tombstone", None, None),
+    )
+    s = _signup(env.client)
+    _make_dataset(env, s["token"])
+    env.write(s["tenant_id"], "ds", [("doc-1", {"v": "cold"})])
+
+    r = env.client.get(
+        "/v1/datasets/ds/vectors/doc-1?include_values=true", headers=_auth(s["token"])
+    )
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "not_found"
+
+
 def test_get_union_passes_resolved_watermark(env, monkeypatch):
     """The recall lookup is filtered with the resolved shard's consolidated_lsn (I3)."""
     _enable_recall(env, monkeypatch)

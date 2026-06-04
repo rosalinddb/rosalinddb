@@ -64,9 +64,22 @@ its metadata live in the shard's `{shard_uri}.meta.json` **sidecar**:
   set, recall live rows are appended (recall-wins), and the filter is applied to
   the **merged** records so it sees each id's authoritative metadata.
 
-The raw vector values are not returned in v1. Returning them requires a FAISS
-`reconstruct` against the index (the sidecar holds only id + metadata); that is
-a noted follow-up exposed later as `?include_values`.
+### `?include_values=true` — return the stored embedding (recall path)
+
+`GET /v1/datasets/{name}/vectors/{id}?include_values=true` additionally returns
+the vector's stored `embedding` (a `list[float]`) **when the vector is
+recall-resident** — i.e. it still lives in the recall tier above the resolved
+shard's watermark. There the embedding is a plain `vector` COLUMN on
+`recall_vectors`, so it is read back with a single SELECT (no FAISS). The
+response is then `{ "id", "metadata", "embedding" }`.
+
+For a **consolidated (cold-only)** id, returning the values would require a FAISS
+`reconstruct` against the shard (the sidecar holds only id + metadata) — that is
+a deferred follow-up — so `embedding` is **OMITTED** from the response rather
+than fabricated. Clients (e.g. the mem0 adapter's metadata-only `update`) treat
+the absent `embedding` as "not recall-resident" and must supply the vector
+explicitly rather than risk corrupting it. Without the flag, the response is
+metadata-only (`{ "id", "metadata" }`) exactly as before.
 
 ## Pagination cursor
 
