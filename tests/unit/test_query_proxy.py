@@ -546,6 +546,78 @@ def test_query_timeout_bad_env_falls_back_to_defaults(monkeypatch):
     assert t.read >= 30.0 and t.connect <= 10.0
 
 
+@pytest.mark.parametrize("bad_value", ["-5", "0", "-0.5", "0.0"])
+def test_query_timeout_read_nonpositive_falls_back_to_default(monkeypatch, bad_value):
+    """A negative/zero read knob is INVALID → default, NOT clamped to ~0.
+
+    Clamping `-5`/`0` down to a sub-second budget would 504 essentially every
+    real query (the opposite of intent). With no legacy knob set it must
+    resolve to the 30s default.
+    """
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.delenv("RB_QUERY_DP_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", bad_value)
+    t = qp._query_timeout()
+    assert t.read == qp._DEFAULT_READ_TIMEOUT_S
+    assert t.read >= 30.0, f"non-positive read knob must not clamp to ~0; got {t.read}"
+
+
+@pytest.mark.parametrize("bad_value", ["-5", "0", "-0.5", "0.0"])
+def test_query_timeout_connect_nonpositive_falls_back_to_default(monkeypatch, bad_value):
+    """A negative/zero connect knob is INVALID → default, NOT clamped to ~0."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.setenv("RB_QUERY_DP_CONNECT_TIMEOUT_S", bad_value)
+    t = qp._query_timeout()
+    assert t.connect == qp._DEFAULT_CONNECT_TIMEOUT_S
+
+
+@pytest.mark.parametrize("bad_value", ["", "   ", "bad", "-5", "0"])
+def test_query_timeout_invalid_read_falls_through_to_legacy(monkeypatch, bad_value):
+    """An empty/garbage/non-positive NEW read knob must NOT mask a valid legacy.
+
+    `RB_QUERY_DP_READ_TIMEOUT_S=''` (or 'bad'/'-5'/'0') with a valid legacy
+    `RB_QUERY_DP_TIMEOUT_S=45` must resolve to 45 (legacy), not 30 (default).
+    """
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", bad_value)
+    monkeypatch.setenv("RB_QUERY_DP_TIMEOUT_S", "45")
+    t = qp._query_timeout()
+    assert t.read == 45.0
+
+
+def test_query_timeout_empty_read_knob_treated_as_unset(monkeypatch):
+    """An empty-string new read knob is treated the same as unset → default."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.delenv("RB_QUERY_DP_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "")
+    t = qp._query_timeout()
+    assert t.read == qp._DEFAULT_READ_TIMEOUT_S
+
+
+def test_query_timeout_valid_read_still_wins_over_legacy(monkeypatch):
+    """Precedence unchanged: a VALID new read knob still beats the legacy knob."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.setenv("RB_QUERY_DP_TIMEOUT_S", "45")
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "90")
+    t = qp._query_timeout()
+    assert t.read == 90.0
+
+
+def test_query_timeout_tiny_positive_read_floored(monkeypatch):
+    """A legitimately-tiny POSITIVE value keeps the 0.1s floor (not rejected)."""
+    import services.query_api.query_proxy as qp
+
+    monkeypatch.delenv("RB_QUERY_DP_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("RB_QUERY_DP_READ_TIMEOUT_S", "0.001")
+    t = qp._query_timeout()
+    assert t.read == 0.1
+
+
 def test_build_client_uses_configured_timeout(monkeypatch):
     """`_build_client` bakes the configured `httpx.Timeout` into the client.
 

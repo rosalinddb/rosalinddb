@@ -426,6 +426,30 @@ _DEFAULT_WRITE_TIMEOUT_S = 5.0
 _DEFAULT_POOL_TIMEOUT_S = 5.0
 
 
+def _parse_positive_timeout_s(raw: str | None) -> float | None:
+    """Parse a timeout-seconds env value, returning None for INVALID input.
+
+    Invalid means: unset (`None`), empty/whitespace-only, non-numeric, or a
+    parsed value `<= 0`. A non-positive read/connect budget is never what an
+    operator wants — clamping it down to ~0 would turn a `-5`/`0` typo into a
+    sub-second budget that 504s essentially every real query (the opposite of
+    intent). Returning None lets callers fall back to the next source (legacy
+    knob, then the hard default) instead of clamping invalid input.
+
+    A `0.1s` floor is applied only to legitimately-tiny POSITIVE values, so a
+    deliberate small budget is honoured while a non-positive value is rejected.
+    """
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return max(0.1, value)
+
+
 def _read_timeout_s() -> float:
     """Resolve the CP→DP READ timeout in seconds (env-tunable).
 
@@ -435,29 +459,33 @@ def _read_timeout_s() -> float:
     deployment that tuned the old knob keeps tuning the read timeout; finally
     the 30s default. Read live so an operator or a test can retune without
     re-importing.
+
+    An unset OR invalid (empty / non-numeric / `<=0`) new read knob falls
+    THROUGH the legacy knob before the hard default — so an empty/garbage new
+    knob never masks a valid legacy knob, and a non-positive value falls back
+    instead of being clamped to a near-zero budget.
     """
-    raw = os.getenv("RB_QUERY_DP_READ_TIMEOUT_S")
-    if raw is None:
+    value = _parse_positive_timeout_s(os.getenv("RB_QUERY_DP_READ_TIMEOUT_S"))
+    if value is None:
         # Backwards-compat: the legacy scalar knob now tunes the read budget.
-        raw = os.getenv("RB_QUERY_DP_TIMEOUT_S")
-    if raw is None:
+        value = _parse_positive_timeout_s(os.getenv("RB_QUERY_DP_TIMEOUT_S"))
+    if value is None:
         return _DEFAULT_READ_TIMEOUT_S
-    try:
-        return max(0.1, float(raw))
-    except (TypeError, ValueError):
-        return _DEFAULT_READ_TIMEOUT_S
+    return value
 
 
 def _connect_timeout_s() -> float:
     """Resolve the CP→DP CONNECT timeout in seconds (env-tunable, default 3s).
 
     Short so a dead/unreachable DP fast-fails the connect-retry chain instead
-    of waiting out the (much larger) read budget. Read live.
+    of waiting out the (much larger) read budget. An empty / non-numeric /
+    non-positive value falls back to the default rather than being clamped to a
+    near-zero budget. Read live.
     """
-    try:
-        return max(0.1, float(os.getenv("RB_QUERY_DP_CONNECT_TIMEOUT_S", str(_DEFAULT_CONNECT_TIMEOUT_S))))
-    except (TypeError, ValueError):
+    value = _parse_positive_timeout_s(os.getenv("RB_QUERY_DP_CONNECT_TIMEOUT_S"))
+    if value is None:
         return _DEFAULT_CONNECT_TIMEOUT_S
+    return value
 
 
 def _query_timeout() -> httpx.Timeout:
