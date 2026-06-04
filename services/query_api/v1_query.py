@@ -179,21 +179,56 @@ _RESULTS_LOCK = result_store._RESULTS_LOCK
 #     large shards co-resident would OOM the node. Instead each entry's
 #     approximate footprint (index + parsed sidecar) is measured once at
 #     insert time and a running total is kept; on insert the LRU end is
-#     evicted until `total <= RB_SHARD_CACHE_BYTES` (default 512 MB). An
-#     `OrderedDict` is the LRU — a hit moves the key to the end. A single
-#     entry larger than the whole budget is admitted then immediately evicted
-#     (usable for that one query, never retained) so eviction can't loop.
+#     evicted until `total <= RB_SHARD_CACHE_BYTES`. An `OrderedDict` is the
+#     LRU — a hit moves the key to the end.
 #     `RB_SHARD_CACHE_SIZE` remains an optional *secondary* safety cap.
+#   - Oversized-shard bypass (the 1M-scale correctness fix): a single shard
+#     whose measured footprint alone EXCEEDS the whole budget can never
+#     coexist with anything else. Inserting it as MRU and then running the
+#     eviction loop would evict every warm neighbour first and finally the
+#     oversized entry too — wiping the cache on *every* query for that shard
+#     (pathological evict-then-reinsert thrash). So `_cache_put` detects the
+#     oversize case up front and BYPASSES the cache entirely: the entry is
+#     never inserted, no neighbour is evicted, and the current query still
+#     searches the in-hand index/sidecar held in the call site's locals. The
+#     bypass emits `record_shard_cache("oversize")` + a one-time-per-shard
+#     WARNING so an under-provisioned operator can see they need a bigger
+#     `RB_SHARD_CACHE_BYTES`.
 #   - Evicted in step with the shard sweep: when the rough-edges sweeper
 #     deletes a superseded shard, `evict_shard()` drops its cache entry so a
 #     stale index is never served. Resolving the *newest* shard per query
 #     means a freshly-built shard is a natural cache miss → cold load.
 #   - Thread-guarded: `_hot_search` runs concurrently under the GIL; every
 #     read/mutate of the cache holds `_SHARD_CACHE_LOCK`.
-RB_SHARD_CACHE_BYTES = max(1, int(os.getenv("RB_SHARD_CACHE_BYTES", str(512 * 1024 * 1024))))
+# `RB_SHARD_CACHE_BYTES` — the in-memory shard-cache byte budget; the primary
+# operator knob for this cache. Default 1 GiB.
+#
+# Default rationale: the cache must be able to hold at least ONE large shard,
+# otherwise that shard is bypassed on every query (a permanent cold load) and
+# the cache provides zero value at the scale where it matters most. A 1M-vector
+# flat-float32 shard is dim x 4B x 1e6: ~512 MB at 128 dims, ~3 GB at 768 dims.
+# The previous 512 MB default could not hold even a single 128-dim 1M shard
+# once the sidecar is accounted for — so at 1M scale it degenerated into the
+# oversize-bypass path for the common case. 1 GiB comfortably holds a 128-dim
+# 1M shard (the most common large config) with headroom for the sidecar and a
+# warm neighbour or two, while staying small enough not to dominate RAM on a
+# modest node (a 4 GB pod still leaves ~3 GB for everything else). Deployers
+# running 768-dim-at-1M (or wanting more warm shards) raise this — the private
+# scale bench, for instance, overrides it to 2 GB. Deployers on tiny nodes can
+# lower it; an oversized shard is then served via the graceful bypass rather
+# than thrashing the cache.
+RB_SHARD_CACHE_BYTES = max(1, int(os.getenv("RB_SHARD_CACHE_BYTES", str(1024 * 1024 * 1024))))
 # Optional secondary count cap. 0 (or unset → 0) disables it; the byte budget
 # is the primary bound.
 RB_SHARD_CACHE_SIZE = max(0, int(os.getenv("RB_SHARD_CACHE_SIZE", "0")))
+
+# Shard ids already warned about for exceeding the cache budget. Keeps the
+# oversize WARNING "one-time-ish" — logged once per shard id per process so an
+# under-provisioned operator gets a loud signal without a per-query log storm.
+# Kept strictly bounded: `evict_shard()` discards a swept shard's id and
+# `cache_clear()` empties the set, so it never accumulates ids for shards that
+# are gone and a re-added shard can warn again.
+_OVERSIZE_WARNED: set = set()
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -271,8 +306,9 @@ _MMAP_ENABLED = _truthy(os.getenv("RB_FAISS_MMAP"))
 # Python process's RSS, so `serialize_index(...).nbytes` (which would deserialise
 # the entire index to measure it — defeating the point of mmap) is the wrong
 # accounting. 32 MiB is large enough that an unbounded number of mmap'd entries
-# still pressures the cache toward eviction; small enough that a 512 MB cache
-# can hold many warm shards. Documented in `docs/architecture/mmap.md`.
+# still pressures the cache toward eviction; small enough that the default
+# `RB_SHARD_CACHE_BYTES` budget holds many warm shards. Documented in
+# `docs/architecture/mmap.md`.
 _MMAP_INDEX_ESTIMATE_BYTES = 32 * 1024 * 1024
 
 
@@ -687,12 +723,50 @@ def _cache_put(shard_id, index, sidecar) -> None:
 
     The entry's footprint is measured once here. On insert, LRU entries are
     evicted until the running total fits `RB_SHARD_CACHE_BYTES` (and, if
-    enabled, the secondary count cap `RB_SHARD_CACHE_SIZE`). An entry larger
-    than the whole budget is admitted then immediately evicted so it is still
-    usable for the current query but is never retained.
+    enabled, the secondary count cap `RB_SHARD_CACHE_SIZE`).
+
+    Oversized-shard bypass: a shard whose footprint alone exceeds the whole
+    budget can never coexist with any other entry. Inserting it would force the
+    eviction loop to drain every warm neighbour before discarding the oversized
+    entry itself — thrashing the cache on every query for that shard. Instead
+    we detect that case up front and return WITHOUT touching the cache: the
+    entry is never inserted, no neighbour is evicted, and the caller's in-hand
+    `index`/`sidecar` still serve the current query. The bypass is recorded as
+    `record_shard_cache("oversize")` and warned about once per shard id so an
+    under-provisioned operator sees they should raise `RB_SHARD_CACHE_BYTES`.
     """
     global _SHARD_CACHE_BYTES_USED
     nbytes = _entry_nbytes(index, sidecar)
+
+    # Oversized-shard graceful bypass — never insert, never evict neighbours.
+    if nbytes > RB_SHARD_CACHE_BYTES:
+        with _SHARD_CACHE_LOCK:
+            # Drop any prior (smaller) entry for this id so a stale index is
+            # never served, but do NOT evict anyone else.
+            old = _SHARD_CACHE.pop(shard_id, None)
+            if old is not None:
+                _SHARD_CACHE_BYTES_USED -= old[2]
+            first_time = shard_id not in _OVERSIZE_WARNED
+            if first_time:
+                _OVERSIZE_WARNED.add(shard_id)
+        # Signal + warn outside the cache lock (logging/metrics must not run
+        # under the hot-path lock).
+        try:
+            obs_metrics.record_shard_cache("oversize")
+        except Exception:  # noqa: BLE001 - metrics must never break the query path
+            pass
+        if first_time:
+            logging.getLogger(__name__).warning(
+                "shard %s footprint (~%d bytes) exceeds the whole shard-cache "
+                "budget RB_SHARD_CACHE_BYTES=%d; serving it BYPASSED (not "
+                "cached) to avoid evicting the warm cache. Raise "
+                "RB_SHARD_CACHE_BYTES to cache shards this large.",
+                shard_id,
+                nbytes,
+                RB_SHARD_CACHE_BYTES,
+            )
+        return
+
     with _SHARD_CACHE_LOCK:
         # Replacing an existing key: drop its old footprint first.
         old = _SHARD_CACHE.pop(shard_id, None)
@@ -702,8 +776,8 @@ def _cache_put(shard_id, index, sidecar) -> None:
         _SHARD_CACHE.move_to_end(shard_id)
         _SHARD_CACHE_BYTES_USED += nbytes
         # Evict LRU entries until within the byte budget. The just-inserted
-        # entry is the MRU, so it is evicted last — if it alone exceeds the
-        # budget it is admitted-then-evicted (usable now, not retained).
+        # entry is the MRU, so it is evicted last; the oversize case is handled
+        # above, so this loop only ever trims genuinely-evictable neighbours.
         while _SHARD_CACHE_BYTES_USED > RB_SHARD_CACHE_BYTES and _SHARD_CACHE:
             _evicted_id, evicted = _SHARD_CACHE.popitem(last=False)
             _SHARD_CACHE_BYTES_USED -= evicted[2]
@@ -724,6 +798,9 @@ def evict_shard(shard_id) -> bool:
     global _SHARD_CACHE_BYTES_USED
     with _SHARD_CACHE_LOCK:
         entry = _SHARD_CACHE.pop(shard_id, None)
+        # Drop any oversize-warned mark so a re-added shard can warn again and
+        # the warned set cannot grow without bound as shards come and go.
+        _OVERSIZE_WARNED.discard(shard_id)
         if entry is None:
             return False
         _SHARD_CACHE_BYTES_USED -= entry[2]
@@ -736,6 +813,8 @@ def cache_clear() -> None:
     with _SHARD_CACHE_LOCK:
         _SHARD_CACHE.clear()
         _SHARD_CACHE_BYTES_USED = 0
+        # Keep the oversize-warned set bounded: a full reset clears it too.
+        _OVERSIZE_WARNED.clear()
 
 
 router = APIRouter()

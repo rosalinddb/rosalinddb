@@ -147,8 +147,11 @@ the *deserialised* FAISS index and the *parsed* sidecar:
   `faiss.serialize_index(index).nbytes` plus the serialised sidecar size — is
   measured once at insert time and a running total is kept; on insert the LRU
   end is evicted until the total fits `RB_SHARD_CACHE_BYTES` (default
-  **512 MB**). A single entry larger than the whole budget is admitted then
-  immediately evicted — usable for that one query, never retained.
+  **1 GiB**). A single entry larger than the whole budget is gracefully
+  **bypassed** — never inserted, so it neither evicts the warm neighbours nor
+  is retained; the current query still uses the in-hand index, and the bypass
+  is recorded as `record_shard_cache("oversize")` with a one-time-per-shard
+  warning prompting the operator to raise `RB_SHARD_CACHE_BYTES`.
   `RB_SHARD_CACHE_SIZE` remains an optional secondary count cap (0 = disabled).
 - It is **evicted in step with the superseded-shard sweep**: when the builder
   sweeps a superseded shard it calls `evict_shard()` so the stale (now-deleted)

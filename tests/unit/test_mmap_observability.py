@@ -144,6 +144,46 @@ def test_record_shard_page_faults_ignores_zero_and_negative(captured_metrics):
     assert total == 0
 
 
+# --- record_shard_cache("oversize") counter -------------------------------
+
+
+def test_record_shard_cache_oversize_label(captured_metrics):
+    """`record_shard_cache("oversize")` increments the shard_cache counter with
+    a low-cardinality `result=oversize` attribute — the operator-facing signal
+    that a shard exceeded the whole cache budget and was served bypassed."""
+    reader, obs_metrics = captured_metrics
+    obs_metrics.record_shard_cache("oversize")
+
+    points = _metric_points(reader, "rosalinddb.shard_cache")
+    assert points, "expected at least one data point for the shard_cache counter"
+    oversize = [p for p in points if dict(p.attributes or {}).get("result") == "oversize"]
+    assert oversize, "expected a data point labelled result=oversize"
+    assert sum(int(p.value) for p in oversize) == 1
+    # No tenant/dataset/shard label — only the low-cardinality `result`.
+    for p in oversize:
+        assert set(dict(p.attributes or {})) == {"result"}
+
+
+def test_oversized_put_emits_oversize_metric(captured_metrics, monkeypatch):
+    """A `_cache_put` whose entry exceeds the whole budget emits
+    `record_shard_cache("oversize")` so under-provisioning is visible."""
+    import services.query_api.v1_query as v1q
+
+    reader, obs_metrics = captured_metrics
+    # Bind v1_query's metrics reference to the isolated provider's module.
+    monkeypatch.setattr(v1q, "obs_metrics", obs_metrics, raising=False)
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_BYTES", 500)
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_SIZE", 0)
+    v1q.cache_clear()
+
+    v1q._cache_put("huge", object(), {"_pad": "x" * 5000})
+
+    points = _metric_points(reader, "rosalinddb.shard_cache")
+    oversize = [p for p in points if dict(p.attributes or {}).get("result") == "oversize"]
+    assert oversize, "oversized put must emit result=oversize"
+    assert sum(int(p.value) for p in oversize) >= 1
+
+
 # --- faiss_load_index_span carries the mmap attribute --------------------
 
 

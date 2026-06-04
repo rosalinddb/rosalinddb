@@ -75,7 +75,12 @@ def _get_instruments() -> dict:
             "shard_cache": meter.create_counter(
                 "rosalinddb.shard_cache",
                 unit="1",
-                description="In-memory shard index cache lookups, by result (hit|miss).",
+                description=(
+                    "In-memory shard index cache outcomes, by result "
+                    "(hit|miss|oversize). `oversize` means the shard's footprint "
+                    "alone exceeded the whole cache budget, so it was served "
+                    "bypassed (never cached) — an under-provisioning signal."
+                ),
             ),
             "shard_page_faults": meter.create_counter(
                 "rosalinddb.shard.page_faults",
@@ -202,12 +207,17 @@ def record_recall_search_duration(duration_ms: float, mode: str = "recall") -> N
 
 
 def record_shard_cache(result: str) -> None:
-    """`rosalinddb.shard_cache` +1. `result` is `hit` or `miss`.
+    """`rosalinddb.shard_cache` +1. `result` is `hit`, `miss`, or `oversize`.
 
     Counts in-memory shard index cache outcomes. A `hit` means the query
     reused an already-deserialised FAISS index + parsed sidecar; a `miss`
-    means a genuine cold load. `result` is the only (low-cardinality)
-    attribute — no tenant/dataset/shard label.
+    means a genuine cold load; `oversize` means the shard's footprint alone
+    exceeded the whole cache budget (`RB_SHARD_CACHE_BYTES`) so it was served
+    BYPASSED — deserialised for this query but never inserted, to avoid
+    evicting the rest of the warm cache for an entry that can never coexist.
+    A non-zero `oversize` rate is the operator-facing under-provisioning
+    signal: raise `RB_SHARD_CACHE_BYTES`. `result` is the only
+    (low-cardinality) attribute — no tenant/dataset/shard label.
     """
     _get_instruments()["shard_cache"].add(1, {"result": result})
 
