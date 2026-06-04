@@ -40,7 +40,26 @@ axis from this one. It can never lose data — a miss just re-fetches from S3. T
 holds **data that is in no shard yet**. The only place completeness can break is the
 **recall↔consolidated seam** (§The watermark, §Invariants) — never the cache.
 
+## Diagrams
+
+Dedicated, richer PlantUML diagrams focused on **how the Recall tier snaps onto
+the Consolidate tier and how they work in tandem** (the inline ```plantuml blocks
+below are kept as quick in-context sketches; these files are the detailed
+companions). All live in [`diagrams/`](diagrams/):
+
+| File | Kind | Shows |
+|---|---|---|
+| [`recall-consolidate-tandem.puml`](diagrams/recall-consolidate-tandem.puml) | component / overview | Both tiers either side of the `consolidated_lsn` seam (Recall owns `lsn > W`, Consolidate owns `lsn <= W`), the `index_builder`, and all three flows: synchronous write → Recall; consolidation drains Recall → shard + advances the watermark; query reads BOTH and merges. |
+| [`recall-consolidate-watermark.puml`](diagrams/recall-consolidate-watermark.puml) | the "snap" picture | An LSN number line with `consolidated_lsn` as the divider, BEFORE vs AFTER a consolidation: the watermark snaps `W → N`, and the grace-bounded trim (I4) reclaims Recall only to the 2nd-newest shard's watermark. |
+| [`recall-consolidate-lifecycle.puml`](diagrams/recall-consolidate-lifecycle.puml) | sequence | One vector's journey: write → Recall (queryable now) → union serves it from Recall → consolidation commits `consolidated_lsn=N` → union serves it from Consolidate → its Recall row is eventually trimmed. |
+| [`recall-consolidate-consolidation.puml`](diagrams/recall-consolidate-consolidation.puml) | handoff sequence (I2/I4) | snapshot up to N → build + commit shard → grace-bounded idempotent trim, annotating commit-then-trim ordering (I2), the grace buffer (I4), and the crash-safe windows across the two-DB seam. |
+| [`recall-consolidate-query-union.puml`](diagrams/recall-consolidate-query-union.puml) | query union sequence | resolve latest shard + its watermark (I3) → search Recall (`lsn > W`, brute-force) + Consolidate (FAISS via cache) → merge: square pgvector L2 → L2² (metric alignment), recall-wins dedup, tombstone suppression, sort, top_k. |
+
+Validated with PlantUML 1.2024.7 (`-checkonly` + PNG render, both clean) — see the PR for details.
+
 ## Architecture
+
+> Diagram: the component/overview is [`diagrams/recall-consolidate-tandem.puml`](diagrams/recall-consolidate-tandem.puml).
 
 ```plantuml
 @startuml
@@ -101,6 +120,8 @@ per-write path never touches the control-plane PG. The control-plane PG sees the
 as a low-frequency `consolidated_lsn` update at consolidation time — never per write.
 
 ## The watermark (the seam)
+
+> Diagram: the "snap" before/after picture is [`diagrams/recall-consolidate-watermark.puml`](diagrams/recall-consolidate-watermark.puml).
 
 Every write is stamped with a monotonic **`lsn`** (log sequence number) from a per-dataset
 sequence. Each `shard_catalog` row gains **`consolidated_lsn`** = the highest LSN folded into
@@ -163,6 +184,8 @@ the consolidated tier (landing → builder → shard). Large dumps never enter t
 this is what keeps the recall set small enough for brute-force search (see §Recall search).
 
 ## Read path — the union
+
+> Diagrams: the full query union (metric alignment, dedup, tombstone suppression, mode labels) is [`diagrams/recall-consolidate-query-union.puml`](diagrams/recall-consolidate-query-union.puml); one vector's end-to-end journey across the seam is [`diagrams/recall-consolidate-lifecycle.puml`](diagrams/recall-consolidate-lifecycle.puml).
 
 ```plantuml
 @startuml
@@ -227,6 +250,8 @@ shard row it resolved back to `run_query` (via an out-dict), and the recall scan
 `list_shards` lookup — so a stale cached shard version can never open a partition gap.
 
 ## Consolidation / flush
+
+> Diagram: the build → commit (I2) → grace-bounded trim (I4) handoff, with the crash-safe windows, is [`diagrams/recall-consolidate-consolidation.puml`](diagrams/recall-consolidate-consolidation.puml).
 
 The recall→consolidated flush *(implemented in `services.index_builder.run` —
 `run_consolidate_once` / `_run_consolidate_locked` / `_build_consolidated_shard`)* is the

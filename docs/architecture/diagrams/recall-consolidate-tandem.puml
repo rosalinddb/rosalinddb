@@ -1,0 +1,67 @@
+@startuml recall-consolidate-tandem
+' STRUCTURAL overview: how the Recall tier snaps onto the Consolidate tier.
+' Recall (pgvector) owns lsn > watermark; Consolidate (S3 FAISS shards) owns
+' lsn <= watermark; shard_catalog/consolidated_lsn is the SEAM between them.
+' This is a STRUCTURE view -- the step-by-step flows live in the lifecycle,
+' consolidation, and query-union SEQUENCE diagrams, not here.
+'
+' NOTE: "Recall <-> Consolidate" here is the WRITE-FRESHNESS axis. It is a
+' DIFFERENT axis from the SSD-cache "hot/cold" storage-distance axis in
+' ssd-cache-tiers.puml -- do not conflate them. The SSD/RAM cache holds
+' disposable copies of consolidated shards and never affects completeness.
+
+title RosalindDB: the Recall tier snapped onto the Consolidate tier (structure)
+
+left to right direction
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam wrapWidth 200
+skinparam nodesep 25
+skinparam ranksep 55
+
+actor "client" as client
+
+component "cp\n(control plane)" as cp
+component "query_dp\n(union + merge)" as dp
+component "index_builder\n(consolidation worker)" as builder
+
+package "Write-freshness axis" {
+  database "Recall tier\npgvector\nowns lsn > watermark" as recall
+  rectangle "shard_catalog /\nconsolidated_lsn\n= the WATERMARK (seam)" as catalog #LightYellow
+  cloud "Consolidate tier\nS3 FAISS shards\nowns lsn <= watermark" as os
+}
+
+' ---- control plane fans out to the two data-plane workers ----
+client --> cp
+cp --> dp
+cp --> recall : write (sync)
+
+' ---- consolidation worker: drain Recall, build shard, advance watermark ----
+builder --> recall : drain
+builder --> os : build shard
+builder --> catalog : advance watermark
+
+' ---- query: read watermark, then search both sides of the seam ----
+dp --> catalog : read watermark
+dp --> recall : search lsn > wm
+dp --> os : search lsn <= wm
+
+' keep the seam laid out BETWEEN the two tiers (left-to-right rank order)
+recall -[hidden]down-> catalog
+catalog -[hidden]down-> os
+
+note bottom of os
+  Partition rule: the watermark splits every
+  vector by its single lsn --
+    lsn <= W  -> Consolidate
+    lsn >  W  -> Recall
+  Exactly one tier each, so the union is
+  complete (no gap, no overlap).
+end note
+
+@enduml
