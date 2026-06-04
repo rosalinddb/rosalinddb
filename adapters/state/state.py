@@ -976,7 +976,13 @@ def _apply_recall_migrations(dsn: str) -> None:
     recall schema without a ledger to reconcile.
     """
     migrations_dir = Path(__file__).parent / "migrations" / "recall"
-    conn = psycopg2.connect(dsn)
+    # Route the migrator's dedicated connection through the single recall
+    # connection seam too, so EVERY recall connection — pooled, dedicated, and
+    # the migration runner — carries the txn-mode `prepare_threshold=None`
+    # marker. The migrator's `pg_advisory_xact_lock` is TRANSACTION-scoped and
+    # its DDL runs in one transaction on this dedicated (non-pooled) connection,
+    # so `_recall_connect()`'s contract is a perfect fit.
+    conn = _recall_connect(dsn)
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
@@ -1092,10 +1098,15 @@ def _recall_conn() -> "psycopg2.extensions.connection":
     A brand-new connection to `RB_RECALL_DSN` (a full TCP + TLS + auth
     handshake). This is NO LONGER the per-op recall path: every recall CRUD /
     consolidation function now checks a connection out of the recall pool via
-    `recall_pooled_conn()` instead (see below). `_recall_conn()` is retained for
-    the migration runner's dedicated-connection needs and as a low-level
-    factory, never as the hot per-query path it used to be (~48ms/op of pure
-    handshake when one was opened per recall op).
+    `recall_pooled_conn()` instead (see below).
+
+    RETAINED FOR TESTS / LOW-LEVEL USE: this has no production callers today (the
+    migration runner mints its dedicated connection via `_recall_connect()`
+    directly, and the hot path is pooled). It is kept as the thin
+    DSN-resolving + recall-off-guard wrapper around `_recall_connect()` for the
+    unit suite (which monkeypatches / drives it) and as a low-level dedicated-
+    connection factory — not dead code. It was never the hot per-query path it
+    used to be (~48ms/op of pure handshake when one was opened per recall op).
 
     Lazy by construction: only reached when `recall_enabled()` is True. With the
     flag off no caller reaches here and no recall pool is built, so no connection
@@ -1119,8 +1130,9 @@ def _recall_conn() -> "psycopg2.extensions.connection":
 # The recall tier is run behind pgbouncer in TRANSACTION pooling mode in prod
 # (a server connection is held only for the duration of a transaction, then
 # returned to pgbouncer's pool — so NO session-level state may span
-# transactions). Every recall connection — pooled (`_get_recall_pool`) and the
-# dedicated factory (`_recall_conn`) — is minted HERE so that txn-mode guarantee
+# transactions). EVERY recall connection — pooled (`_get_recall_pool`), the
+# dedicated factory (`_recall_conn`), AND the migration runner
+# (`_apply_recall_migrations`) — is minted HERE so that txn-mode guarantee
 # lives in exactly one place.
 #
 # TXN-MODE SAFETY AUDIT of the recall code path (recall_upsert_vectors,
@@ -1174,9 +1186,9 @@ _RECALL_PREPARE_THRESHOLD = None  # txn-mode marker: never persist named prepare
 def _recall_connect(dsn: str) -> "psycopg2.extensions.connection":
     """Open ONE recall connection in a pgbouncer-TRANSACTION-mode-safe way.
 
-    The single seam through which every recall connection (pooled and dedicated)
-    is created, so the transaction-pooling guarantee documented above lives in
-    one place. Sets `prepare_threshold=None` so no NAMED server-side prepared
+    The single seam through which every recall connection (pooled, dedicated,
+    and the migration runner) is created, so the transaction-pooling guarantee
+    documented above lives in one place. Sets `prepare_threshold=None` so no NAMED server-side prepared
     statement is ever created on a recall connection — the property that lets a
     server connection be safely returned to pgbouncer's transaction pool after
     each transaction without leaking session state to the next borrower.

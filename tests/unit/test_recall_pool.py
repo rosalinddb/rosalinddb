@@ -682,6 +682,81 @@ def test_recall_conn_dedicated_factory_routes_through_recall_connect(
     )
 
 
+class _FakeMigrateCursor:
+    """A cursor stub for the migration runner: records SQL, replays the ledger.
+
+    `fetchall()` returns every known migration version as already-applied, so
+    `_apply_recall_migrations` skips the per-version `.sql` file reads + DDL —
+    keeping the test hermetic (no filesystem, no real database) while still
+    exercising the connection mint + advisory-lock + ledger statements.
+    """
+
+    def __init__(self, applied):
+        self._applied = applied
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, *a, **k):
+        pass
+
+    def fetchall(self):
+        return [(v,) for v in self._applied]
+
+
+class _FakeMigrateConn:
+    """A connection stub supporting `with conn, conn.cursor() as cur` use."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self, *a, **k):
+        return self._cur
+
+    def close(self):
+        pass
+
+
+def test_apply_recall_migrations_mints_connection_with_prepare_threshold_none(
+    state_on, monkeypatch
+):
+    """The MIGRATION runner also mints its connection with `prepare_threshold=None`.
+
+    `_apply_recall_migrations()` now routes its dedicated connection through
+    `_recall_connect()` too, so the txn-mode marker covers EVERY recall
+    connection — pooled, dedicated, AND the migrator — making the "minted HERE"
+    invariant literally true.
+    """
+    state = state_on
+    seen = {}
+
+    def _spy_connect(dsn, **kwargs):
+        seen["dsn"] = dsn
+        seen["kwargs"] = kwargs
+        return _FakeMigrateConn(_FakeMigrateCursor(state._RECALL_MIGRATION_VERSIONS))
+
+    monkeypatch.setattr(state.psycopg2, "connect", _spy_connect)
+    state._apply_recall_migrations(state._recall_dsn())
+
+    assert seen["dsn"] == state._recall_dsn()
+    assert "prepare_threshold" in seen["kwargs"], (
+        "the migration runner must mint its connection through the txn-mode seam"
+    )
+    assert seen["kwargs"]["prepare_threshold"] is None, (
+        "_apply_recall_migrations() must mint its connection with "
+        "prepare_threshold=None (the single-seam txn-mode invariant)"
+    )
+
+
 def test_recall_pool_built_with_prepare_threshold_none(state_on, monkeypatch):
     """`_get_recall_pool()` forwards `prepare_threshold=None` to the pool ctor.
 
