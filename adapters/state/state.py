@@ -471,8 +471,17 @@ def pooled_conn(
             pool.putconn(conn)
         raise
     else:
-        conn.commit()
-        pool.putconn(conn)
+        # Return the connection on EVERY exit — even if commit() itself raises
+        # (broken backend / TLS reset / statement_timeout on COMMIT). Otherwise a
+        # commit failure leaks the conn from the pool's accounting, permanently
+        # shrinking the pool. psycopg2._putconn inspects transaction_status and
+        # rolls back / closes a non-idle or server-lost conn before re-pooling,
+        # so a post-commit-failure conn is returned clean, not poisoned. (Mirrors
+        # the corrected pattern in `recall_pooled_conn()`.)
+        try:
+            conn.commit()
+        finally:
+            pool.putconn(conn)
 
 
 def _checkout_request_conn(
