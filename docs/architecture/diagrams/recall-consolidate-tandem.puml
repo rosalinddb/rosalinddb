@@ -1,17 +1,18 @@
 @startuml recall-consolidate-tandem
-' Component / overview: how the Recall tier snaps onto the Consolidate tier.
-' Recall (pgvector) owns lsn > consolidated_lsn; Consolidate (S3 shards +
-' sidecars) owns lsn <= consolidated_lsn; the consolidated_lsn watermark is
-' the seam. Synchronous writes land in Recall; the index_builder drains
-' Recall into a shard and advances the watermark; queries read BOTH tiers
-' and merge (recall-wins dedup, L2^2 metric alignment).
+' STRUCTURAL overview: how the Recall tier snaps onto the Consolidate tier.
+' Recall (pgvector) owns lsn > watermark; Consolidate (S3 FAISS shards) owns
+' lsn <= watermark; shard_catalog/consolidated_lsn is the SEAM between them.
+' This is a STRUCTURE view -- the step-by-step flows live in the lifecycle,
+' consolidation, and query-union SEQUENCE diagrams, not here.
 '
 ' NOTE: "Recall <-> Consolidate" here is the WRITE-FRESHNESS axis. It is a
 ' DIFFERENT axis from the SSD-cache "hot/cold" storage-distance axis in
 ' ssd-cache-tiers.puml -- do not conflate them. The SSD/RAM cache holds
 ' disposable copies of consolidated shards and never affects completeness.
 
-title RosalindDB: Recall tier snapped onto the Consolidate tier (RB_RECALL on)
+title RosalindDB: the Recall tier snapped onto the Consolidate tier (structure)
+
+left to right direction
 
 skinparam componentStyle rectangle
 skinparam shadowing false
@@ -19,64 +20,48 @@ skinparam defaultFontName Helvetica
 skinparam defaultFontSize 12
 skinparam ArrowFontSize 11
 skinparam NoteFontSize 10
-skinparam wrapWidth 220
+skinparam wrapWidth 200
+skinparam nodesep 25
+skinparam ranksep 55
 
 actor "client" as client
 
-component "cp\n(Control Plane,\npublic origin)" as cp
+component "cp\n(control plane)" as cp
 component "query_dp\n(union + merge)" as dp
-component "index_builder\n(consolidate = compaction,\nsingle replica, advisory-locked)" as builder
-queue "CONSOLIDATE topic\n(best-effort enqueue:\ncap exceeded / idle sweep)" as q
+component "index_builder\n(consolidation worker)" as builder
 
-package "Write-freshness axis (this design)" {
-  database "Recall tier\npgvector (data-plane,\nRB_RECALL_DSN)\nrows: (tenant, dataset, id,\nembedding, metadata, lsn, deleted)\nOWNS lsn > consolidated_lsn" as recall
-  database "shard_catalog\n(control-plane PG)\nrow per shard + consolidated_lsn\n= the WATERMARK / seam" as catalog
-  cloud "Consolidate tier\nobject store: FAISS shards\n+ sidecars\nOWNS lsn <= consolidated_lsn" as os
+package "Write-freshness axis" {
+  database "Recall tier\npgvector\nowns lsn > watermark" as recall
+  rectangle "shard_catalog /\nconsolidated_lsn\n= the WATERMARK (seam)" as catalog #LightYellow
+  cloud "Consolidate tier\nS3 FAISS shards\nowns lsn <= watermark" as os
 }
 
-' ---- Synchronous write path: -> Recall ----
-client -down-> cp : (1) POST /vectors (sync)
-cp -down-> recall : (2) nextval(lsn_seq);\nUPSERT (.. , lsn, deleted)\n[durable -> queryable now]
-cp -right-> q : (3) enqueue CONSOLIDATE\n(after durable write)
-cp --> client : 200 OK {accepted, rejected, errors}
+' ---- control plane fans out to the two data-plane workers ----
+client --> cp
+cp --> dp
+cp --> recall : write (sync)
 
-' ---- Consolidation: drains Recall -> shard, advances watermark ----
-q -down-> builder : signal
-builder -up-> recall : (A) snapshot lsn <= N\n(live rows + tombstones)
-builder -down-> os : (B) build + write shard + sidecar\n(apply tombstones via _remove_ids)
-builder -right-> catalog : (C) COMMIT consolidated_lsn = N\n[I2: commit BEFORE trim]
-builder -up-> recall : (D) grace-bounded TRIM\nlsn <= 2nd-newest shard's watermark\n[I2 after commit, I4 grace, idempotent]
+' ---- consolidation worker: drain Recall, build shard, advance watermark ----
+builder --> recall : drain
+builder --> os : build shard
+builder --> catalog : advance watermark
 
-' ---- Query: reads BOTH tiers, merges ----
-client -down-> cp : (Q1) POST /query
-cp -down-> dp
-dp -right-> catalog : (Q2) resolve latest shard S +\nits consolidated_lsn(S)  [I3 pairing]
-dp -down-> os : (Q3) FAISS search S (via SSD/RAM cache)\n-> cold hits in L2^2
-dp -up-> recall : (Q4) exact brute-force\nWHERE NOT deleted, lsn > consolidated_lsn(S)
-dp -> dp : (Q5) merge: square pgvector L2 -> L2^2,\nrecall-wins dedup, drop tombstoned ids,\nsort asc, take top_k
-dp --> client : {matches, mode, ...}
+' ---- query: read watermark, then search both sides of the seam ----
+dp --> catalog : read watermark
+dp --> recall : search lsn > wm
+dp --> os : search lsn <= wm
 
-note bottom of catalog
-  consolidated_lsn is the single number that
-  partitions every vector (I1):
-    lsn <= W  -> Consolidate (shard)
-    lsn >  W  -> Recall (pgvector)
-  Each vector has exactly one lsn, so it is in
-  exactly one tier. Union = complete.
-end note
-
-note right of recall
-  Brute-force exact (no ANN) over a SMALL set:
-  consolidation cadence -- not data size -- bounds
-  it (cap RB_RECALL_MAX_ROWS, idle drain to 0).
-  The per-write path never touches control-plane PG.
-end note
+' keep the seam laid out BETWEEN the two tiers (left-to-right rank order)
+recall -[hidden]down-> catalog
+catalog -[hidden]down-> os
 
 note bottom of os
-  Immutable, versioned shards (the Consolidate
-  tier). The SSD/RAM cache in front of this is a
-  SEPARATE storage-distance axis; a cache miss is
-  only slower, never incomplete.
+  Partition rule: the watermark splits every
+  vector by its single lsn --
+    lsn <= W  -> Consolidate
+    lsn >  W  -> Recall
+  Exactly one tier each, so the union is
+  complete (no gap, no overlap).
 end note
 
 @enduml

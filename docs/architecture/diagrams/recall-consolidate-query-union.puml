@@ -24,13 +24,13 @@ database "Recall\n(pgvector, recall_search)" as recall
 client -> dp : POST /query {vector, top_k, filter}
 activate dp
 
-== Resolve the seam (I3: pair the watermark to the shard actually read) ==
+== Resolve the seam (use the watermark of the shard this query actually read) ==
 
 dp -> catalog : list_shards -> latest shard S
 alt shard S exists
   dp -> cold : search S (FAISS, L2^2)\nvia SSD/RAM cache
   activate cold
-  cold --> dp : cold hits (L2^2) +\nOUT: the exact shard row resolved,\nits consolidated_lsn = W   [I3]
+  cold --> dp : cold hits (L2^2) +\nOUT: the exact shard row resolved,\nits consolidated_lsn = W
   deactivate cold
 else no shard yet (list_shards empty)
   note right of dp #E9F7E9
@@ -42,7 +42,7 @@ end
 
 == Search Recall with the RESOLVED watermark (brute-force exact) ==
 
-dp -> recall : recall_search WHERE tenant, dataset,\nlsn > W (the resolved shard's wm, NOT a fresh list_shards),\nfilter  [I3]
+dp -> recall : recall_search WHERE tenant, dataset,\nlsn > W (the watermark of the shard this query READ,\nNOT a fresh list_shards), filter
 activate recall
 note right of recall
   Brute-force exact L2 over the SMALL recall partition.

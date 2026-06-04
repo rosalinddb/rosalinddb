@@ -51,12 +51,12 @@ deactivate dp
 builder -> recall : snapshot lsn <= N   (N >= k, so V is in the snapshot)
 activate builder
 builder -> os : build + write new shard containing V + sidecar
-builder -> catalog : COMMIT consolidated_lsn = N   [I2: commit FIRST]
+builder -> catalog : COMMIT consolidated_lsn = N\n(commit the shard BEFORE trimming Recall)
 note over catalog #LightYellow
   Watermark snaps W -> N (N >= k).
   Now lsn=k is <= consolidated_lsn -> V belongs to CONSOLIDATE.
 end note
-builder -> recall : grace-bounded TRIM lsn <= 2nd-newest wm (= W, not N)\n[I2 after commit, I4 grace] -- V (lsn=k in (W,N]) is KEPT for now
+builder -> recall : grace-bounded TRIM lsn <= 2nd-newest wm (= W, not N)\n(only after commit; grace buffer keeps (W,N] one extra generation)\n-- V (lsn=k in (W,N]) is KEPT for now
 deactivate builder
 
 == t3: query union now serves V FROM Consolidate ==
@@ -70,9 +70,9 @@ dp -> dp : merge -> single copy of V
 dp --> client : matches include V  [served from CONSOLIDATE]
 deactivate dp
 note over recall, os #E7F3FD
-  V's Recall row still physically exists in (W, N] as a
-  grace buffer (I4), but the union excludes it (lsn > N is false).
-  No loss, no duplicate.
+  V's Recall row still physically exists in (W, N] as a grace
+  buffer (kept one extra generation), but the union excludes it
+  (lsn > N is false). No loss, no duplicate.
 end note
 
 == t4: V's Recall row is eventually trimmed ==
