@@ -359,6 +359,109 @@ def test_incremental_nonoverlap_fold_still_appends(ivf_builder, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# 3b. (TA-1) A survivor MISSING from the sidecar keeps its ORIGINAL int64.     #
+# --------------------------------------------------------------------------- #
+
+
+def test_union_rebuild_preserves_survivor_int64_with_partial_sidecar(
+    ivf_builder, monkeypatch
+):
+    """Regression (review P1): the union-rebuild path must carry each survivor's
+    ORIGINAL int64 through to the rebuilt index — even a survivor whose sidecar
+    entry is missing (a partial/unreadable sidecar; `read_shard_sidecar` degrades
+    to {} for missing keys and callers "degrade gracefully").
+
+    Pre-fix the rebuilt id array was `_id_to_int64(i) for i in union_ids`, where a
+    missing-from-sidecar survivor's id was synthesised as `str(sid)`. Re-hashing
+    that decimal string gives `_id_to_int64(str(sid)) != sid`, so the survivor's
+    vector is re-stamped under a WRONG int64: unreachable by its true id and
+    un-removable by a future tombstone. The fix concatenates the actual survivor
+    int64s instead of re-hashing.
+
+    Scenario: seed a cold IVFFlat shard, CORRUPT its sidecar by deleting ONE
+    survivor's `.meta.json` entry, run an OVERLAPPING fold (forces the rebuild),
+    and assert that survivor's ORIGINAL int64 is still present in the rebuilt
+    index with its vector preserved and is reachable by its true id.
+
+    This FAILS on the pre-fix code (the survivor's true int64 is absent from
+    `index.id_map`; a wrong int64 sits in its place) and PASSES after the fix.
+    """
+    builder_mod, state_mod, storage_mod = ivf_builder
+    from adapters.landing.parquet_reader import id_to_int64, read_shard_sidecar
+    from adapters.storage.storage import read_bytes, write_bytes
+    import json as _json
+
+    ids = [f"id-{i}" for i in range(_N_COLD)]
+    base = _deterministic_vectors(_N_COLD, _DIM, seed=11)
+    cold_shard = _seed_cold_ivf_shard(builder_mod, state_mod, ids, base)
+
+    # Pick a survivor that is NOT in the re-upsert set below (ids 0..39), so it
+    # flows through the survivor-reconstruction branch of the rebuild.
+    victim = ids[70]
+    victim_int64 = id_to_int64(victim)
+    victim_vec = base[70]
+
+    # CORRUPT the sidecar: delete exactly the victim's entry, leaving the rest.
+    # This is the "incomplete/partial sidecar" precondition — the victim's vector
+    # is still in the FAISS index, but its meta lookup will miss.
+    sidecar_uri = f"{cold_shard['shard_uri']}.meta.json"
+    sidecar = _json.loads(read_bytes(sidecar_uri).decode("utf-8"))
+    assert str(victim_int64) in sidecar, "fixture precondition: victim is in sidecar"
+    del sidecar[str(victim_int64)]
+    write_bytes(sidecar_uri, _json.dumps(sidecar).encode("utf-8"))
+    assert str(victim_int64) not in read_shard_sidecar(cold_shard["shard_uri"])
+
+    # OVERLAPPING fold: re-upsert ids 0..39 with NEW vectors. The overlap is
+    # non-empty so `_build_consolidated_shard` takes the union-REBUILD path; the
+    # victim (id-70) is an untouched survivor and is reconstructed + re-stamped.
+    new1 = _deterministic_vectors(40, _DIM, seed=21)
+    rows1 = [
+        _recall_row(ids[k], new1[k].tolist(), 100, metadata={"v": 100})
+        for k in range(40)
+    ]
+    _patch_snapshot(monkeypatch, builder_mod, max_lsn=100, rows=rows1)
+    n1 = builder_mod.run_consolidate_once("ds", "t1")
+    assert n1 == 40
+
+    shard = state_mod.get_latest_shard("t1", "ds")
+    assert shard["build_type"] == "consolidate"
+    assert shard["index_type"] == "ivfflat", "union rebuild stays IVFFlat"
+
+    index = faiss.deserialize_index(
+        np.frombuffer(read_bytes(shard["shard_uri"]), dtype=np.uint8)
+    )
+    faiss_int_ids = set(faiss.vector_to_array(index.id_map).tolist())
+
+    # CORE ASSERTION: the victim's ORIGINAL int64 is still in the rebuilt index.
+    # Pre-fix this is the WRONG int64 (`_id_to_int64(str(victim_int64))`), so the
+    # true `victim_int64` is ABSENT here and this fails.
+    assert victim_int64 in faiss_int_ids, (
+        "survivor missing from a partial sidecar was re-stamped under the WRONG "
+        "int64 (re-hash of its synthesised decimal id) — it is no longer "
+        "reachable by its true id"
+    )
+    # And the bug's wrong int64 must NOT have leaked in.
+    wrong_int64 = id_to_int64(str(victim_int64))
+    assert wrong_int64 not in faiss_int_ids, (
+        "the re-hashed (wrong) int64 leaked into the index"
+    )
+
+    # The victim's VECTOR is preserved (lossless IVFFlat reconstruct), reachable
+    # under its ORIGINAL int64 — i.e. by its true id's hash.
+    faiss.extract_index_ivf(index).make_direct_map()
+    recon = index.reconstruct(int(victim_int64))
+    assert np.allclose(recon, victim_vec, atol=1e-5), (
+        "survivor's vector was not preserved under its original int64"
+    )
+
+    # Reachable: the true id hashes to that int64, and a search finds it.
+    assert id_to_int64(victim) == victim_int64
+    index.nprobe = 16
+    D, I = index.search(victim_vec.reshape(1, -1), 1)
+    assert int(I[0][0]) == victim_int64, "search did not return the survivor's true id"
+
+
+# --------------------------------------------------------------------------- #
 # 4. From-scratch IVF fold unchanged.                                         #
 # --------------------------------------------------------------------------- #
 

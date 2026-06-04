@@ -1357,9 +1357,25 @@ def _build_consolidated_shard(
             ]
             survivor_vectors = _reconstruct_surviving(index, survivor_int_ids)
             # Map each survivor int64 back to its original (string id, metadata)
-            # via the existing sidecar. A survivor missing from the sidecar (older
-            # shard / lost meta) still keeps its vector; we synthesise a stable id
-            # from the int64 so it is never silently dropped from the union.
+            # via the existing sidecar — for the SIDECAR only. A survivor missing
+            # from the sidecar (older shard / partial-write meta — read_shard_sidecar
+            # degrades to {} on an unreadable sidecar) still keeps its vector; we
+            # synthesise a stable string id from the int64 so it has a sidecar
+            # entry and is never silently dropped from the union.
+            #
+            # CRITICAL (review P1): the rebuilt index must carry each survivor's
+            # ORIGINAL int64 (`sid`) — the exact hash its vector was reconstructed
+            # under — NOT a re-hash of `survivor_ids`. For a present survivor
+            # `_id_to_int64(entry["id"]) == sid` (round-trips), but for a
+            # missing-from-sidecar survivor the synthesised `str(sid)` re-hashes to
+            # `_id_to_int64(str(sid)) != sid`, stamping the vector under a WRONG
+            # int64 — unreachable by its true id (get/delete/upsert all hash the
+            # true id back to `sid`) and un-removable by a future tombstone. So we
+            # CONCATENATE the actual `survivor_int_ids` with the live int64s rather
+            # than re-hashing `union_ids`. (`survivor_int_ids`/`survivor_vectors`/
+            # `survivor_ids` are index-aligned, so the sidecar stays consistent: a
+            # present survivor's entry is keyed by `str(sid)`; a missing one is
+            # keyed by `str(sid)` with fallback metadata.)
             survivor_ids: list[str] = []
             survivor_metas: list[dict] = []
             for sid in survivor_int_ids:
@@ -1381,8 +1397,12 @@ def _build_consolidated_shard(
                 union_vectors = vectors
             else:
                 union_vectors = survivor_vectors
+            # Carry survivors' ORIGINAL int64s through unchanged (see CRITICAL note
+            # above); only the live rows are hashed from their string ids. Order
+            # matches `union_vectors`/`union_ids`/`union_metas` (survivors first).
             union_int_ids = np.array(
-                [_id_to_int64(i) for i in union_ids], dtype=np.int64
+                survivor_int_ids + [_id_to_int64(i) for i in live_ids],
+                dtype=np.int64,
             )
 
             # Rebuild via the from-scratch builder selection (IVFFlat when the
@@ -1398,7 +1418,23 @@ def _build_consolidated_shard(
             else:
                 blob = build_flat(union_vectors, union_int_ids)
                 index_type_str = "flat"
-            sidecar_blob = _build_sidecar(union_ids, union_metas)
+            # Keep index↔sidecar consistent: stamp the sidecar under the SAME
+            # int64s carried into the index (`union_int_ids`), not a re-hash of
+            # `union_ids`. `_build_sidecar`/`_sidecar_dict` key by
+            # `str(_id_to_int64(raw_id))`, which would re-derive the WRONG key for a
+            # missing-from-sidecar survivor (the same bug, on the sidecar side), so
+            # we build the mapping directly from `union_int_ids`.
+            sidecar_blob = json.dumps(
+                {
+                    str(int(int64_id)): {
+                        "id": raw_id,
+                        "metadata": meta if isinstance(meta, dict) else {},
+                    }
+                    for int64_id, raw_id, meta in zip(
+                        union_int_ids.tolist(), union_ids, union_metas
+                    )
+                }
+            ).encode("utf-8")
             total_vectors = int(union_vectors.shape[0])
     else:
         # --- from-scratch fold (no prior shard) ----------------------------
