@@ -330,12 +330,17 @@ query's critical path ("blast-radius isolation"). The bundled compose stack
 ships a `pgvector` service (image `pgvector/pgvector:pg15`, on host port `5433`)
 for exactly this.
 
-It is entirely opt-in, controlled by two env vars:
+It is entirely opt-in, controlled by these env vars:
 
 | Variable | Purpose | Default |
 |---|---|---|
 | `RB_RECALL_DSN` | DSN of the recall pgvector instance. Setting it makes the migrator apply the recall schema and lets services connect. | unset → off |
 | `RB_RECALL` | Master switch for recall-tier behaviour (sync recall write, query union, consolidation). | `false` |
+| `RB_RECALL_MAX_ROWS` | Per-`(tenant, dataset)` recall-row cap. After a recall write, if the partition exceeds this, the builder is asked (via a `CONSOLIDATE` message) to fold the partition into a Consolidated shard — bounding both memory and the union's brute-force recall scan. | `2000` |
+| `RB_RECALL_IDLE_S` | Idle window. A `(tenant, dataset)` whose newest recall write is older than this is consolidated to **zero** recall rows by the builder's idle sweep, so idle datasets stop touching pgvector (scale-to-zero). | `60` |
+
+Both `RB_RECALL_MAX_ROWS` and `RB_RECALL_IDLE_S` only take effect when the recall
+tier is on; with the flag off they are inert.
 
 **Flag-off is byte-identical to today.** With `RB_RECALL_DSN` unset (the default):
 
@@ -378,11 +383,20 @@ only client-visible change; the response body shape is unchanged (`job_id` is
 omitted since there is no async job). See
 [`docs/api/v1.md`](../api/v1.md#post-v1datasetsnamevectors).
 
-> The remaining recall-tier *behaviour* (the query union that merges recall +
-> consolidated, and the recall→consolidated consolidation/compaction) lands in
-> later PRs behind `RB_RECALL`. Until consolidation ships, flag-on writes live in
-> the recall tier only. This is acceptable because the flag defaults off and the
-> full recall tier is not user-complete until those PRs land.
+The query **union** (a query merges recall + consolidated, recall-authoritative)
+and the recall→consolidated **consolidation** (the LSM flush that folds the recall
+tier into the immutable shards and advances the watermark) both ship behind
+`RB_RECALL` too. Consolidation runs in the single-replica `index_builder`,
+triggered by the per-tenant cap (`RB_RECALL_MAX_ROWS`) and by an idle sweep
+(`RB_RECALL_IDLE_S`); it builds the shard, commits the watermark, then trims the
+recall rows grace-bounded — so read-your-writes holds continuously through a
+flush and an idle dataset drains to zero recall rows. The full design (invariants
+I1-I4, the build→commit→trim ordering, cross-DB crash safety) is in
+[`docs/architecture/recall-consolidate.md`](../architecture/recall-consolidate.md).
+
+> The remaining recall-tier *behaviour* (the recall + consolidated union for the
+> per-id get/list/delete surface, and the `mem0` adapter) lands in a later PR
+> behind `RB_RECALL`. This is acceptable because the flag defaults off.
 
 ---
 

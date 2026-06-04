@@ -226,6 +226,51 @@ shard row it resolved back to `run_query` (via an out-dict), and the recall scan
 *that* shard's `consolidated_lsn` — never a watermark resolved by an independent
 `list_shards` lookup — so a stale cached shard version can never open a partition gap.
 
+## Consolidation / flush
+
+The recall→consolidated flush *(implemented in `services.index_builder.run` —
+`run_consolidate_once` / `_run_consolidate_locked` / `_build_consolidated_shard`)* is the
+LSM **compaction** that folds a recall partition into the immutable shards and advances the
+watermark. It runs in the **single-replica `index_builder`**, gated by the existing
+per-dataset advisory lock (serialised against any concurrent build/delete), and is triggered
+by a new `CONSOLIDATE` queue topic. **The order is load-bearing (I2): build → commit catalog
+→ grace-bounded trim. NEVER trim before commit.**
+
+1. **Snapshot** the `(tenant, dataset)` recall partition up to the current `max(lsn) = N`
+   (live rows **and** tombstones) in one transaction from `RB_RECALL_DSN`
+   (`recall_snapshot_for_consolidation`). A write that lands *after* the snapshot (higher LSN)
+   is left in recall — it stays queryable via the union and the next consolidation folds it
+   (this is what makes read-your-writes hold **through** a consolidation).
+2. **Fold** the LIVE rows into a new Consolidated shard via the existing build tail
+   (`_add_to_index` onto the current shard's index, or a fresh build; `_write_shard` + sidecar).
+   **Apply tombstones**: `deleted=true` ids are `_remove_ids`'d from the index and dropped from
+   the sidecar; they are never added.
+3. **Commit** the `shard_catalog` row with `consolidated_lsn = N`, `build_type='consolidate'`;
+   run the supersede sweep (keep newest 2) and evict superseded shards from the query cache.
+4. **Then** (strictly after the commit — I2) **trim** `recall_vectors` idempotently and
+   **grace-bounded (I4)**: `recall_trim` hard-deletes only rows whose `lsn <=` the
+   **2nd-newest** shard's `consolidated_lsn` (NOT the newest just committed) — so an in-flight
+   query that resolved an older shard still finds its recall rows. Re-runnable
+   (`DELETE WHERE lsn <= grace_watermark`); the first consolidation, whose new shard is the
+   only one, trims nothing.
+
+**Triggers** (both `recall_enabled()`-gated, so flag-off enqueues nothing):
+- **Per-tenant cap** `RB_RECALL_MAX_ROWS` (default 2000): after a recall write, if the
+  partition row count exceeds the cap, `POST /vectors` enqueues `CONSOLIDATE` (best-effort,
+  after the durable write — a cap-check failure never fails the committed write). This also
+  bounds the union's brute-force recall scan.
+- **Consolidate-on-idle** `RB_RECALL_IDLE_S` (default 60): a rate-limited sweep on the builder
+  loop's idle tick (`recall_idle_partitions`) enqueues `CONSOLIDATE` for every partition whose
+  newest write (`max(created_at)`) is older than the idle window → drains it to ZERO recall
+  rows → idle queries skip pgvector entirely (scale-to-zero).
+
+**Cross-DB crash safety (no distributed transaction).** Recall rows live in `RB_RECALL_DSN`;
+`consolidated_lsn` lives in the control-plane catalog. Commit-then-trim (I2) + the idempotent
+grace-bounded trim make the two-database seam safe **without** a distributed transaction: a
+crash between commit and trim leaves recall rows with `lsn <= consolidated_lsn` that the union
+**harmlessly excludes** (`lsn > consolidated_lsn` is false) and the next consolidation GCs.
+No loss (the shard has them), no duplicate (the union excludes the recall copy).
+
 ## Invariants
 
 These are named so tests and reviews can reference them.
@@ -259,9 +304,11 @@ These are named so tests and reviews can reference them.
 An always-on pgvector in the recall path would quietly defeat scale-to-zero (idle tenants must
 cost ~0). Mitigations, all **v1 requirements, not nice-to-haves**:
 
-- **Consolidate-on-idle.** A `(tenant, dataset)` with no writes for `RB_RECALL_IDLE_CONSOLIDATE_S`
+- **Consolidate-on-idle.** A `(tenant, dataset)` with no writes for `RB_RECALL_IDLE_S`
   is consolidated to completion → its recall row count → 0 → idle queries skip pgvector entirely
   (pure consolidated path / on-demand shard load). Postgres holds only the **active working set**.
+  *Implemented* as a rate-limited sweep on the `index_builder` loop's idle tick
+  (`adapters.state.state.recall_idle_partitions` → enqueue `CONSOLIDATE`).
 - **Per-tenant recall cap** (`RB_RECALL_MAX_ROWS` per tenant/dataset) → forces a consolidation;
   bounds memory and keeps brute-force fast; stops one tenant evicting another's working set.
 - **Bulk imports bypass recall** (above).
@@ -291,9 +338,8 @@ fixed-dimension schema migration (e.g. a table/partition per embedding dimension
 | Flag | Default | Effect when set |
 |---|---|---|
 | `RB_RECALL` | `false` | Master switch: sync recall write, query union, consolidation worker |
-| `RB_RECALL_MAX_ROWS` | `2000` | Per-(tenant,dataset) recall-row cap that forces a consolidation |
-| `RB_RECALL_IDLE_CONSOLIDATE_S` | `60` | Idle window after which a dataset is consolidated to zero recall rows |
-| `RB_RECALL_CONSOLIDATE_MAX_AGE_S` | `30` | Max age of the oldest recall row before a consolidation is forced |
+| `RB_RECALL_MAX_ROWS` | `2000` | Per-(tenant,dataset) recall-row cap that forces a consolidation (after a recall write, if the partition row count exceeds this, a `CONSOLIDATE` is enqueued — also bounds the union's brute-force recall scan) |
+| `RB_RECALL_IDLE_S` | `60` | Idle window after which a dataset is consolidated to zero recall rows (the builder's idle-tick sweep enqueues `CONSOLIDATE` for any partition whose newest write is older than this → drains to 0 → idle queries skip pgvector entirely) |
 | `RB_RECALL_INDEX` | `bruteforce` | `hnsw` to add a pgvector ANN index (escape hatch — requires a fixed-dimension schema migration first, since the v1 `recall_vectors.embedding` is an unparameterised `vector` for mixed per-dataset dims) |
 | `RB_RECALL_DSN` | separate recall pgvector instance | DSN of the recall tier (data-plane), isolated from the control-plane PG by default. A single-tenant self-hoster MAY point it at the control-plane DSN to accept shared-fate. |
 
@@ -336,8 +382,10 @@ Integration (real PG/MinIO/Redis):
 - **Sequencing (PR plan):** PR1 consolidated get/list/delete-by-id (flag-off correct) → PR2
   migrations + separate pgvector container → PR3 sync recall write + flag → PR4 query
   union/merge *(implemented — `recall_search` + `_merge_recall_and_cold`; see §Read path)* → PR5
-  consolidation/compaction + consolidate-on-idle + caps → PR6 recall + consolidated union for
-  get/list/delete + mem0 adapter + docs. Each flag-gated so `main` stays shippable.
+  consolidation/compaction + consolidate-on-idle + caps *(implemented — `run_consolidate_once` +
+  the `CONSOLIDATE` topic + the cap/idle triggers; see §Consolidation / flush)* → PR6 recall +
+  consolidated union for get/list/delete + mem0 adapter + docs. Each flag-gated so `main` stays
+  shippable.
 
 **Open**
 - (none blocking — ready to split into agents)
