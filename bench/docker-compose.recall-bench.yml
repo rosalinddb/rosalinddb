@@ -168,7 +168,7 @@ services:
   # POOL_MODE=transaction, AUTH_TYPE=scram-sha-256 (postgres:15 stores
   # scram-sha-256 verifiers by default).
   pgbouncer:
-    image: edoburu/pgbouncer:1.23.1-p2
+    image: edoburu/pgbouncer:v1.23.1-p2
     environment:
       DB_HOST: pgvector
       DB_PORT: "5432"
