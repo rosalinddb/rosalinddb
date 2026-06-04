@@ -1348,6 +1348,184 @@ def _metadata_matches_filter(metadata: dict, flt: dict) -> bool:
     return True
 
 
+# --- Recall-tier consolidation (flush) helpers ----------------------------
+#
+# The recall→consolidated flush (PR5): the index builder snapshots a
+# (tenant, dataset) recall partition up to the current max LSN, folds the LIVE
+# rows into a new Consolidated shard, applies tombstones, commits the catalog
+# row with that LSN as the watermark, and THEN trims the consolidated recall
+# rows — grace-bounded and idempotent (I2 + I4). The four read/finder helpers
+# plus the trim below back that operation; they ONLY ever run when the builder
+# reaches the consolidation path, which is gated on `recall_enabled()`, so a
+# flag-off deploy never opens a recall connection through here. See
+# docs/architecture/recall-consolidate.md, "Consolidation / flush".
+
+
+def recall_snapshot_for_consolidation(
+    tenant_id: str, dataset: str
+) -> Tuple[int, List[dict]]:
+    """Snapshot a recall partition for a consolidation: `(max_lsn, rows)`.
+
+    Reads EVERY row for `(tenant, dataset)` — live rows AND tombstones — up to
+    the partition's `max(lsn) = N`, in ONE statement so the bound `N` and the
+    rows it selects come from a SINGLE MVCC snapshot. The bound is derived in a
+    scalar sub-SELECT (`lsn <= (SELECT COALESCE(MAX(lsn),0) FROM recall_vectors
+    WHERE ...)`), so the whole `SELECT` is one statement and the rows are exactly
+    those at or below the max LSN as of that statement's snapshot — self-
+    consistent independent of writer internals (no inter-statement gap, no
+    reliance on the recall-write seq-lock / commit-order==LSN-order coupling).
+    A concurrent write that commits during the snapshot has a higher LSN than the
+    max captured by the sub-SELECT, so it is excluded by the `lsn <=` bound and
+    left in recall — not partly-included and not lost.
+
+    The watermark `N` is then derived from the max LSN of the RETURNED rows (`0`
+    if empty), so it matches the row set exactly and the caller commits the
+    catalog row with `consolidated_lsn = N`. The builder folds the live rows into
+    the new shard, applies the tombstones (`deleted=true` ids are removed and
+    never added), and stamps that watermark.
+
+    Returns:
+      - `max_lsn` — the highest LSN among the returned rows, the watermark the
+        consolidation will stamp (`0` when the partition is empty — nothing to
+        consolidate).
+      - `rows` — `[{"id", "values", "metadata", "lsn", "deleted"}, ...]` for
+        every row with `lsn <= max_lsn`, ascending by LSN. `values` is the
+        parsed float list (pgvector's text `vector` literal → `list[float]`);
+        `metadata` is the JSONB dict (coalesced to `{}`).
+
+    A write that lands AFTER the snapshot (a higher LSN) is left in recall
+    untouched: it is simply not in this consolidation's set, stays queryable via
+    the union (`lsn > consolidated_lsn`), and the next consolidation folds it.
+    This is what makes read-your-writes hold THROUGH a consolidation (I1 + I2).
+    """
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+        # ONE statement: derive the bound N inside the same query via a scalar
+        # sub-SELECT, so N and the selected rows share a single MVCC snapshot. A
+        # concurrent write (higher LSN) is excluded by the `lsn <=` bound, so the
+        # snapshot is internally consistent without depending on transaction
+        # isolation level or on the recall writer's seq-lock allocation order.
+        cur.execute(
+            """
+SELECT id, embedding, metadata, lsn, deleted
+FROM recall_vectors
+WHERE tenant_id = %s AND dataset = %s
+  AND lsn <= (
+    SELECT COALESCE(MAX(lsn), 0) FROM recall_vectors
+    WHERE tenant_id = %s AND dataset = %s
+  )
+ORDER BY lsn ASC
+            """,
+            (tenant_id, dataset, tenant_id, dataset),
+        )
+        rows: List[dict] = []
+        for rid, embedding, metadata, lsn, deleted in cur.fetchall():
+            rows.append(
+                {
+                    "id": rid,
+                    "values": _pgvector_literal_to_list(embedding),
+                    "metadata": metadata or {},
+                    "lsn": int(lsn),
+                    "deleted": bool(deleted),
+                }
+            )
+    # Derive the watermark from the returned rows so it matches the set exactly
+    # (the rows are ascending by LSN). Empty partition -> 0, nothing to do.
+    max_lsn = rows[-1]["lsn"] if rows else 0
+    return max_lsn, rows
+
+
+def _pgvector_literal_to_list(literal) -> List[float]:
+    """Parse pgvector's text `vector` literal (`[1,2,3]`) to a float list.
+
+    psycopg2 reads an unparameterised pgvector `vector` column back as its text
+    representation (a bracketed, comma-separated string) since no typecaster is
+    registered. Invert `_to_pgvector_literal`. A `list`/`tuple` (already parsed
+    by a future typecaster) is passed through; an empty/blank literal yields
+    `[]`.
+    """
+    if isinstance(literal, (list, tuple)):
+        return [float(v) for v in literal]
+    s = str(literal).strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1]
+    s = s.strip()
+    if not s:
+        return []
+    return [float(part) for part in s.split(",")]
+
+
+def recall_partition_count(tenant_id: str, dataset: str) -> int:
+    """Return the number of recall rows for `(tenant, dataset)` (live + tombstones).
+
+    Backs the per-tenant cap (`RB_RECALL_MAX_ROWS`): the write path calls this
+    after a recall UPSERT and enqueues `CONSOLIDATE` when the count exceeds the
+    cap. Counts every row in the partition (a tombstone still occupies a row and
+    still costs the brute-force scan), so the cap genuinely bounds the recall
+    set the union scans.
+    """
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM recall_vectors "
+            "WHERE tenant_id = %s AND dataset = %s",
+            (tenant_id, dataset),
+        )
+        return int(cur.fetchone()[0] or 0)
+
+
+def recall_trim(tenant_id: str, dataset: str, grace_watermark: int) -> int:
+    """Hard-delete consolidated recall rows up to `grace_watermark`; return the count.
+
+    The FINAL step of a consolidation, run STRICTLY AFTER the catalog commit
+    (I2): `DELETE FROM recall_vectors WHERE lsn <= grace_watermark`. Idempotent
+    and re-runnable — a crash between commit and trim leaves rows that the union
+    harmlessly excludes (`lsn > consolidated_lsn`) and the next consolidation's
+    trim GCs (cross-DB crash safety).
+
+    `grace_watermark` is the GRACE-BOUNDED watermark (I4): the caller passes the
+    `consolidated_lsn` of the shard that is now the **2nd-newest** (NOT the
+    newest just committed), so an in-flight query that resolved an older shard
+    still finds its recall rows. `grace_watermark <= 0` is a no-op (nothing has
+    aged into the grace window yet — e.g. the very first consolidation, whose
+    new shard is the only one).
+    """
+    if grace_watermark <= 0:
+        return 0
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM recall_vectors "
+            "WHERE tenant_id = %s AND dataset = %s AND lsn <= %s",
+            (tenant_id, dataset, grace_watermark),
+        )
+        return cur.rowcount
+
+
+def recall_idle_partitions(idle_seconds: float) -> List[Tuple[str, str]]:
+    """Return `(tenant_id, dataset)` partitions whose newest recall write is idle.
+
+    Backs consolidate-on-idle (`RB_RECALL_IDLE_S`): the builder's idle-tick
+    sweep calls this, then enqueues `CONSOLIDATE` for each returned partition so
+    it drains to ZERO recall rows → idle queries skip pgvector entirely
+    (scale-to-zero preserved). "Idle" = the partition's most recent write
+    (`max(created_at)`) is older than `idle_seconds` ago AND the partition still
+    has rows to drain. Returns an empty list when nothing is idle.
+
+    Grouped per `(tenant, dataset)` so a single SQL round-trip finds every idle
+    partition across the whole recall instance in one pass.
+    """
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=idle_seconds)
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+        cur.execute(
+            """
+SELECT tenant_id, dataset
+FROM recall_vectors
+GROUP BY tenant_id, dataset
+HAVING MAX(created_at) <= %s
+            """,
+            (cutoff,),
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+
 # --- Per-dataset build advisory lock (multi-worker safety) ----------------
 
 
@@ -2466,21 +2644,40 @@ def add_shard(
     index_type: str,
     build_type: str = "full",
     indexed_landing_uris: Optional[List[str]] = None,
+    consolidated_lsn: int = 0,
 ) -> int:
     """Insert a new shard record and return its ID.
 
     Two columns support incremental indexing:
       - `build_type`: `'full'` (trained-from-scratch), `'incremental'`
-        (existing index loaded, only new vectors `index.add()`-ed), or
+        (existing index loaded, only new vectors `index.add()`-ed),
         `'delete'` (existing index loaded, one vector removed by id — a
         delete-driven rebuild, labelled distinctly so deletes are not
-        miscounted as ingests in `build_type`-keyed metrics).
+        miscounted as ingests in `build_type`-keyed metrics), or
+        `'consolidate'` (recall→consolidated flush: the recall partition up to
+        `consolidated_lsn` is folded into a new shard — see
+        docs/architecture/recall-consolidate.md, "Consolidation / flush").
       - `indexed_landing_uris`: the manifest of landing parquet part URIs
         already folded into this shard. The index builder reads the *newest*
         shard's manifest to decide which landing parts are new, so a
         subsequent ingest never re-reads previously indexed uploads.
+
+    `consolidated_lsn` (migration 008) is the recall-tier watermark: the highest
+    recall LSN folded into any shard of this dataset so far (a per-dataset high-
+    water mark). It partitions every vector into exactly one tier —
+    `lsn <= consolidated_lsn` lives in the cold shard, `lsn >` lives in recall
+    (I1). A consolidation advances it to the snapshot's `max(lsn)`; every other
+    build (ingest/incremental/delete) carries the prior newest shard's value
+    forward so the watermark stays monotonic — a non-consolidate fold only
+    touches recall-owned rows (`lsn > watermark`) and must NOT regress it (a
+    regression stalls the grace-trim and re-unions already-consolidated rows).
+    The default `0` is correct only for a dataset's very first shard (no
+    consolidated predecessor) and, with the flag off, for every shard. The value
+    is set here at every build commit, never per recall write (the seam lives
+    across two databases — I2's commit-then-trim keeps it safe).
     """
     uris = list(indexed_landing_uris or [])
+    consolidated_lsn = int(consolidated_lsn or 0)
     # The payload format is shared across the memory hook and the `pg_notify`
     # channel so the DP's catalog-cache invalidator can use one parser. Keep
     # keys minimal — `pg_notify`'s payload is capped at 8000 bytes by
@@ -2505,6 +2702,7 @@ def add_shard(
             "index_type": index_type,
             "build_type": build_type,
             "indexed_landing_uris": uris,
+            "consolidated_lsn": consolidated_lsn,
             "sealed": True,
             "supersedes": [],
             "created_at": time.time(),
@@ -2520,12 +2718,12 @@ def add_shard(
             """
 INSERT INTO shard_catalog(
   tenant_id, dataset_name, shard_uri, checksum, vector_count, index_type,
-  build_type, indexed_landing_uris)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+  build_type, indexed_landing_uris, consolidated_lsn)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
             """,
             (
                 tenant_id, dataset_name, shard_uri, checksum, vector_count,
-                index_type, build_type, uris,
+                index_type, build_type, uris, consolidated_lsn,
             ),
         )
         shard_id = cur.fetchone()[0]
@@ -2552,7 +2750,18 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
 
 
 def list_shards(tenant_id: str, dataset_name: str) -> List[dict]:
-    """Return shards for a `(tenant_id, dataset_name)` sorted newest-first."""
+    """Return shards for a `(tenant_id, dataset_name)` sorted newest-first.
+
+    The ordering must be a TOTAL order: `_grace_watermark` selects `shards[1]`
+    (the 2nd-newest) and `get_latest_shard` selects `shards[0]`, so a tie would
+    make those selections nondeterministic and could mis-bound the grace-trim.
+    Memory mode orders by the monotonic insertion `id` (already total). The
+    Postgres path orders by `created_at DESC` but `created_at` is
+    `TIMESTAMPTZ DEFAULT now()` (transaction-start time), so two shards built in
+    the same transaction window could share it; the `id DESC` tiebreaker (the
+    serial PK, strictly increasing) makes the order provably total and matches
+    memory mode's `id`-desc semantics.
+    """
     if _MEMORY_MODE:
         return [
             dict(r)
@@ -2564,7 +2773,7 @@ def list_shards(tenant_id: str, dataset_name: str) -> List[dict]:
             """
 SELECT * FROM shard_catalog
 WHERE tenant_id=%s AND dataset_name=%s
-ORDER BY created_at DESC
+ORDER BY created_at DESC, id DESC
             """,
             (tenant_id, dataset_name),
         )
