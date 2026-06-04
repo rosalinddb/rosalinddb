@@ -37,7 +37,15 @@ def state(monkeypatch):
 
 
 class _FakeCur:
-    """Records executed SQL/params; returns a scripted row set / fetchone."""
+    """Records executed SQL/params; returns a scripted row set / fetchone.
+
+    `recall_search` / `recall_list_rows` now issue TWO scans each — a
+    `NOT deleted` LIVE/MATCH scan and a separate full SUPPRESS scan — so the fake
+    projects the scripted partition rows to the columns the CURRENT statement
+    selects: the SUPPRESS scan (`SELECT id ...`) yields `(id,)` for EVERY row, the
+    LIVE list scan (`SELECT id, metadata ...`) yields `(id, metadata)` for
+    not-deleted rows only. Each scripted row is `(id, metadata, deleted)`.
+    """
 
     def __init__(self, rows=None, seq_start=0):
         self.calls: list[tuple] = []
@@ -64,6 +72,14 @@ class _FakeCur:
         return self._rows[0] if self._rows else None
 
     def fetchall(self):
+        sql = self._last_sql
+        # SUPPRESS scan: `SELECT id FROM recall_vectors WHERE ...` — every id.
+        if "SELECT id\nFROM recall_vectors" in sql:
+            return [(rid,) for rid, _meta, _del in self._rows]
+        # LIVE list scan: `SELECT id, metadata ... AND NOT deleted ...` — not-deleted.
+        if "SELECT id, metadata" in sql and "NOT deleted" in sql:
+            return [(rid, meta) for rid, meta, deleted in self._rows if not deleted]
+        # Fallback: the raw scripted rows (point-lookup style helpers).
         return list(self._rows)
 
 
@@ -206,10 +222,11 @@ def test_delete_never_flips_in_place(state, monkeypatch):
 def test_delete_placeholder_embedding_matches_dimension(state, monkeypatch):
     """A cold-only delete's tombstone gets a zero placeholder of the dataset dim.
 
-    The recall SEARCH scan computes `embedding <-> q` over EVERY row above the
-    watermark (tombstones included) before filtering deleted in Python, so the
-    placeholder MUST match the partition dimension or the next query raises a
-    pgvector dimension-mismatch.
+    `recall_search` now excludes tombstones from its MATCH scan in SQL, so the
+    placeholder is never ranked against a query vector — its dimension is a
+    belt-and-suspenders match for the `NOT NULL vector` column rather than a
+    search-ranking correctness dependency. The helper still writes a zero-vector
+    of the dataset dimension.
     """
     cur = _wire(state, monkeypatch, seq_start=0)
     state.recall_delete_vector("t", "ds", "x", dimension=4)
