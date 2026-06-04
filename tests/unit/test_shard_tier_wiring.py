@@ -311,6 +311,67 @@ def test_classifier_maps_filenotfound_to_storage_unavailable(v1q_tier_on):
     assert code == "storage_unavailable"
 
 
+# --- recall-down graceful degrade (benchmark finding C2, #19) -------------
+
+
+def test_classifier_maps_recall_unavailable_to_503_distinct_code(v1q_tier_on):
+    """`RecallUnavailable` -> `recall_unavailable`, NOT the generic 500 bucket.
+
+    Benchmark C2: when the recall pgvector instance is down, the recall search
+    path raised an unclassified psycopg2 error that fell through to
+    `ephemeral_error` (HTTP 500). The typed `RecallUnavailable` wrapper now
+    classifies to a distinct, retryable 503 code — separate from both the
+    generic `ephemeral_error` 500 and the write-side `recall_write_failed`.
+    """
+    from adapters.state.state import RecallUnavailable
+
+    code, msg = v1q_tier_on._classify_hot_path_error(
+        RecallUnavailable("recall store unreachable: OperationalError")
+    )
+    assert code == "recall_unavailable", (
+        f"expected recall_unavailable for RecallUnavailable; got {code}"
+    )
+    assert code != "ephemeral_error"
+    assert code != "recall_write_failed"
+    # `safe_message` must not leak the underlying psycopg2 detail / DSN.
+    assert "OperationalError" not in msg
+
+
+def test_classifier_recall_unavailable_status_is_503_not_500(v1q_tier_on):
+    """The wire-status mapping in `run_query` turns the code into 503, not 500.
+
+    `run_query` maps `ephemeral_error` -> 500 and EVERYTHING else -> 503. Pin
+    that `recall_unavailable` lands on the 503 side of that branch, so a recall
+    outage is an honest retryable signal, not an opaque server error.
+    """
+    code, _ = v1q_tier_on._classify_hot_path_error(
+        v1q_tier_on.RecallUnavailable("down")
+    )
+    status = 500 if code == "ephemeral_error" else 503
+    assert status == 503
+
+
+def test_classifier_does_not_misclassify_plain_operationalerror(v1q_tier_on):
+    """A bare `psycopg2.OperationalError` (e.g. from the cold/control path) is
+    NOT classified as `recall_unavailable`.
+
+    Scoping is by TYPE (`RecallUnavailable`), not by `isinstance(exc,
+    OperationalError)` — the same psycopg2 type is raised by the control-plane /
+    cold path, so a blanket rule would misattribute a control-plane outage to the
+    recall tier. An UNWRAPPED OperationalError must stay in the generic bucket.
+    """
+    import psycopg2
+
+    code, _ = v1q_tier_on._classify_hot_path_error(
+        psycopg2.OperationalError("control-plane connection refused")
+    )
+    assert code != "recall_unavailable", (
+        "an unwrapped OperationalError (cold/control path) must NOT be "
+        "classified as recall_unavailable"
+    )
+    assert code == "ephemeral_error"
+
+
 # --- ephemeral_runner mirror tests ---------------------------------------
 
 
@@ -365,3 +426,31 @@ def test_eph_classifier_maps_shard_tier_timeout_to_503(eph_tier_on):
     exc = shard_tier.ShardTierTimeout("timed out after 300s")
     code, _msg = eph_tier_on._classify_error(exc)
     assert code == "storage_unavailable"
+
+
+def test_eph_classifier_maps_recall_unavailable_to_503(eph_tier_on):
+    """Symmetry: the ephemeral `_classify_error` maps `RecallUnavailable`
+    to the same `recall_unavailable` code as the hot-path classifier.
+
+    The runner does not call `recall_search` today, but the two classification
+    tables are an explicit "keep in sync" contract — this pins that the recall
+    branch exists and matches `_classify_hot_path_error`.
+    """
+    from adapters.state.state import RecallUnavailable
+
+    code, msg = eph_tier_on._classify_error(RecallUnavailable("down"))
+    assert code == "recall_unavailable"
+    assert "OperationalError" not in msg
+
+
+def test_eph_and_hot_classifiers_agree_on_recall_unavailable(
+    eph_tier_on, v1q_tier_on
+):
+    """The hot-path and ephemeral classifiers return the SAME (code, message)
+    for `RecallUnavailable` — the duplicated tables must not drift."""
+    from adapters.state.state import RecallUnavailable
+
+    exc = RecallUnavailable("recall store unreachable: InterfaceError")
+    assert eph_tier_on._classify_error(exc) == v1q_tier_on._classify_hot_path_error(
+        exc
+    )

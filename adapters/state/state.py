@@ -1013,6 +1013,43 @@ CREATE TABLE IF NOT EXISTS recall_schema_migrations (
 # (including recall-delete tombstoning) live in their own sections below.
 
 
+class RecallUnavailable(RuntimeError):
+    """The recall (pgvector) tier could not be reached for this operation.
+
+    A TYPED boundary error raised by the recall READ path (`recall_search`)
+    when the recall store is unreachable — a connection drop / refused socket /
+    TLS reset (`psycopg2.OperationalError`/`InterfaceError`) or a SUSTAINED
+    recall-pool exhaustion (`PoolCheckoutTimeout`). It wraps the underlying
+    cause as `__cause__` so logs keep the full detail, but the customer-facing
+    classifier surfaces only the typed name.
+
+    Why a typed wrapper rather than classifying `psycopg2.OperationalError`
+    directly: the SAME psycopg2 exception type is raised by the control-plane /
+    cold path (catalog reads, quota), and a blanket "OperationalError ->
+    recall_unavailable" rule would misattribute a control-plane outage to the
+    recall tier. Raising this type ONLY at the recall boundary lets the query
+    path classify it precisely as a retryable 503 `recall_unavailable` (a
+    transient recall outage the client should retry), distinct from both the
+    generic `ephemeral_error` 500 and the write-side `recall_write_failed`.
+    The query path must NOT silently fall back to consolidated-only results: a
+    recall outage means recent (unconsolidated) writes are unreadable, so a
+    silent cold-only answer would drop read-your-writes without signal. A 503
+    tells the client to retry; a silent degrade lies.
+
+    Lives here (next to `recall_enabled`/`recall_search` and `PoolCheckoutTimeout`)
+    so both the recall adapter that RAISES it and the query path that CLASSIFIES
+    it import it from one place — the same module both already depend on.
+    """
+
+
+# psycopg2 connectivity error types that mean "the recall store is unreachable"
+# (as opposed to a query/constraint error against a healthy backend). Both are
+# subclasses of `psycopg2.Error`, NOT of `OSError`, so the hot-path classifier's
+# `OSError` branch never caught them — that is exactly why an un-wrapped one used
+# to fall through to the generic `ephemeral_error` 500 (benchmark finding C2).
+_RECALL_CONNECTIVITY_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+
 def recall_enabled() -> bool:
     """Whether the synchronous recall-tier write path is active.
 
@@ -1459,38 +1496,57 @@ def recall_search(
     #       such id is dropped whether the recall row is a tombstone, fails the
     #       filter, or ranks past `top_k`. Built WITHOUT the filter and WITHOUT a
     #       top_k cap on purpose.
-    with recall_pooled_conn() as conn, conn.cursor() as cur:
-        # (a) MATCH scan: LIVE rows only, ordered by the FAISS-aligned squared L2
-        # distance. `power(embedding <-> %s, 2)` squares pgvector's plain-L2 `<->`
-        # so the score matches FAISS L2². The query vector is bound TWICE — once
-        # for the score expression, once for the ORDER BY — so the same literal
-        # drives both. `AND NOT deleted` keeps tombstones out of the ranking
-        # entirely. No SQL `LIMIT`: the live-row `top_k` truncation still happens
-        # in Python (a future LIMIT here would now be SAFE, since tombstones are
-        # already excluded), and the recall set is small by construction (bounded
-        # by consolidation cadence, not data size — §Recall search).
-        cur.execute(
-            """
+    #
+    # Recall-connectivity boundary (benchmark finding C2). The recall store is a
+    # SEPARATE data-plane instance; if it is down, the pool checkout (opening a
+    # new backend) or the `cur.execute()` raises a `psycopg2.OperationalError`/
+    # `InterfaceError`, and a sustained recall-pool exhaustion raises
+    # `PoolCheckoutTimeout`. None of those are `OSError`s, so the hot-path
+    # classifier used to bucket them as the generic `ephemeral_error` 500. Wrap
+    # them HERE — at the recall boundary, where we KNOW the failure is the recall
+    # tier — in a typed `RecallUnavailable`, so the query path can map it to a
+    # retryable 503 `recall_unavailable` WITHOUT misclassifying an identical
+    # exception raised by the control-plane/cold path. The original is preserved
+    # as `__cause__` for logs; a SQL/constraint error against a HEALTHY backend
+    # (anything outside the connectivity set) is NOT wrapped and bubbles up
+    # unchanged — only "the recall store is unreachable" becomes RecallUnavailable.
+    try:
+        with recall_pooled_conn() as conn, conn.cursor() as cur:
+            # (a) MATCH scan: LIVE rows only, ordered by the FAISS-aligned squared
+            # L2 distance. `power(embedding <-> %s, 2)` squares pgvector's plain-L2
+            # `<->` so the score matches FAISS L2². The query vector is bound TWICE
+            # — once for the score expression, once for the ORDER BY — so the same
+            # literal drives both. `AND NOT deleted` keeps tombstones out of the
+            # ranking entirely. No SQL `LIMIT`: the live-row `top_k` truncation
+            # still happens in Python (a future LIMIT here would now be SAFE, since
+            # tombstones are already excluded), and the recall set is small by
+            # construction (bounded by consolidation cadence, not data size).
+            cur.execute(
+                """
 SELECT id,
        power(embedding <-> %s, 2) AS score,
        metadata
 FROM recall_vectors
 WHERE tenant_id = %s AND dataset = %s AND NOT deleted AND lsn > %s
 ORDER BY embedding <-> %s ASC
-            """,
-            (qlit, tenant_id, dataset, watermark, qlit),
-        )
-        match_rows = cur.fetchall()
-        # (b) SUPPRESS scan: EVERY id above the watermark (live AND tombstoned).
-        cur.execute(
-            """
+                """,
+                (qlit, tenant_id, dataset, watermark, qlit),
+            )
+            match_rows = cur.fetchall()
+            # (b) SUPPRESS scan: EVERY id above the watermark (live AND tombstoned).
+            cur.execute(
+                """
 SELECT id
 FROM recall_vectors
 WHERE tenant_id = %s AND dataset = %s AND lsn > %s
-            """,
-            (tenant_id, dataset, watermark),
-        )
-        suppress_rows = cur.fetchall()
+                """,
+                (tenant_id, dataset, watermark),
+            )
+            suppress_rows = cur.fetchall()
+    except (PoolCheckoutTimeout, *_RECALL_CONNECTIVITY_ERRORS) as exc:
+        raise RecallUnavailable(
+            f"recall store unreachable: {type(exc).__name__}"
+        ) from exc
 
     flt = flt or {}
     # `suppress_ids`: EVERY id above the watermark. Recall is authoritative for

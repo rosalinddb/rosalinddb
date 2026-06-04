@@ -49,6 +49,7 @@ from adapters.observability.tracing import (
 from adapters.queue.queue import consume, publish, ack, nack
 from adapters.queue.shutdown import should_stop
 from adapters.state.state import (
+    RecallUnavailable,
     get_dataset,
     list_shards,
     recall_enabled,
@@ -1296,6 +1297,21 @@ def _classify_hot_path_error(exc: BaseException) -> Tuple[str, str]:
     never surfaced — a botocore `ClientError` carries an endpoint URL and
     sometimes signed-URL params that must not leak to the customer.
     """
+    if isinstance(exc, RecallUnavailable):
+        # The recall (pgvector) tier is unreachable for this query — a typed
+        # boundary error raised ONLY by the recall search path (`recall_search`
+        # wraps a recall-store connection failure / sustained recall-pool
+        # exhaustion in `RecallUnavailable`). Distinct, retryable 503: NOT the
+        # generic `ephemeral_error` 500 (benchmark finding C2: an unclassified
+        # psycopg2 OperationalError from the recall path used to hard-500), NOT
+        # the write-side `recall_write_failed`. The query path must NOT silently
+        # serve consolidated-only results — a recall outage means recent,
+        # unconsolidated writes are unreadable, so a silent cold-only 200 would
+        # break read-your-writes without signal. A 503 tells the client to retry.
+        # Scoped by TYPE, not by `isinstance(exc, OperationalError)`, so an
+        # identical psycopg2 error from the control-plane/cold path is NOT
+        # misclassified as recall_unavailable.
+        return "recall_unavailable", "Recall tier is temporarily unavailable"
     if isinstance(exc, PermissionError):
         return "cache_unavailable", "Shard cache is unreadable or unwritable"
     if isinstance(exc, shard_tier.CacheCapacityExceeded):

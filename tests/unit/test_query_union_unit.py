@@ -30,6 +30,7 @@ Headline properties proven here:
 """
 from __future__ import annotations
 
+import contextlib
 import importlib
 
 import numpy as np
@@ -389,6 +390,116 @@ def test_run_query_union_recall_failure_maps_to_503(union_on, monkeypatch):
     assert out.status_code == 503
 
 
+def _envelope_code(resp):
+    """Pull the v1 error `code` out of a `JSONResponse` body for assertions."""
+    import json
+
+    return json.loads(bytes(resp.body))["error"]["code"]
+
+
+def test_run_query_union_recall_unavailable_maps_to_503_recall_unavailable(
+    union_on, monkeypatch
+):
+    """C2 (#19): a recall-tier connectivity failure -> 503 `recall_unavailable`.
+
+    The recall search raises the typed `RecallUnavailable` (which `recall_search`
+    produces from a psycopg2 OperationalError / sustained pool exhaustion when the
+    recall pgvector instance is down). The query path must classify it as a
+    DISTINCT, retryable 503 `recall_unavailable` — NOT the opaque
+    `ephemeral_error` 500 it used to hard-500 as, and NOT a silent
+    consolidated-only 200 (which would drop recent unconsolidated writes without
+    signal, breaking read-your-writes).
+    """
+    from fastapi.responses import JSONResponse
+
+    # Use v1_query's OWN reference to the class — that is exactly what its
+    # classifier compares against with `isinstance`. (A sibling test that
+    # `importlib.reload`s `adapters.state.state` would otherwise rebind the class
+    # object and break identity; in production both come from the one loaded
+    # module, so they are the same object.)
+    RecallUnavailable = v1q.RecallUnavailable
+
+    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        # A healthy cold shard WITH a stale match for X — if the code silently
+        # degraded to cold-only, this would leak as a 200 instead of a 503.
+        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+        return ([{"id": "stale", "score": 0.1, "metadata": {}}], "cold")
+
+    def _recall_down(*a, **k):
+        raise RecallUnavailable("recall store unreachable: OperationalError")
+
+    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
+    monkeypatch.setattr(v1q, "recall_search", _recall_down)
+
+    out = v1q.run_query("t1", _parsed())
+    assert isinstance(out, JSONResponse), (
+        "recall down must NOT silently degrade to a consolidated-only 200"
+    )
+    assert out.status_code == 503
+    assert _envelope_code(out) == "recall_unavailable"
+
+
+def test_run_query_recall_down_does_not_silently_serve_cold(union_on, monkeypatch):
+    """No silent degrade: a recall outage never returns the stale cold matches.
+
+    The cold path resolves a shard and returns a match; recall is down. The
+    response must be the 503 error envelope, never a `{matches: [...]}` body
+    carrying the stale cold copy — the whole point of the recall tier is
+    read-your-writes, and a silent cold-only answer would lie about it.
+    """
+    from fastapi.responses import JSONResponse
+
+    RecallUnavailable = v1q.RecallUnavailable
+
+    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+        return ([{"id": "stale-cold", "score": 0.01, "metadata": {}}], "hot")
+
+    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
+    monkeypatch.setattr(
+        v1q, "recall_search",
+        lambda *a, **k: (_ for _ in ()).throw(RecallUnavailable("down")),
+    )
+
+    out = v1q.run_query("t1", _parsed())
+    assert isinstance(out, JSONResponse)
+    assert out.status_code == 503
+    # No `matches` body — the stale cold copy never reaches the client.
+    assert b"stale-cold" not in bytes(out.body)
+
+
+def test_run_query_non_recall_operationalerror_is_not_recall_unavailable(
+    union_on, monkeypatch
+):
+    """A non-recall OperationalError (e.g. cold/control path) is NOT misclassified.
+
+    The cold search itself raises a bare `psycopg2.OperationalError` (a
+    control-plane / catalog failure, NOT the recall tier). Because the recall
+    wrapper is typed and only raised at the recall boundary, this unwrapped error
+    must NOT be classified as `recall_unavailable` — it falls to the generic
+    `ephemeral_error` 500, the pre-existing behaviour for an unexpected error on
+    the cold path.
+    """
+    import psycopg2
+    from fastapi.responses import JSONResponse
+
+    def _cold_down(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        raise psycopg2.OperationalError("control-plane catalog unreachable")
+
+    monkeypatch.setattr(v1q, "_hot_search", _cold_down)
+    # recall_search must never be reached — the cold search failed first.
+    monkeypatch.setattr(
+        v1q, "recall_search",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreached")),
+    )
+
+    out = v1q.run_query("t1", _parsed())
+    assert isinstance(out, JSONResponse)
+    assert _envelope_code(out) != "recall_unavailable"
+    assert out.status_code == 500
+    assert _envelope_code(out) == "ephemeral_error"
+
+
 # --- flag OFF: byte-identical, no recall connection -----------------------
 
 
@@ -648,3 +759,108 @@ def test_recall_search_returns_match_and_suppresses_past_top_k_and_tombstones(mo
     suppress_ids, matches = state_mod.recall_search("t", "d", [0.0], top_k=2, watermark=0)
     assert [r["id"] for r in matches] == ["live1", "live2"], matches
     assert suppress_ids == {"live1", "live2", "live3", "tomb"}, suppress_ids
+
+
+# --- recall_search connectivity boundary: typed RecallUnavailable (C2, #19) -
+
+
+class _RaisingRecallCursor:
+    """A recall cursor whose `execute` raises a scripted exception.
+
+    Stands in for "the recall store is down": the brute-force scan's
+    `cur.execute()` raises a psycopg2 connectivity error against a dropped
+    backend. The fake is a context manager (the real cursor is used as one).
+    """
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        raise self._exc
+
+    def fetchall(self):  # pragma: no cover - never reached, execute() raises first
+        return []
+
+
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: __import__("psycopg2").OperationalError("server closed the connection"),
+        lambda: __import__("psycopg2").InterfaceError("connection already closed"),
+    ],
+)
+def test_recall_search_wraps_connectivity_error_in_recall_unavailable(
+    monkeypatch, exc_factory
+):
+    """A recall-store connectivity error -> typed `RecallUnavailable`.
+
+    `recall_search` is the recall boundary: a psycopg2 OperationalError /
+    InterfaceError from the scan (the recall pgvector instance is down) is wrapped
+    in `RecallUnavailable`, with the original preserved as `__cause__`. This is the
+    typed signal the query path classifies as a 503 `recall_unavailable` — instead
+    of the bare psycopg2 error bubbling up unclassified to an `ephemeral_error`
+    500 (benchmark finding C2).
+    """
+    import adapters.state.state as state_mod
+
+    underlying = exc_factory()
+    cur = _RaisingRecallCursor(underlying)
+    _wire_recall(state_mod, monkeypatch, cur)
+
+    with pytest.raises(state_mod.RecallUnavailable) as ei:
+        state_mod.recall_search("t", "d", [0.0], top_k=3, watermark=0)
+    # The original psycopg2 error is preserved for logs, never swallowed.
+    assert ei.value.__cause__ is underlying
+
+
+def test_recall_search_wraps_pool_checkout_timeout_in_recall_unavailable(
+    monkeypatch,
+):
+    """A SUSTAINED recall-pool exhaustion -> typed `RecallUnavailable`.
+
+    When the recall pool stays exhausted past the checkout deadline,
+    `recall_pooled_conn()` raises `PoolCheckoutTimeout`. That is still "the recall
+    tier could not serve this query", so `recall_search` wraps it in
+    `RecallUnavailable` -> 503 `recall_unavailable`, not a 500.
+    """
+    import adapters.state.state as state_mod
+
+    boom = state_mod.PoolCheckoutTimeout("recall pool exhausted")
+
+    @contextlib.contextmanager
+    def _raise_on_enter(*a, **k):
+        raise boom
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(state_mod, "recall_pooled_conn", _raise_on_enter)
+
+    with pytest.raises(state_mod.RecallUnavailable) as ei:
+        state_mod.recall_search("t", "d", [0.0], top_k=3, watermark=0)
+    assert ei.value.__cause__ is boom
+
+
+def test_recall_search_does_not_wrap_non_connectivity_error(monkeypatch):
+    """A SQL/programming error against a HEALTHY backend is NOT wrapped.
+
+    Only "the recall store is unreachable" becomes `RecallUnavailable`. A
+    `psycopg2.ProgrammingError` (e.g. a query bug against a live backend) is a
+    real server bug, not a transient outage — it must bubble up unchanged so it
+    classifies as the generic `ephemeral_error` 500, never a misleading retryable
+    503.
+    """
+    import psycopg2
+
+    import adapters.state.state as state_mod
+
+    underlying = psycopg2.ProgrammingError("syntax error at or near ...")
+    cur = _RaisingRecallCursor(underlying)
+    _wire_recall(state_mod, monkeypatch, cur)
+
+    with pytest.raises(psycopg2.ProgrammingError):
+        state_mod.recall_search("t", "d", [0.0], top_k=3, watermark=0)
