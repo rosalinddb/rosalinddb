@@ -186,10 +186,41 @@ hatch (`RB_RECALL_INDEX=hnsw`, default off), expected never to be needed.
 **Metric alignment (correctness-critical):** the consolidated tier returns FAISS **L2-squared**;
 pgvector `<->` returns plain L2. Square pgvector's distance before merging, over **identical
 un-normalised** vectors, or the union ranks wrong. This is the most likely silent bug — it
-gets a dedicated test.
+gets a dedicated test. *Implemented* as `power(embedding <-> q, 2)` in the recall scan
+(`adapters.state.state.recall_search`), so the recall `score` is L2² and merges directly with
+the cold shard's FAISS L2² distances.
 
 **Dedup:** a re-upserted id can be in both tiers during the consolidation grace window;
 **recall wins** (its version is newer). Recall tombstones suppress matching consolidated ids.
+The merge (`services.query_api.v1_query._merge_recall_and_cold`) keys on `id`: a recall **live**
+row replaces the cold match for that id; a recall **tombstone** drops the cold match and
+contributes nothing; the survivors are sorted ascending by L2² and truncated to `top_k`.
+
+**No consolidated shard + recall has data → synchronous recall answer.** When the dataset has
+no shard yet (`get_latest_shard` → none) the watermark is `0`, so every recall row qualifies and
+the query is answered **synchronously from recall** — it does **not** fall through to the
+`ephemeral` empty+`job_id` path (that path is reserved for "nothing can answer": no shard AND no
+recall row). This is the read-your-writes property for a brand-new dataset.
+
+**`mode` semantics under the union.** The response `mode` always reflects the **cold-shard cache
+state**, never the recall contribution:
+
+| Cold shard | Recall contributed | `mode` | `job_id`? |
+|---|---|---|---|
+| resolved (warm cache) | maybe | `hot` | no |
+| resolved (cold load) | maybe | `cold` | no |
+| none | yes | `recall` | no |
+| none | no | `ephemeral` | yes |
+
+So a `hot`/`cold` mode does **not** imply the recall tier was idle — recall may have overridden
+or added matches; the label only describes the cold cache. `recall` is the dedicated value for
+"no cold shard, recall answered." This is documented for callers in
+[`docs/api/query.md`](../api/query.md).
+
+**Watermark/shard pairing (I3) in code.** The cold search (`_hot_search`) reports the exact
+shard row it resolved back to `run_query` (via an out-dict), and the recall scan is filtered with
+*that* shard's `consolidated_lsn` — never a watermark resolved by an independent
+`get_latest_shard` call — so a stale cached shard version can never open a partition gap.
 
 ## Invariants
 
@@ -300,9 +331,9 @@ Integration (real PG/MinIO/Redis):
   in `docs/api/v1.md`.
 - **Sequencing (PR plan):** PR1 consolidated get/list/delete-by-id (flag-off correct) → PR2
   migrations + separate pgvector container → PR3 sync recall write + flag → PR4 query
-  union/merge → PR5 consolidation/compaction + consolidate-on-idle + caps → PR6 recall +
-  consolidated union for get/list/delete + mem0 adapter + docs. Each flag-gated so `main` stays
-  shippable.
+  union/merge *(implemented — `recall_search` + `_merge_recall_and_cold`; see §Read path)* → PR5
+  consolidation/compaction + consolidate-on-idle + caps → PR6 recall + consolidated union for
+  get/list/delete + mem0 adapter + docs. Each flag-gated so `main` stays shippable.
 
 **Open**
 - (none blocking — ready to split into agents)
