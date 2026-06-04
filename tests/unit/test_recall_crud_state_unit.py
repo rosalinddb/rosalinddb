@@ -138,6 +138,44 @@ def test_get_vector_null_metadata_coalesced(state, monkeypatch):
     assert status == "live" and meta == {}
 
 
+# --- recall_get_vector_with_embedding (include_values recall path) ----------
+
+
+def test_get_vector_with_embedding_live_returns_parsed_vector(state, monkeypatch):
+    # fetchone fallback returns the scripted row as-is: (metadata, deleted, embedding).
+    cur = _wire(
+        state,
+        monkeypatch,
+        rows=[({"v": "recall"}, False, "[1,2,3,4]")],
+    )
+    status, meta, emb = state.recall_get_vector_with_embedding(
+        "t", "ds", "id", watermark=5
+    )
+    assert status == "live"
+    assert meta == {"v": "recall"}
+    # The pgvector text literal is parsed to a float list (never zeros).
+    assert emb == [1.0, 2.0, 3.0, 4.0]
+    sql, params = cur.calls[-1]
+    assert "embedding" in sql and "lsn > %s" in sql
+    assert params == ("t", "ds", "id", 5)
+
+
+def test_get_vector_with_embedding_tombstone(state, monkeypatch):
+    _wire(state, monkeypatch, rows=[({"stale": True}, True, "[9,9,9,9]")])
+    status, meta, emb = state.recall_get_vector_with_embedding(
+        "t", "ds", "id", watermark=0
+    )
+    assert status == "tombstone" and meta is None and emb is None
+
+
+def test_get_vector_with_embedding_absent(state, monkeypatch):
+    _wire(state, monkeypatch, rows=[])
+    status, meta, emb = state.recall_get_vector_with_embedding(
+        "t", "ds", "id", watermark=0
+    )
+    assert status is None and meta is None and emb is None
+
+
 # --- recall_list_rows ------------------------------------------------------
 
 

@@ -1422,6 +1422,46 @@ WHERE tenant_id = %s AND dataset = %s AND id = %s AND lsn > %s
     return "live", (metadata or {})
 
 
+def recall_get_vector_with_embedding(
+    tenant_id: str, dataset: str, vector_id: str, watermark: int
+) -> Tuple[Optional[str], Optional[dict], Optional[List[float]]]:
+    """Like :func:`recall_get_vector`, but ALSO return the stored embedding.
+
+    Backs the `?include_values=true` recall path for get-by-id — the cheap
+    recall-resident case (no FAISS): the embedding is a plain `vector` COLUMN on
+    `recall_vectors`, so this is one SELECT over the same partition/watermark
+    scope as `recall_get_vector`, plus a text→`list[float]` parse of the column.
+
+    Returns a `(status, metadata, embedding)` triple:
+
+      - `("live", metadata, [float, ...])` — a LIVE recall row above the
+        watermark: its real stored embedding is returned alongside the metadata.
+      - `("tombstone", None, None)` — a recall TOMBSTONE above the watermark.
+      - `(None, None, None)` — NO recall row above the watermark for this id; the
+        caller falls back to the cold tier (which, for `include_values`, cannot
+        currently reconstruct the embedding — a deferred FAISS `reconstruct`).
+
+    Scope is byte-identical to `recall_get_vector` (I1 partition + I3 watermark
+    pairing). Only ever called when `recall_enabled()` is True.
+    """
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+        cur.execute(
+            """
+SELECT metadata, deleted, embedding
+FROM recall_vectors
+WHERE tenant_id = %s AND dataset = %s AND id = %s AND lsn > %s
+            """,
+            (tenant_id, dataset, vector_id, watermark),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None, None, None
+    metadata, deleted, embedding = row
+    if deleted:
+        return "tombstone", None, None
+    return "live", (metadata or {}), _pgvector_literal_to_list(embedding)
+
+
 def recall_list_rows(
     tenant_id: str, dataset: str, watermark: int
 ) -> Tuple[List[dict], set]:

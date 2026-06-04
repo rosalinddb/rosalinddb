@@ -215,5 +215,24 @@ def test_read_your_writes_through_mem0_adapter(recall_server):
     store.update("fact-2", vector=[0.0, 1.0, 0.0, 0.0], payload={"user_id": "u1", "data": "prefers green tea"})
     assert store.get("fact-2").payload["data"] == "prefers green tea"
 
+    # METADATA-ONLY update (vector=None) must PRESERVE the stored embedding via
+    # the include_values recall path — NEVER write a zero placeholder. After it,
+    # fact-2 must still be found near its own vector (it would not be if the
+    # embedding had been clobbered to zeros).
+    store.update("fact-2", payload={"user_id": "u1", "data": "loves green tea"})
+    assert store.get("fact-2").payload["data"] == "loves green tea"
+    hits_meta = store.search(
+        query="tea?", vectors=[0.0, 1.0, 0.0, 0.0], top_k=5, filters={"user_id": "u1"}
+    )
+    by_id_meta = {h.id: h for h in hits_meta}
+    assert "fact-2" in by_id_meta, "metadata-only update must preserve the embedding"
+    # The query equals fact-2's preserved vector -> exact match -> similarity 1.0.
+    assert by_id_meta["fact-2"].score == pytest.approx(1.0)
+
+    # Direct client read confirms include_values returns the REAL (non-zero) vector.
+    raw = store.client.get("agentmem", "fact-2", include_values=True)
+    assert raw["embedding"] == pytest.approx([0.0, 1.0, 0.0, 0.0])
+    assert raw["embedding"] != [0.0, 0.0, 0.0, 0.0]
+
     # cleanup.
     store.reset()

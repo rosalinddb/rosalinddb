@@ -14,6 +14,7 @@ Endpoints covered:
   - ``DELETE /v1/datasets/{name}``                  -> :meth:`delete_dataset`
   - ``POST   /v1/datasets/{name}/vectors``          -> :meth:`upsert` (NDJSON)
   - ``GET    /v1/datasets/{name}/vectors/{id}``     -> :meth:`get`
+    (``?include_values=true`` returns a recall-resident vector's ``embedding``)
   - ``GET    /v1/datasets/{name}/vectors``          -> :meth:`list`
   - ``DELETE /v1/datasets/{name}/vectors/{id}``     -> :meth:`delete`
   - ``POST   /v1/query`` (+ ephemeral status poll)  -> :meth:`query`
@@ -47,6 +48,7 @@ __all__ = [
     "DatasetNotFoundError",
     "VectorNotFoundError",
     "QueryTimeoutError",
+    "TransportError",
 ]
 
 
@@ -89,6 +91,20 @@ class QueryTimeoutError(RosalindDBError):
             f"ephemeral query {job_id} did not complete within {timeout}s",
         )
         self.job_id = job_id
+
+
+class TransportError(RosalindDBError):
+    """A transport-layer failure (connection refused, DNS, socket timeout, ...).
+
+    The request never reached a v1 error envelope — the server was unreachable or
+    the socket timed out — so there is no ``status``. Carried under the
+    :class:`RosalindDBError` hierarchy (``code == "transport_error"``) so callers
+    can catch every client failure uniformly. The original exception is chained
+    via ``__cause__``.
+    """
+
+    def __init__(self, message: str):
+        super().__init__("transport_error", message)
 
 
 def _raise_for_envelope(status: int, body: bytes) -> None:
@@ -182,13 +198,18 @@ class RosalindDBClient:
             content_type = content_type or "application/json"
 
         if _HAVE_REQUESTS:
-            resp = self._session.request(  # type: ignore[union-attr]
-                method,
-                url,
-                data=body,
-                headers=self._headers(content_type),
-                timeout=self.timeout,
-            )
+            try:
+                resp = self._session.request(  # type: ignore[union-attr]
+                    method,
+                    url,
+                    data=body,
+                    headers=self._headers(content_type),
+                    timeout=self.timeout,
+                )
+            except requests.exceptions.RequestException as exc:  # type: ignore[union-attr]
+                # Connection refused / DNS / socket timeout / etc. — the request
+                # never reached a v1 envelope. Wrap into the typed hierarchy.
+                raise TransportError(f"{method} {url} failed: {exc}") from exc
             response = _Response(resp.status_code, resp.content)
         else:  # pragma: no cover - exercised only without `requests`
             req = urllib.request.Request(
@@ -199,6 +220,10 @@ class RosalindDBClient:
                     response = _Response(raw.status, raw.read())
             except urllib.error.HTTPError as exc:
                 response = _Response(exc.code, exc.read())
+            except (urllib.error.URLError, OSError) as exc:
+                # URLError wraps connection refused/DNS; OSError covers socket
+                # timeouts. Same typed wrapping as the `requests` path.
+                raise TransportError(f"{method} {url} failed: {exc}") from exc
 
         if response.status >= 400:
             _raise_for_envelope(response.status, response.content)
@@ -242,14 +267,25 @@ class RosalindDBClient:
             content_type="application/x-ndjson",
         ).json()
 
-    def get(self, name: str, vector_id: str) -> dict:
+    def get(self, name: str, vector_id: str, include_values: bool = False) -> dict:
         """``GET /v1/datasets/{name}/vectors/{id}`` — id + metadata.
+
+        Returns ``{"id", "metadata"}``. With ``include_values=True``
+        (``?include_values=true``) a **recall-resident** vector additionally
+        carries its stored ``"embedding"`` (a ``list[float]``); a consolidated
+        (cold-only) vector OMITS ``"embedding"`` (the cold FAISS ``reconstruct``
+        is a deferred follow-up), so callers must treat its absence as "not
+        recall-resident". This backs the adapter's metadata-only ``update``,
+        which must re-upsert without clobbering the real embedding.
 
         Raises :class:`VectorNotFoundError` on a ``404 not_found`` (absent id or
         a recall tombstone).
         """
         quoted = urllib.parse.quote(vector_id, safe="")
-        return self._request("GET", f"/v1/datasets/{name}/vectors/{quoted}").json()
+        params = {"include_values": "true"} if include_values else None
+        return self._request(
+            "GET", f"/v1/datasets/{name}/vectors/{quoted}", params=params
+        ).json()
 
     def list(
         self,

@@ -154,3 +154,41 @@ def test_query_non_ephemeral_returns_immediately():
 def test_delete_returns_none_on_204():
     client = _client([_StubResp(204, None)])
     assert client.delete("ds", "id1") is None
+
+
+def test_get_default_omits_include_values():
+    client = _client([_StubResp(200, {"id": "id1", "metadata": {}})])
+    client.get("ds", "id1")
+    url = client._session.calls[0]["url"]
+    assert "include_values" not in url
+
+
+def test_get_include_values_adds_query_param_and_returns_embedding():
+    client = _client(
+        [_StubResp(200, {"id": "id1", "metadata": {"k": "v"}, "embedding": [1.0, 2.0]})]
+    )
+    out = client.get("ds", "id1", include_values=True)
+    url = client._session.calls[0]["url"]
+    assert "include_values=true" in url
+    assert out["embedding"] == [1.0, 2.0]
+
+
+# -- transport-layer errors -------------------------------------------------
+
+
+def test_transport_error_wraps_connection_failure():
+    import requests as _requests
+
+    class _BoomSession:
+        calls = []
+
+        def request(self, *a, **k):
+            raise _requests.exceptions.ConnectionError("refused")
+
+    client = rc.RosalindDBClient(base_url="http://test:8080")
+    client._session = _BoomSession()
+    with pytest.raises(rc.TransportError) as exc:
+        client.get_dataset("d")
+    assert exc.value.code == "transport_error"
+    # The original exception is chained.
+    assert isinstance(exc.value.__cause__, _requests.exceptions.ConnectionError)
