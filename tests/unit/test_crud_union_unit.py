@@ -599,3 +599,80 @@ def test_delete_recall_no_shard_still_204(env, monkeypatch):
 
     r = env.client.delete("/v1/datasets/ds/vectors/ghost", headers=_auth(s["token"]))
     assert r.status_code == 204, r.text
+
+
+# --- DELETE recall cap → CONSOLIDATE enqueue (liveness) --------------------
+
+
+def _drain_consolidate():
+    """Pop every queued `CONSOLIDATE` message; return the list."""
+    from adapters.queue.queue import consume
+
+    msgs = []
+    while True:
+        m = consume("CONSOLIDATE", block=False)
+        if not m:
+            break
+        msgs.append(m)
+    return msgs
+
+
+def test_delete_cap_exceeded_enqueues_consolidate(env, monkeypatch):
+    """A delete crossing `RB_RECALL_MAX_ROWS` enqueues a CONSOLIDATE (like writes).
+
+    A delete writes a tombstone row that counts against the partition, so a
+    delete-heavy workload must trip the same cap-driven flush the write path uses,
+    or recall tombstones accumulate unbounded between idle sweeps.
+    """
+    _drain_consolidate()
+    _enable_recall(env, monkeypatch)
+    monkeypatch.setattr(env.main, "recall_delete_vector", lambda t, d, vid, dim: 1)
+    monkeypatch.setenv("RB_RECALL_MAX_ROWS", "2")
+    monkeypatch.setattr(env.main, "recall_partition_count", lambda t, d: 5)
+
+    s = _signup(env.client)
+    _make_dataset(env, s["token"], dim=4)
+    env.write(s["tenant_id"], "ds", [("doc-1", {})])
+
+    r = env.client.delete("/v1/datasets/ds/vectors/doc-1", headers=_auth(s["token"]))
+    assert r.status_code == 204, r.text
+    msgs = _drain_consolidate()
+    assert len(msgs) == 1, f"a delete over the cap must enqueue one CONSOLIDATE: {msgs}"
+    assert msgs[0]["dataset"] == "ds"
+
+
+def test_delete_cap_not_exceeded_no_consolidate(env, monkeypatch):
+    """A delete under the cap does NOT enqueue a CONSOLIDATE."""
+    _drain_consolidate()
+    _enable_recall(env, monkeypatch)
+    monkeypatch.setattr(env.main, "recall_delete_vector", lambda t, d, vid, dim: 1)
+    monkeypatch.setenv("RB_RECALL_MAX_ROWS", "2000")
+    monkeypatch.setattr(env.main, "recall_partition_count", lambda t, d: 3)
+
+    s = _signup(env.client)
+    _make_dataset(env, s["token"], dim=4)
+    env.write(s["tenant_id"], "ds", [("doc-1", {})])
+
+    r = env.client.delete("/v1/datasets/ds/vectors/doc-1", headers=_auth(s["token"]))
+    assert r.status_code == 204, r.text
+    assert _drain_consolidate() == [], "under-cap delete must not enqueue CONSOLIDATE"
+
+
+def test_delete_cap_check_failure_does_not_fail_delete(env, monkeypatch):
+    """A cap-count failure (after the durable tombstone) must NOT turn 204 into error."""
+    _drain_consolidate()
+    _enable_recall(env, monkeypatch)
+    monkeypatch.setattr(env.main, "recall_delete_vector", lambda t, d, vid, dim: 1)
+
+    def _boom(t, d):
+        raise RuntimeError("recall count query failed")
+
+    monkeypatch.setattr(env.main, "recall_partition_count", _boom)
+
+    s = _signup(env.client)
+    _make_dataset(env, s["token"], dim=4)
+    env.write(s["tenant_id"], "ds", [("doc-1", {})])
+
+    r = env.client.delete("/v1/datasets/ds/vectors/doc-1", headers=_auth(s["token"]))
+    assert r.status_code == 204, "cap-check failure must not fail the committed delete"
+    assert _drain_consolidate() == []

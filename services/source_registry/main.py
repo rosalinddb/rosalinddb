@@ -1001,6 +1001,28 @@ def delete_vector_endpoint(
                 "recall_delete_failed",
                 "Recall-tier delete failed; the vector was not tombstoned",
             )
+        # Per-tenant recall cap (liveness): a delete WRITES a tombstone row, which
+        # counts against the partition like a live row, so a delete-heavy workload
+        # would otherwise accumulate tombstones unbounded between idle sweeps and
+        # bloat the brute-force recall scan. Mirror the write path: if this
+        # partition now exceeds `RB_RECALL_MAX_ROWS`, enqueue a `CONSOLIDATE` so
+        # the builder flushes it (folding live rows + APPLYING tombstones) into a
+        # Consolidated shard. Best-effort AFTER the durable tombstone write: a
+        # count/enqueue failure must NEVER turn the already-committed delete into
+        # an error (the next write/delete — or the idle sweep — re-checks and
+        # re-enqueues), so it never turns the 204 into a 5xx.
+        try:
+            if recall_partition_count(tenant_id, name) > _recall_max_rows():
+                publish("CONSOLIDATE", {"tenant": tenant_id, "dataset": name})
+        except Exception:  # noqa: BLE001 - cap check is best-effort
+            logger.warning(
+                "recall cap check/enqueue failed on delete for tenant=%s "
+                "dataset=%s (tombstone already committed; will retry next "
+                "write/delete/idle sweep)",
+                tenant_id,
+                name,
+                exc_info=True,
+            )
         # Read-your-deletes: the tombstone is committed; the union hides the id
         # immediately. No async job → 204 No Content (no body).
         return Response(status_code=204)
