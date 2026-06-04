@@ -58,7 +58,10 @@ from services.auth.quota import (
 # reached and `post_vectors` behaves byte-identically to today (202, landing
 # write, VALIDATE_DATASET). See docs/architecture/recall-consolidate.md.
 from adapters.state.state import (
+    recall_delete_vector,
     recall_enabled,
+    recall_get_vector,
+    recall_list_rows,
     recall_partition_count,
     recall_upsert_vectors,
 )
@@ -634,14 +637,27 @@ async def post_vectors(
     )
 
 
-# --- consolidated-tier vector CRUD ----------------------------------------
+# --- consolidated-tier vector CRUD (+ recall union, RB_RECALL) -------------
 #
 # Get / list / delete a single vector by its customer-supplied string id,
 # served from the immutable consolidated shards (the FAISS index + its
-# `.meta.json` sidecar). This surface is INDEPENDENT of the recall tier
-# (`RB_RECALL`) — it works against today's async-built shards. The
-# recall↔consolidated union for these operations is a later PR (see
-# docs/architecture/recall-consolidate.md, PR6).
+# `.meta.json` sidecar).
+#
+# When the recall tier is ON (`RB_RECALL`, default OFF), these endpoints UNION
+# the cold sidecar with the recall tier, with RECALL AUTHORITATIVE for any id
+# above the resolved shard's watermark — the same recall-wins / tombstone-
+# suppress rule the QUERY union uses (`recall_search` + `_merge_recall_and_cold`):
+#   - get: a live recall row (lsn > watermark) wins (recall metadata); a recall
+#     tombstone → 404 (deleted); otherwise fall back to the cold sidecar.
+#   - list: union recall live rows with the cold sidecar (recall-wins dedup),
+#     suppress any id with a recall tombstone above the watermark, then filter +
+#     sort + paginate as before.
+#   - delete: write an ABOVE-watermark TOMBSTONE into recall (fresh lsn) and
+#     return 200/204 synchronously (read-your-deletes); consolidation applies it
+#     to cold later. Does NOT publish DELETE_VECTORS in flag-on mode.
+# With the flag OFF every endpoint is byte-identical to the cold-only path and
+# NEVER opens a recall connection. See docs/architecture/recall-consolidate.md
+# (PR6) + docs/api/vectors.md.
 #
 # The sidecar maps each SHA1->int64 hash (the same `id_to_int64` the builder
 # stamps onto every FAISS vector) back to `{id, metadata}`. Get/delete hash
@@ -699,6 +715,42 @@ def _newest_sidecar(tenant_id: str, dataset: str) -> Optional[dict]:
     return read_shard_sidecar(shard["shard_uri"])
 
 
+def _resolve_shard_sidecar_and_watermark(
+    tenant_id: str, dataset: str
+) -> tuple[Optional[dict], int]:
+    """Resolve the newest shard ONCE; return `(sidecar_or_None, watermark)`.
+
+    The recall-union CRUD paths need BOTH the cold sidecar and the recall
+    watermark, and invariant I3 (watermark/shard pairing) requires they come from
+    the SAME resolved shard — never a sidecar from one shard and a watermark read
+    from an independent lookup. This resolves `get_latest_shard` once and derives
+    both: the sidecar (None when no shard exists yet) and the watermark (the
+    shard's `consolidated_lsn`, or `0` when no shard exists so EVERY recall row
+    qualifies — a brand-new dataset's writes live only in recall).
+    """
+    shard = state_mod.get_latest_shard(tenant_id, dataset)
+    if shard is None:
+        return None, 0
+    return read_shard_sidecar(shard["shard_uri"]), _watermark_of(shard)
+
+
+def _watermark_of(shard: Optional[dict]) -> int:
+    """Recall watermark = the resolved shard's `consolidated_lsn` (I3), else 0.
+
+    Mirrors `services.query_api.v1_query._watermark_for_shard`: `0` when no shard
+    (all recall rows qualify), and a missing/None `consolidated_lsn` (a pre-008
+    or memory-mode shard row) defaults to `0` — backward-compatible with the
+    `NOT NULL DEFAULT 0` column.
+    """
+    if not shard:
+        return 0
+    raw = shard.get("consolidated_lsn", 0)
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 @app.get("/v1/datasets/{name}/vectors/{vector_id}")
 def get_vector_endpoint(
     name: str,
@@ -706,7 +758,7 @@ def get_vector_endpoint(
     tenant_id: str = Depends(current_tenant_id),
     _rl: None = Depends(rate_limit),
 ):
-    """Get one consolidated-tier vector by id. Returns `{id, metadata}`.
+    """Get one vector by id. Returns `{id, metadata}`.
 
     Resolves the newest shard, reads its sidecar, hashes `vector_id` with the
     builder's SHA1->int64, and looks it up. `404 not_found` when there is no
@@ -714,10 +766,36 @@ def get_vector_endpoint(
     `404 dataset_not_found` (tenant scoping is enforced by `get_dataset` /
     `get_latest_shard`). `?include_values` is a noted follow-up — v1 returns
     metadata only.
+
+    Recall union (`RB_RECALL`, default OFF): when on, the recall tier is
+    AUTHORITATIVE for any id above the resolved shard's watermark. A LIVE recall
+    row (`lsn > watermark`) wins → its `{id, metadata}` is returned (recall-wins);
+    a recall TOMBSTONE → `404 not_found` (the id was deleted, never fall back to
+    the stale cold copy); otherwise fall back to the cold sidecar lookup below.
+    Flag OFF → cold-only (byte-identical). See
+    docs/architecture/recall-consolidate.md (PR6).
     """
     if state_mod.get_dataset(tenant_id, name) is None:
         return _err(404, "dataset_not_found", f"Dataset '{name}' not found")
-    sidecar = _newest_sidecar(tenant_id, name)
+
+    # Recall union. Resolve the shard ONCE so the recall watermark and the cold
+    # sidecar come from the SAME shard (I3 pairing). With the flag off this whole
+    # branch is skipped and no recall connection is ever opened.
+    if recall_enabled():
+        sidecar, watermark = _resolve_shard_sidecar_and_watermark(tenant_id, name)
+        status, metadata = recall_get_vector(tenant_id, name, vector_id, watermark)
+        if status == "live":
+            # Recall-wins: a live row above the watermark is the authoritative
+            # version, newer than any consolidated copy.
+            return {"id": vector_id, "metadata": metadata or {}}
+        if status == "tombstone":
+            # Deleted in recall — authoritative; do NOT fall back to the cold copy.
+            return _err(404, "not_found", f"Vector '{vector_id}' not found")
+        # status is None: no recall row above the watermark — fall through to the
+        # cold sidecar (the id, if any, is consolidated below the watermark).
+    else:
+        sidecar = _newest_sidecar(tenant_id, name)
+
     if not sidecar:
         return _err(404, "not_found", f"Vector '{vector_id}' not found")
     entry = sidecar.get(str(id_to_int64(vector_id)))
@@ -735,7 +813,7 @@ def list_vectors_endpoint(
     tenant_id: str = Depends(current_tenant_id),
     _rl: None = Depends(rate_limit),
 ):
-    """List consolidated-tier vectors with an optional `filter` and pagination.
+    """List vectors with an optional `filter` and pagination.
 
     Reads the newest shard's sidecar, applies an optional AND-of-equals
     `filter` (a JSON object, reusing the query path's `metadata_matches_filter`
@@ -743,6 +821,15 @@ def list_vectors_endpoint(
     paginates with `limit` (default 100, capped at 1000) and an opaque
     `cursor`. Returns `{vectors: [{id, metadata}], next_cursor}`; an empty list
     when no shard exists. Tenant-scoped via `get_dataset` / `get_latest_shard`.
+
+    Recall union (`RB_RECALL`, default OFF): when on, the cold sidecar entries are
+    unioned with the recall tier's LIVE rows above the resolved shard's watermark,
+    RECALL-WINS on a shared id (recall metadata overrides the cold copy), and any
+    id with a recall TOMBSTONE above the watermark is SUPPRESSED from the list —
+    the same recall-authoritative dedup the QUERY union uses. The union happens
+    BEFORE the metadata `filter`, so the filter sees each id's authoritative
+    (recall-or-cold) metadata. Flag OFF → cold-only (byte-identical). See
+    docs/architecture/recall-consolidate.md (PR6) + docs/api/vectors.md.
 
     Pagination contract (offset cursor — read this before paging):
     `next_cursor` encodes ONLY the offset into the id-sorted result; it does
@@ -793,14 +880,30 @@ def list_vectors_endpoint(
         if not isinstance(flt, dict):
             return _err(400, "invalid_filter", "filter must be a JSON object")
 
-    sidecar = _newest_sidecar(tenant_id, name) or {}
-    # Project to {id, metadata}, optionally filter, then stable-sort by the
-    # original string id so pagination over an opaque offset is deterministic.
+    # Resolve the cold sidecar and (under the union) the recall partition above
+    # the SAME resolved shard's watermark (I3 pairing). With the flag off this is
+    # a plain sidecar read and no recall connection is ever opened.
+    if recall_enabled():
+        sidecar, watermark = _resolve_shard_sidecar_and_watermark(tenant_id, name)
+        sidecar = sidecar or {}
+        recall_live, recall_suppress_ids = recall_list_rows(tenant_id, name, watermark)
+    else:
+        sidecar = _newest_sidecar(tenant_id, name) or {}
+        recall_live, recall_suppress_ids = [], set()
+
+    # Project the cold sidecar to {id, metadata}, DROPPING any id recall is
+    # authoritative for (`recall_suppress_ids`) — a recall tombstone hides the
+    # cold id, and a recall live row replaces the cold copy with the recall
+    # version appended below (recall-wins dedup, mirroring the query union).
     records = [
         {"id": e.get("id"), "metadata": e.get("metadata") or {}}
         for e in sidecar.values()
-        if e.get("id") is not None
+        if e.get("id") is not None and e.get("id") not in recall_suppress_ids
     ]
+    # Append the recall LIVE rows (their ids were suppressed from the cold set
+    # above, so this is the only copy of each — no duplicate). Empty when the
+    # flag is off.
+    records.extend(recall_live)
     if flt:
         # Reuse the query path's AND-of-equals predicate so list/query agree.
         from services.query_api.v1_query import metadata_matches_filter
@@ -815,19 +918,35 @@ def list_vectors_endpoint(
     return {"vectors": page, "next_cursor": next_cursor}
 
 
-@app.delete("/v1/datasets/{name}/vectors/{vector_id}", status_code=202)
+@app.delete(
+    "/v1/datasets/{name}/vectors/{vector_id}",
+    status_code=202,
+    # The success code is FLAG-CONDITIONAL: 204 (No Content, synchronous
+    # read-your-deletes) on the recall path (`RB_RECALL` on), 202 (`{job_id}`,
+    # eventually-consistent builder delete) on the default cold-only path. The
+    # declared `status_code=202` is the default; the recall path returns an
+    # explicit `Response(204)` at runtime. Document BOTH in the OpenAPI schema so
+    # the generated contract reflects the real flag-conditional behaviour rather
+    # than advertising only 202.
+    responses={
+        204: {"description": "Recall path (RB_RECALL on): tombstone written "
+                             "synchronously; no body (read-your-deletes)."},
+        202: {"description": "Default path: DELETE_VECTORS enqueued; returns "
+                             "`{job_id}` (eventually consistent)."},
+    },
+)
 def delete_vector_endpoint(
     name: str,
     vector_id: str,
     tenant_id: str = Depends(current_tenant_id),
     _rl: None = Depends(rate_limit),
 ):
-    """Delete one consolidated-tier vector by id. Returns `202 {job_id}`.
+    """Delete one vector by id. Returns `202 {job_id}` (flag off) or `204` (recall).
 
-    Publishes a `DELETE_VECTORS` message; the index builder's `DELETE_VECTORS`
-    consumer loads the newest shard, removes the hashed id, rewrites the
-    sidecar without it, and writes a superseded shard. Tenant-scoped — a
-    missing/cross-tenant dataset is `404 dataset_not_found`.
+    Flag OFF (default — eventually consistent via the builder): publishes a
+    `DELETE_VECTORS` message; the index builder's consumer loads the newest shard,
+    removes the hashed id, rewrites the sidecar without it, and writes a superseded
+    shard. Tenant-scoped — a missing/cross-tenant dataset is `404 dataset_not_found`.
 
     Status handling is shard-aware so a delete never masks a dataset's true
     state. The status is flipped to `indexing` ONLY when a shard actually
@@ -846,9 +965,67 @@ def delete_vector_endpoint(
     this keeps the endpoint a single cheap publish (plus, when a shard exists,
     one status flip) rather than a synchronous shard read on the request path.
     This mirrors the eventual-consistency contract of `POST .../vectors`.
+
+    Recall (`RB_RECALL`, default OFF — SYNCHRONOUS, read-your-deletes): writes a
+    TOMBSTONE into the recall tier with a FRESH lsn allocated ABOVE the watermark
+    (`recall_delete_vector`), so the union immediately hides the id (an immediate
+    GET → 404, a `POST /query` no longer returns it) and the next consolidation
+    removes it from cold. Returns `204` — there is no async job. It does NOT
+    publish `DELETE_VECTORS`: consolidation applies the tombstone to the cold tier
+    later (that machinery already exists), so a builder delete-rebuild here would
+    be redundant. THE ABOVE-WATERMARK LSN IS A HARD CONTRACT (a below-watermark
+    tombstone would be excluded from the union AND trim-eligible-unapplied — the
+    id would resurrect); see docs/architecture/recall-consolidate.md, invariants
+    I1/I2. A recall-store failure maps to the v1 `503 recall_delete_failed`
+    envelope, never a raw 500.
     """
-    if state_mod.get_dataset(tenant_id, name) is None:
+    dataset = state_mod.get_dataset(tenant_id, name)
+    if dataset is None:
         return _err(404, "dataset_not_found", f"Dataset '{name}' not found")
+
+    # --- recall-delete write path (RB_RECALL): synchronous tombstone ----------
+    if recall_enabled():
+        try:
+            recall_delete_vector(
+                tenant_id, name, vector_id, int(dataset["dimension"])
+            )
+        except Exception:  # noqa: BLE001 - any recall-store failure -> 503
+            logger.exception(
+                "recall-tier delete failed for tenant=%s dataset=%s id=%s",
+                tenant_id,
+                name,
+                vector_id,
+            )
+            return _err(
+                503,
+                "recall_delete_failed",
+                "Recall-tier delete failed; the vector was not tombstoned",
+            )
+        # Per-tenant recall cap (liveness): a delete WRITES a tombstone row, which
+        # counts against the partition like a live row, so a delete-heavy workload
+        # would otherwise accumulate tombstones unbounded between idle sweeps and
+        # bloat the brute-force recall scan. Mirror the write path: if this
+        # partition now exceeds `RB_RECALL_MAX_ROWS`, enqueue a `CONSOLIDATE` so
+        # the builder flushes it (folding live rows + APPLYING tombstones) into a
+        # Consolidated shard. Best-effort AFTER the durable tombstone write: a
+        # count/enqueue failure must NEVER turn the already-committed delete into
+        # an error (the next write/delete — or the idle sweep — re-checks and
+        # re-enqueues), so it never turns the 204 into a 5xx.
+        try:
+            if recall_partition_count(tenant_id, name) > _recall_max_rows():
+                publish("CONSOLIDATE", {"tenant": tenant_id, "dataset": name})
+        except Exception:  # noqa: BLE001 - cap check is best-effort
+            logger.warning(
+                "recall cap check/enqueue failed on delete for tenant=%s "
+                "dataset=%s (tombstone already committed; will retry next "
+                "write/delete/idle sweep)",
+                tenant_id,
+                name,
+                exc_info=True,
+            )
+        # Read-your-deletes: the tombstone is committed; the union hides the id
+        # immediately. No async job → 204 No Content (no body).
+        return Response(status_code=204)
 
     job_id = "job_" + uuid4().hex
     publish(

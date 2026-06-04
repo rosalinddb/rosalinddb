@@ -450,11 +450,21 @@ def test_recall_search_opens_no_connection_when_flag_off(monkeypatch):
 
 
 class _FakeRecallCursor:
-    """A cursor stand-in that returns canned `recall_vectors` rows."""
+    """A cursor stand-in that returns canned `recall_vectors` rows.
+
+    `recall_search` now issues TWO scans — a `NOT deleted` MATCH scan
+    (`SELECT id, power(embedding <-> %s, 2) AS score, metadata`) and a separate
+    full SUPPRESS scan (`SELECT id`). The fake projects the scripted
+    `(id, score, metadata, deleted)` rows to the columns the CURRENT statement
+    selects: the MATCH scan yields `(id, score, metadata)` for not-deleted rows
+    only; the SUPPRESS scan yields `(id,)` for EVERY row. `executed` records the
+    MATCH scan (the one the score/param assertions inspect).
+    """
 
     def __init__(self, rows):
         self._rows = rows
         self.executed = None
+        self._last_sql = ""
 
     def __enter__(self):
         return self
@@ -463,10 +473,25 @@ class _FakeRecallCursor:
         return False
 
     def execute(self, sql, params=None):
-        self.executed = (sql, params)
+        self._last_sql = sql
+        # Keep `executed` pinned to the MATCH scan (squared-distance, 5 params)
+        # so the existing score/param assertions inspect that statement.
+        if "power(embedding <-> %s, 2)" in sql:
+            self.executed = (sql, params)
 
     def fetchall(self):
-        return self._rows
+        sql = self._last_sql
+        # SUPPRESS scan: `SELECT id ...` — every id above the watermark.
+        if "SELECT id\nFROM recall_vectors" in sql:
+            return [(rid,) for rid, _score, _meta, _del in self._rows]
+        # MATCH scan: `... NOT deleted ...` — not-deleted rows, (id, score, meta).
+        if "power(embedding <-> %s, 2)" in sql:
+            return [
+                (rid, score, meta)
+                for rid, score, meta, deleted in self._rows
+                if not deleted
+            ]
+        return list(self._rows)
 
 
 class _FakeRecallConn:
@@ -531,7 +556,8 @@ def test_recall_search_scoped_to_tenant_dataset_and_watermark(monkeypatch):
     monkeypatch.setattr(state_mod, "_recall_conn", lambda: _FakeRecallConn(cur))
     state_mod.recall_search("tenantA", "datasetB", [1.0], top_k=3, watermark=99)
     sql, params = cur.executed
-    assert "tenant_id = %s AND dataset = %s AND lsn > %s" in sql
+    # The MATCH scan is partition + watermark scoped AND excludes tombstones.
+    assert "tenant_id = %s AND dataset = %s AND NOT deleted AND lsn > %s" in sql
     assert params[1] == "tenantA" and params[2] == "datasetB" and params[3] == 99
 
 
