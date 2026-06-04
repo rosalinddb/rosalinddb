@@ -414,6 +414,36 @@ def _remove_ids(index, int_ids: list[int]) -> None:
         index.remove_ids(selector)
 
 
+def _reconstruct_surviving(index, survivor_int_ids: list[int]) -> np.ndarray:
+    """Reconstruct the raw vectors for `survivor_int_ids` from a loaded shard.
+
+    Used by the incremental consolidation's UNION-REBUILD path (see
+    `_build_consolidated_shard`). For an `IndexIDMap2(IndexIVFFlat)` we cannot
+    `remove_ids` the stale copies of re-upserted ids — that trips a FAISS 1.8.0
+    C++ assertion (`j == index->ntotal`, IndexIDMap.cpp:181) that `abort()`s the
+    whole process. Instead we read the *surviving* vectors back out and rebuild
+    a fresh shard from scratch (which never removes).
+
+    IVFFlat stores **raw, uncompressed float32** vectors, so reconstruction is
+    LOSSLESS — the rebuilt union carries the exact original survivor vectors.
+    `make_direct_map()` initialises the per-id offset map an IVF needs for
+    `reconstruct`; we reconstruct PER-ID (not `reconstruct_n`) because the id_map
+    is sparse/unordered and `reconstruct_n` indexes by contiguous offset.
+    Returns an `(len(survivor_int_ids), d)` float32 array (empty when there are
+    no survivors).
+    """
+    if not survivor_int_ids:
+        return np.empty((0, int(index.d)), dtype=np.float32)
+    # IVF needs a direct map for per-id reconstruct; flat indexes ignore this.
+    ivf = faiss.try_extract_index_ivf(index)
+    if ivf is not None:
+        ivf.make_direct_map()
+    out = np.empty((len(survivor_int_ids), int(index.d)), dtype=np.float32)
+    for row, sid in enumerate(survivor_int_ids):
+        out[row] = index.reconstruct(int(sid))
+    return out
+
+
 # Number of newest shards to retain when sweeping superseded ones. The newest
 # shard is the one queries load; the one before it is a grace buffer for an
 # in-flight query that resolved it as the latest shard moments before this
@@ -1279,35 +1309,133 @@ def _build_consolidated_shard(
                 f"(type {type(index).__name__}); cannot upsert by id"
             )
         existing_int_ids = set(faiss.vector_to_array(index.id_map).tolist())
+        existing_sidecar = read_shard_sidecar(latest_shard["shard_uri"])
+        index_type_str = latest_shard.get("index_type", "flat")
 
-        # Remove stale cold copies of every live upsert id (last-write-wins) AND
-        # every tombstoned id (apply the delete). One overlap-gated removal pass
-        # — `remove_ids` is an O(N) scan, so skip it when nothing overlaps.
+        # The set of cold ids being replaced (live re-upserts, last-write-wins)
+        # or deleted (tombstones). Both must drop their stale cold copy.
         tombstone_int_ids = [_id_to_int64(i) for i in tombstone_ids]
-        to_remove = [
+        replaced_or_removed = {
             int(i)
             for i in (list(live_int_ids) + tombstone_int_ids)
             if int(i) in existing_int_ids
-        ]
-        if to_remove:
-            _remove_ids(index, to_remove)
-
-        existing_sidecar = read_shard_sidecar(latest_shard["shard_uri"])
-        if live_rows:
-            _add_to_index(index, vectors, live_int_ids)
-        index_type_str = latest_shard.get("index_type", "flat")
-        blob = _serialize_index(index)
-
-        # Merge the sidecar: start from the existing map, drop tombstoned ids,
-        # overlay the live upserts' (id, metadata).
-        merged_sidecar = dict(existing_sidecar)
-        for tid in tombstone_ids:
-            merged_sidecar.pop(str(_id_to_int64(tid)), None)
-        merged_sidecar.update(_sidecar_dict(live_ids, live_metas))
-        sidecar_blob = json.dumps(merged_sidecar).encode("utf-8")
-        total_vectors = int(getattr(index, "ntotal", 0))
+        }
         # Recall data never lands, so the landing manifest is unchanged.
         indexed_uris = list(latest_shard.get("indexed_landing_uris", []) or [])
+
+        if not replaced_or_removed:
+            # APPEND-ONLY FAST PATH: no overlap and no tombstone hits an existing
+            # id — nothing to remove. Cheap `add_with_ids` onto the loaded index,
+            # no rebuild. This is the common case and never trips the FAISS abort.
+            if live_rows:
+                _add_to_index(index, vectors, live_int_ids)
+            blob = _serialize_index(index)
+            merged_sidecar = dict(existing_sidecar)
+            merged_sidecar.update(_sidecar_dict(live_ids, live_metas))
+            sidecar_blob = json.dumps(merged_sidecar).encode("utf-8")
+            total_vectors = int(getattr(index, "ntotal", 0))
+        else:
+            # UNION-REBUILD PATH (#18). The overlap set is non-empty, so we would
+            # otherwise `remove_ids` the stale copies. On an `IndexIDMap2(IVFFlat)`
+            # that trips a FAISS 1.8.0 C++ assertion (`j == index->ntotal`,
+            # IndexIDMap.cpp:181) that `abort()`s the whole builder process — it is
+            # NOT a catchable Python error. So instead of remove+add we REBUILD the
+            # shard as a correct UNION via the crash-free from-scratch path:
+            #   surviving cold vectors (existing ids NOT replaced/tombstoned)
+            #   ∪ the new/updated live vectors (carrying their NEW values).
+            # Reconstruction of IVFFlat survivors is lossless (raw float32). The
+            # rebuild also re-trains the IVF quantizer over the union, which keeps
+            # recall sound as the dataset evolves.
+            #
+            # NOTE (out of scope, follow-ups): FAISS asserts via C++ `abort()`,
+            # which Python cannot catch — a defensive subprocess-isolated fold (so
+            # any future FAISS abort becomes a handled nack, not a dead consumer)
+            # and the consolidate-queue hygiene (reaper for unstamped messages,
+            # producers routing through `publish()`) are tracked separately.
+            survivor_int_ids = [
+                int(i) for i in existing_int_ids if int(i) not in replaced_or_removed
+            ]
+            survivor_vectors = _reconstruct_surviving(index, survivor_int_ids)
+            # Map each survivor int64 back to its original (string id, metadata)
+            # via the existing sidecar — for the SIDECAR only. A survivor missing
+            # from the sidecar (older shard / partial-write meta — read_shard_sidecar
+            # degrades to {} on an unreadable sidecar) still keeps its vector; we
+            # synthesise a stable string id from the int64 so it has a sidecar
+            # entry and is never silently dropped from the union.
+            #
+            # CRITICAL (review P1): the rebuilt index must carry each survivor's
+            # ORIGINAL int64 (`sid`) — the exact hash its vector was reconstructed
+            # under — NOT a re-hash of `survivor_ids`. For a present survivor
+            # `_id_to_int64(entry["id"]) == sid` (round-trips), but for a
+            # missing-from-sidecar survivor the synthesised `str(sid)` re-hashes to
+            # `_id_to_int64(str(sid)) != sid`, stamping the vector under a WRONG
+            # int64 — unreachable by its true id (get/delete/upsert all hash the
+            # true id back to `sid`) and un-removable by a future tombstone. So we
+            # CONCATENATE the actual `survivor_int_ids` with the live int64s rather
+            # than re-hashing `union_ids`. (`survivor_int_ids`/`survivor_vectors`/
+            # `survivor_ids` are index-aligned, so the sidecar stays consistent: a
+            # present survivor's entry is keyed by `str(sid)`; a missing one is
+            # keyed by `str(sid)` with fallback metadata.)
+            survivor_ids: list[str] = []
+            survivor_metas: list[dict] = []
+            for sid in survivor_int_ids:
+                entry = existing_sidecar.get(str(sid))
+                if entry is not None:
+                    survivor_ids.append(entry.get("id", str(sid)))
+                    survivor_metas.append(entry.get("metadata", {}) or {})
+                else:
+                    survivor_ids.append(str(sid))
+                    survivor_metas.append({})
+
+            # Concatenate survivors with the new/updated live rows. Live ids carry
+            # their NEW vectors/metadata; tombstoned ids appear in neither set.
+            union_ids = survivor_ids + list(live_ids)
+            union_metas = survivor_metas + list(live_metas)
+            if survivor_vectors.shape[0] and live_rows:
+                union_vectors = np.concatenate([survivor_vectors, vectors], axis=0)
+            elif live_rows:
+                union_vectors = vectors
+            else:
+                union_vectors = survivor_vectors
+            # Carry survivors' ORIGINAL int64s through unchanged (see CRITICAL note
+            # above); only the live rows are hashed from their string ids. Order
+            # matches `union_vectors`/`union_ids`/`union_metas` (survivors first).
+            union_int_ids = np.array(
+                survivor_int_ids + [_id_to_int64(i) for i in live_ids],
+                dtype=np.int64,
+            )
+
+            # Rebuild via the from-scratch builder selection (IVFFlat when the
+            # union is large enough to train, else flat) — never `remove_ids`.
+            nlist_target = _choose_nlist(int(union_vectors.shape[0]))
+            if (
+                INDEX_TYPE == "ivfflat"
+                and nlist_target >= 4
+                and union_vectors.shape[0] >= IVF_TRAINING_FLOOR
+            ):
+                blob = build_ivfflat(union_vectors, union_int_ids)
+                index_type_str = "ivfflat"
+            else:
+                blob = build_flat(union_vectors, union_int_ids)
+                index_type_str = "flat"
+            # Keep index↔sidecar consistent: stamp the sidecar under the SAME
+            # int64s carried into the index (`union_int_ids`), not a re-hash of
+            # `union_ids`. `_build_sidecar`/`_sidecar_dict` key by
+            # `str(_id_to_int64(raw_id))`, which would re-derive the WRONG key for a
+            # missing-from-sidecar survivor (the same bug, on the sidecar side), so
+            # we build the mapping directly from `union_int_ids`.
+            sidecar_blob = json.dumps(
+                {
+                    str(int(int64_id)): {
+                        "id": raw_id,
+                        "metadata": meta if isinstance(meta, dict) else {},
+                    }
+                    for int64_id, raw_id, meta in zip(
+                        union_int_ids.tolist(), union_ids, union_metas
+                    )
+                }
+            ).encode("utf-8")
+            total_vectors = int(union_vectors.shape[0])
     else:
         # --- from-scratch fold (no prior shard) ----------------------------
         if not live_rows:
