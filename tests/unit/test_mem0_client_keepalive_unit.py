@@ -187,6 +187,132 @@ def test_fallback_reconnects_after_dropped_connection(force_fallback, monkeypatc
     assert _DropOnceConnection.instances[0].closed is True
 
 
+# -- retry scoping: no double-execute of non-idempotent requests (#23 f/u) ---
+
+
+def test_fallback_does_not_resend_post_when_drop_at_getresponse(
+    force_fallback, monkeypatch
+):
+    """Server PROCESSES a POST then drops the keep-alive socket before/while
+    delivering the response: the failure surfaces at ``getresponse()`` (after a
+    successful send). The request must be processed EXACTLY ONCE — NO re-send —
+    and the caller gets a ``TransportError``.
+    """
+    import http.client
+
+    _FakeConnection.instances = []
+
+    class _DropAtResponseConnection(_FakeConnection):
+        # Tracks how many times the body was actually SENT to the "server".
+        sends = 0
+
+        def request(self, method, url, body=None, headers=None):
+            super().request(method, url, body=body, headers=headers)
+            type(self).sends += 1  # the server received (processed) the request
+
+        def getresponse(self):
+            # Socket dropped after the server processed the request, before the
+            # response was delivered. RemoteDisconnected is both OSError and
+            # HTTPException.
+            raise http.client.RemoteDisconnected("peer closed after processing")
+
+    _DropAtResponseConnection.sends = 0
+    _DropAtResponseConnection.next_responses = []
+    monkeypatch.setattr(http.client, "HTTPConnection", _DropAtResponseConnection)
+    client = _client()
+
+    with pytest.raises(rc.TransportError) as exc:
+        client.upsert("ds", [{"id": "a", "values": [1, 0], "metadata": {}}])
+
+    assert exc.value.code == "transport_error"
+    # The POST was sent (processed) EXACTLY ONCE — no automatic re-send.
+    assert _DropAtResponseConnection.sends == 1
+    # Only one connection was ever constructed (no reconnect-and-retry).
+    assert len(_DropAtResponseConnection.instances) == 1
+
+
+def test_fallback_retries_stale_socket_detected_at_send(force_fallback, monkeypatch):
+    """A stale connection detected at ``request()`` send (the server closed the
+    idle keep-alive socket) IS retried successfully on a fresh connection — the
+    reuse-recovery path stays intact because the request never went out.
+    """
+    import http.client
+
+    _FakeConnection.instances = []
+
+    class _StaleOnReuseConnection(_FakeConnection):
+        sends = 0
+
+        def request(self, method, url, body=None, headers=None):
+            super().request(method, url, body=body, headers=headers)
+            # First connection's SECOND use (a reused idle socket) fails at send,
+            # before the request leaves; a fresh connection then serves it.
+            if len(type(self).instances) == 1 and len(self.requests) == 2:
+                raise http.client.RemoteDisconnected("idle socket closed")
+            type(self).sends += 1
+
+        def getresponse(self):
+            return type(self).next_responses.pop(0)
+
+    _StaleOnReuseConnection.sends = 0
+    _StaleOnReuseConnection.next_responses = [
+        _FakeResponse(200, {"accepted": 1, "rejected": 0, "errors": []}),  # req 1
+        _FakeResponse(200, {"accepted": 1, "rejected": 0, "errors": []}),  # req 2 retry
+    ]
+    monkeypatch.setattr(http.client, "HTTPConnection", _StaleOnReuseConnection)
+    client = _client()
+
+    out1 = client.upsert("ds", [{"id": "a", "values": [1, 0], "metadata": {}}])
+    out2 = client.upsert("ds", [{"id": "b", "values": [1, 0], "metadata": {}}])
+
+    assert out1["accepted"] == 1
+    assert out2["accepted"] == 1
+    # Two connections: the original plus one transparent reconnect on the retry.
+    assert len(_StaleOnReuseConnection.instances) == 2
+    # The stale connection was closed during recovery.
+    assert _StaleOnReuseConnection.instances[0].closed is True
+    # The first request sent once; the second sent once on the fresh connection
+    # (the failed stale send did NOT increment sends — it never went out).
+    assert _StaleOnReuseConnection.sends == 2
+
+
+def test_fallback_stale_retry_is_bounded_when_both_attempts_fail(
+    force_fallback, monkeypatch
+):
+    """If the stale-send retry's fresh connection also fails at send, the loop is
+    bounded (no infinite retry) and a ``TransportError`` is raised.
+    """
+    import http.client
+
+    _FakeConnection.instances = []
+
+    class _AlwaysStaleConnection(_FakeConnection):
+        def request(self, method, url, body=None, headers=None):
+            super().request(method, url, body=body, headers=headers)
+            # The very first send (conn #1, fresh) succeeds. Every send after
+            # that fails: conn #1's reused 2nd use fails (-> stale retry), and
+            # the fresh retry connection #2's first send ALSO fails -> the loop
+            # must be bounded and give up, not retry forever.
+            if not (len(type(self).instances) == 1 and len(self.requests) == 1):
+                raise http.client.RemoteDisconnected("always closed")
+
+    _AlwaysStaleConnection.next_responses = [
+        _FakeResponse(200, {"datasets": ["a"]}),  # serves request 1 fine
+    ]
+    monkeypatch.setattr(http.client, "HTTPConnection", _AlwaysStaleConnection)
+    client = _client()
+
+    # First call: connection #1 is fresh, request goes out, succeeds.
+    client.list_datasets()
+    # Second call: connection #1 is reused, send fails (stale) -> retry on fresh
+    # connection #2, whose send ALSO fails -> bounded TransportError.
+    with pytest.raises(rc.TransportError) as exc:
+        client.list_datasets()
+    assert exc.value.code == "transport_error"
+    # Exactly two connections were constructed: original + one retry. No more.
+    assert len(_AlwaysStaleConnection.instances) == 2
+
+
 # -- preserved semantics: responses & errors --------------------------------
 
 

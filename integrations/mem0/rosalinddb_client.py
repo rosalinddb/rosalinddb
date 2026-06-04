@@ -128,6 +128,17 @@ def _raise_for_envelope(status: int, body: bytes) -> None:
     raise RosalindDBError(code, message, status, details)
 
 
+class _StaleSendError(Exception):
+    """Internal marker: a send on a *reused* keep-alive socket failed.
+
+    Signals the only replay-safe fallback failure — the request never left the
+    client because the server had already closed the idle keep-alive socket, so
+    it can be re-sent once on a fresh connection without risking double
+    execution. Never leaks past :meth:`RosalindDBClient._fallback_request`; the
+    underlying ``HTTPException``/``OSError`` is chained via ``__cause__``.
+    """
+
+
 class _Response:
     """A minimal, transport-agnostic response wrapper (status + raw bytes)."""
 
@@ -236,12 +247,22 @@ class RosalindDBClient:
         """Issue one request over a persistent, reused ``http.client`` socket.
 
         Replaces a fresh-connection-per-call ``urllib.request.urlopen`` with a
-        single keep-alive connection reused across requests. On a dropped or
-        otherwise broken persistent connection (the server may close an idle
-        keep-alive socket) the connection is reopened and the request retried
-        exactly once, transparently. Semantics — method/URL/headers/body,
-        response parsing, and the typed :class:`TransportError` wrapping for
-        unreachable/timed-out sockets — are identical to the previous fallback.
+        single keep-alive connection reused across requests. Semantics —
+        method/URL/headers/body, response parsing, and the typed
+        :class:`TransportError` wrapping for unreachable/timed-out sockets — are
+        identical to the previous fallback.
+
+        Retry scoping (#23 follow-up, see #23-driven fix): a single automatic
+        retry is performed ONLY for the stale-keep-alive case where a *reused*
+        connection fails during the SEND phase (``conn.request(...)``) — i.e. the
+        server had already closed the idle socket and the request never went out.
+        That is safe to replay on a fresh connection for any method. A failure
+        from ``conn.getresponse()`` (AFTER a successful send) is NOT retried: the
+        server may have already processed a non-idempotent request (e.g. a POST
+        upsert) and re-sending would execute it twice (at-most-once would become
+        at-least-once). A freshly-opened connection that fails is likewise not
+        retried (reopening would just hit the same unreachable peer). All
+        non-retried failures are wrapped into the typed :class:`TransportError`.
 
         A lock serialises access to the shared connection so concurrent callers
         cannot interleave on the non-thread-safe socket.
@@ -258,24 +279,42 @@ class RosalindDBClient:
 
         # http.client raises HTTPException for protocol errors; OSError (which
         # subsumes socket.error, ConnectionError and socket timeouts) for socket
-        # failures. A *reused* keep-alive socket the server has since closed
-        # surfaces here on the next send, so we drop it, reopen, and retry once;
-        # if that retry also fails the request never reached a v1 envelope and is
-        # wrapped into the typed TransportError, exactly as the old fallback did.
+        # failures. ``http.client.RemoteDisconnected`` is BOTH — and crucially it
+        # can surface from getresponse() AFTER the server has processed the
+        # request, so we must not blindly retry every failure.
         with self._fallback_lock:
             try:
                 return self._fallback_send(
                     parsed, method, request_target, body, send_headers
                 )
-            except (http.client.HTTPException, OSError):
+            except _StaleSendError as exc:
+                # A reused idle socket the server had already closed: the request
+                # never went out, so reopen and send once on a fresh connection.
                 self._fallback_close()
                 try:
                     return self._fallback_send(
                         parsed, method, request_target, body, send_headers
                     )
-                except (http.client.HTTPException, OSError) as exc:
+                except (http.client.HTTPException, OSError) as exc2:
                     self._fallback_close()
-                    raise TransportError(f"{method} {url} failed: {exc}") from exc
+                    raise TransportError(
+                        f"{method} {url} failed: {exc2}"
+                    ) from exc2
+                except _StaleSendError as exc2:
+                    # The fresh connection also failed at send (peer unreachable);
+                    # bounded — no further retry.
+                    self._fallback_close()
+                    raise TransportError(
+                        f"{method} {url} failed: {exc2.__cause__}"
+                    ) from exc2.__cause__
+            except (http.client.HTTPException, OSError) as exc:
+                # Either a failure on a freshly-opened connection (nothing to
+                # recover by reopening) or a getresponse() failure after a
+                # successful send (the request may already have been processed —
+                # NOT safe to replay). Surface as a transport error without
+                # re-sending.
+                self._fallback_close()
+                raise TransportError(f"{method} {url} failed: {exc}") from exc
 
     def _fallback_send(
         self,
@@ -285,16 +324,39 @@ class RosalindDBClient:
         body: Optional[bytes],
         headers: dict,
     ) -> _Response:
-        """Send one request on the (lazily opened) persistent connection."""
-        conn = self._fallback_connection(parsed)
-        conn.request(method, request_target, body=body, headers=headers)
+        """Send one request on the (lazily opened) persistent connection.
+
+        Distinguishes the two failure phases so the caller can scope its retry:
+        a failure of ``conn.request(...)`` on a *reused* connection (a stale idle
+        socket the server already closed, before the request went out) is raised
+        as :class:`_StaleSendError` — the only replay-safe case. Every other
+        failure (send failure on a fresh connection, or any ``getresponse()``
+        failure after a successful send) propagates as the original
+        ``HTTPException``/``OSError`` and must NOT be retried.
+        """
+        conn, reused = self._fallback_connection(parsed)
+        try:
+            conn.request(method, request_target, body=body, headers=headers)
+        except (http.client.HTTPException, OSError) as exc:
+            if reused:
+                # Stale keep-alive socket: the request never left, replay is safe.
+                raise _StaleSendError(exc) from exc
+            # Fresh connection failed to send: reopening won't help.
+            raise
+        # Past this point the request has been sent; a getresponse() failure must
+        # NOT be retried (the server may have processed it).
         raw = conn.getresponse()
         return _Response(raw.status, raw.read())
 
     def _fallback_connection(
         self, parsed: urllib.parse.SplitResult
-    ) -> http.client.HTTPConnection:
-        """Return the persistent connection, opening it on first use.
+    ) -> tuple[http.client.HTTPConnection, bool]:
+        """Return ``(connection, reused)``, opening it on first use.
+
+        ``reused`` is ``True`` when the returned connection was already cached
+        from a prior request (a keep-alive socket that may have gone stale) and
+        ``False`` when it was freshly constructed this call. The caller uses this
+        to decide whether a send-phase failure is replay-safe.
 
         Caller must hold ``self._fallback_lock``.
         """
@@ -307,7 +369,8 @@ class RosalindDBClient:
             self._fallback_conn = cls(
                 parsed.hostname, parsed.port, timeout=self.timeout
             )
-        return self._fallback_conn
+            return self._fallback_conn, False
+        return self._fallback_conn, True
 
     def _fallback_close(self) -> None:
         """Close and drop the persistent connection. Caller holds the lock."""
