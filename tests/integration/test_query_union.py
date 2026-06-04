@@ -17,6 +17,8 @@ union", invariants I1/I3):
     poll.
   - **recall-wins**: a vector in the cold shard + an updated copy in recall →
     the recall version is returned.
+  - **authoritative suppression**: a live recall re-upsert that FAILS the query
+    filter still hides the stale, filter-matching cold copy of its id.
   - **tombstone suppression**: a recall tombstone hides a cold id.
   - **no cold shard + recall data**: a synchronous recall result (`mode:
     "recall"`), NOT the ephemeral empty+job_id path.
@@ -346,6 +348,64 @@ def test_recall_wins_over_cold_for_same_id(
     assert by_id["cold-only"]["metadata"] == {"v": "cold"}
     # mode reflects the cold-shard cache state (hot|cold), not "recall".
     assert out["mode"] in ("hot", "cold")
+
+
+def test_filter_failing_live_recall_suppresses_stale_cold(
+    monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+):
+    """P1 regression: a live re-upsert that fails the filter hides its stale cold copy.
+
+    Cold shard holds `X {color: red}` (matches filter `{color: red}`). Recall has
+    a newer live `X {color: blue}` (FAILS the filter), `lsn > watermark`. A query
+    `{color: red}` must NOT return X: recall is authoritative and X's current
+    version no longer matches the filter, so the stale filter-matching cold copy
+    must not leak.
+    """
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
+    _migrate_recall(recall_url)
+    _truncate_recall(recall_url)
+
+    client_off, _state, _v1q = _build_client(
+        monkeypatch, s3_landing_prefix, s3_indexes_prefix, tmp_path, recall_on=False
+    )
+    s = _signup(client_off, email="leak@example.com")
+    _make_cold_dataset(client_off, s["token"], "lk", 4, [
+        {"id": "X", "values": [5.0, 0.0, 0.0, 0.0], "metadata": {"color": "red"}},
+        {"id": "Y", "values": [5.0, 0.1, 0.0, 0.0], "metadata": {"color": "red"}},
+    ])
+    tenant = _tenant_of(client_off, s)
+
+    import os
+    os.environ["RB_RECALL"] = "true"
+    os.environ["RB_RECALL_DSN"] = recall_url
+    import services.query_api.v1_query as v1_query
+    importlib.reload(v1_query)
+    client_off.app.include_router(v1_query.router)
+
+    # Re-upsert X into recall with color=blue (the current authoritative version),
+    # which does NOT match the query filter {color: red}.
+    import adapters.state.state as state_mod
+    state_mod.recall_upsert_vectors(tenant, "lk", [
+        {"id": "X", "values": [5.0, 0.0, 0.0, 0.0], "metadata": {"color": "blue"}},
+    ])
+
+    r = client_off.post(
+        "/v1/query",
+        headers=_auth(s["token"]),
+        json={
+            "dataset": "lk",
+            "vector": [5.0, 0.0, 0.0, 0.0],
+            "top_k": 10,
+            "filter": {"color": "red"},
+        },
+    )
+    assert r.status_code == 200, r.text
+    ids = [m["id"] for m in r.json()["matches"]]
+    assert "X" not in ids, (
+        "stale cold X (color=red) must be suppressed by the live recall "
+        "re-upsert (color=blue) even though the live row fails the filter"
+    )
+    assert "Y" in ids
 
 
 def test_recall_tombstone_hides_cold_id(

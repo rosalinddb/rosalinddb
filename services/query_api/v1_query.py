@@ -1346,10 +1346,12 @@ def _classify_hot_path_error(exc: BaseException) -> Tuple[str, str]:
 #     shard's watermark, returning rows with the SAME metric (pgvector `<->`
 #     squared → L2²) plus tombstones.
 #
-# The two are unioned by `_merge_recall_and_cold`, deduped by id with
-# RECALL-WINS, recall tombstones SUPPRESS the matching cold id, then sorted
-# ascending by L2² and truncated to `top_k` (invariant I1 guarantees the two
-# tiers partition the universe, so the union is complete and non-double-counting).
+# The two are unioned by `_merge_recall_and_cold`: recall is AUTHORITATIVE for any
+# id above the watermark, so every recall id (live, tombstoned, or filtered-out)
+# SUPPRESSES the stale cold copy of that id; only filter-passing live recall rows
+# contribute an actual match. The result is sorted ascending by L2² and truncated
+# to `top_k` (invariant I1 guarantees the two tiers partition the universe, so the
+# union is complete and non-double-counting).
 
 
 def _watermark_for_shard(shard: Optional[Dict[str, Any]]) -> int:
@@ -1373,38 +1375,40 @@ def _watermark_for_shard(shard: Optional[Dict[str, Any]]) -> int:
 
 
 def _merge_recall_and_cold(
-    recall_rows: List[dict],
+    recall_suppress_ids: set,
+    recall_matches: List[dict],
     cold_matches: List[dict],
     top_k: int,
 ) -> List[dict]:
-    """Union recall + cold matches: dedup recall-wins, drop tombstoned ids, top_k.
+    """Union recall + cold matches: recall-authoritative suppression, then top_k.
 
     Rules (docs/architecture/recall-consolidate.md, "Read path — the union",
     "Dedup"):
-      - **Recall wins on dedup.** A recall LIVE row for id X overrides any cold
-        match for X (recall's version is newer — it has a higher LSN, sitting
-        above the watermark). Only the recall row is kept.
-      - **Tombstone suppression.** A recall TOMBSTONE (`deleted=true`) for id X
-        suppresses a cold match for X: the cold id is dropped and the tombstone
-        contributes NO match (a deleted vector must not appear in results).
-      - **Sort + truncate.** The surviving matches (recall live rows + the
-        un-suppressed, un-overridden cold matches) are sorted ascending by L2²
-        `score` and truncated to `top_k`.
+      - **Recall is authoritative for any id above the watermark.** Recall
+        suppresses the stale cold copy of EVERY id it has a row for —
+        `recall_suppress_ids` is the FULL set of recall ids above the watermark
+        (live, tombstoned, filtered-out, and ranked-past-top_k alike). A cold
+        match survives only if recall has NO row for its id. This closes the leak
+        where a live re-upsert that fails the filter (or ranks past `top_k`) let a
+        stale, filter-matching cold copy surface.
+      - **Only filter-passing live recall rows are MATCHES.** `recall_matches`
+        are exactly those rows; a tombstone or a filtered-out live row
+        contributes NO match (it only suppresses, via `recall_suppress_ids`).
+      - **Sort + truncate.** The surviving matches (recall matches + the
+        un-suppressed cold matches) are sorted ascending by L2² `score` and
+        truncated to `top_k`.
 
     Both inputs already carry FAISS-aligned L2² `score`s (the recall scan squares
     pgvector's `<->`), so a single ascending sort over the union ranks correctly.
     """
-    # Index recall by id: a live row contributes a match AND overrides cold; a
-    # tombstone overrides cold but contributes nothing.
-    recall_ids = {r["id"] for r in recall_rows}
+    # Recall matches always survive; cold matches survive only if recall has NO
+    # row for that id (suppression keys on the FULL recall id-set, not just the
+    # ids that became matches).
     merged: List[dict] = [
         {"id": r["id"], "score": r["score"], "metadata": r["metadata"]}
-        for r in recall_rows
-        if not r.get("deleted")
+        for r in recall_matches
     ]
-    # Cold matches survive only if recall has NO row for that id (live-override
-    # and tombstone-suppress both key on presence in `recall_ids`).
-    merged.extend(m for m in cold_matches if m["id"] not in recall_ids)
+    merged.extend(m for m in cold_matches if m["id"] not in recall_suppress_ids)
     # Stable ascending sort by L2² distance; truncate to top_k.
     merged.sort(key=lambda m: m["score"])
     return merged[:top_k]
@@ -1482,11 +1486,15 @@ def run_query(tenant_id: str, parsed: _ParsedQuery) -> Union[JSONResponse, dict]
     # no-cold-shard + recall data). A recall-store failure maps to the same v1
     # 503 envelope as a cold-path storage failure — the union must not 500.
     if union_on:
-        watermark = _watermark_for_shard(
-            (resolved or {}).get("shard") if resolved else None
-        )
+        # `resolved` is always a dict when `union_on` (set at the top of the
+        # function); `.get("shard")` is None until `_hot_search` resolves a shard,
+        # so a no-shard query gets watermark 0 and all recall rows qualify.
+        watermark = _watermark_for_shard(resolved.get("shard") if resolved else None)
         try:
-            recall_rows = recall_search(
+            # `recall_search` returns (suppress_ids, matches): the FULL set of
+            # recall ids above the watermark (for authoritative suppression of the
+            # stale cold copy) AND only the filter-passing live rows (the matches).
+            recall_suppress_ids, recall_matches = recall_search(
                 tenant_id, dataset_name, vector_f, top_k, watermark, flt
             )
         except Exception as exc:  # noqa: BLE001
@@ -1510,12 +1518,17 @@ def run_query(tenant_id: str, parsed: _ParsedQuery) -> Union[JSONResponse, dict]
 
         # If there is neither a cold shard NOR any recall row, fall through to
         # the ephemeral path exactly as the cold-only path would (the dataset is
-        # genuinely empty for this query). recall_rows being empty AND hot being
-        # None means nothing can answer synchronously.
-        if hot is None and not recall_rows:
+        # genuinely empty for this query). No recall id above the watermark AND
+        # hot being None means nothing can answer synchronously. (`suppress_ids`
+        # is non-empty iff there is ANY recall row, including tombstones — a
+        # tombstone-only recall set with no cold shard still has nothing to
+        # return, but suppression-only is harmless and the merge yields [].)
+        if hot is None and not recall_suppress_ids:
             pass  # fall through to the ephemeral enqueue below
         else:
-            matches = _merge_recall_and_cold(recall_rows, cold_matches, top_k)
+            matches = _merge_recall_and_cold(
+                recall_suppress_ids, recall_matches, cold_matches, top_k
+            )
             # `mode`: the cold-shard cache state when a shard was read; `recall`
             # when only recall could answer (no cold shard). The recall tier
             # contributed regardless — documented in docs/api/query.md.

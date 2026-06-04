@@ -14,10 +14,14 @@ Headline properties proven here:
     ranking bug, per the spec.
   - **Dedup recall-wins**: a recall LIVE row overrides a cold match for the same
     id.
-  - **Tombstone suppression**: a recall tombstone (`deleted=true`) drops a cold
-    match for that id and contributes no match.
-  - **Filter applied to recall**: the AND-of-equals predicate is enforced on
-    recall live rows; a tombstone is returned regardless so a delete suppresses.
+  - **Authoritative suppression**: recall suppresses the stale cold copy of EVERY
+    id above the watermark — tombstoned, filter-failing, OR ranked-past-`top_k` —
+    keying on "any recall row for this id", not "a recall row that became a
+    match". A live re-upsert that fails the query filter must not let a stale,
+    filter-matching cold copy leak.
+  - **Filter gates matches, not suppression**: the AND-of-equals predicate
+    decides whether a live recall row is a MATCH; it never removes an id from the
+    suppression set.
   - **Watermark partition (I1/I3)**: the recall scan filters `lsn > watermark`,
     and the watermark is the resolved shard's `consolidated_lsn` (0 when no
     shard).
@@ -106,14 +110,15 @@ def test_watermark_reads_consolidated_lsn_of_resolved_shard():
 
 def test_merge_recall_wins_on_dedup():
     """A recall LIVE row overrides a cold match for the same id (recall is newer)."""
-    recall_rows = [
+    suppress = {"x"}
+    recall_matches = [
         {"id": "x", "score": 5.0, "metadata": {"v": "new"}, "deleted": False},
     ]
     cold = [
         {"id": "x", "score": 1.0, "metadata": {"v": "old"}},  # closer, but stale
         {"id": "y", "score": 2.0, "metadata": {}},
     ]
-    merged = v1q._merge_recall_and_cold(recall_rows, cold, top_k=10)
+    merged = v1q._merge_recall_and_cold(suppress, recall_matches, cold, top_k=10)
     by_id = {m["id"]: m for m in merged}
     # `x` is the RECALL version (metadata "new", score 5.0) — NOT the cold one,
     # even though the cold one ranked closer.
@@ -127,44 +132,74 @@ def test_merge_recall_wins_on_dedup():
 
 def test_merge_recall_only_rows_when_no_cold():
     """Recall rows alone form the result when there is no cold shard."""
-    recall_rows = [
+    recall_matches = [
         {"id": "a", "score": 3.0, "metadata": {}, "deleted": False},
         {"id": "b", "score": 1.0, "metadata": {}, "deleted": False},
     ]
-    merged = v1q._merge_recall_and_cold(recall_rows, [], top_k=10)
+    merged = v1q._merge_recall_and_cold({"a", "b"}, recall_matches, [], top_k=10)
     assert [m["id"] for m in merged] == ["b", "a"]
 
 
-# --- merge: tombstone suppression -----------------------------------------
+# --- merge: tombstone / authoritative suppression -------------------------
 
 
 def test_merge_recall_tombstone_suppresses_cold_id():
-    """A recall tombstone drops the cold match for that id and yields no match."""
-    recall_rows = [
-        {"id": "gone", "score": 0.0, "metadata": {}, "deleted": True},
-    ]
+    """A recall tombstone drops the cold match for that id and yields no match.
+
+    A tombstone is in `suppress_ids` but NOT in `recall_matches`.
+    """
     cold = [
         {"id": "gone", "score": 0.5, "metadata": {"stale": True}},
         {"id": "keep", "score": 1.0, "metadata": {}},
     ]
-    merged = v1q._merge_recall_and_cold(recall_rows, cold, top_k=10)
+    merged = v1q._merge_recall_and_cold({"gone"}, [], cold, top_k=10)
     ids = [m["id"] for m in merged]
     assert "gone" not in ids, "tombstone must suppress the cold id"
     assert ids == ["keep"], merged
 
 
+def test_merge_filtered_out_live_recall_suppresses_cold_id():
+    """A live recall row that FAILS the filter still suppresses its stale cold id.
+
+    The P1 fix: the live row is in `suppress_ids` (every recall id above the
+    watermark) but NOT in `recall_matches` (it failed the filter), so the stale
+    cold copy whose older metadata DOES match the filter must not leak.
+    """
+    cold = [
+        {"id": "x", "score": 0.1, "metadata": {"color": "red"}},  # stale, matches
+        {"id": "y", "score": 1.0, "metadata": {}},
+    ]
+    # `x` was re-upserted into recall with {color: blue} (fails {color: red}) →
+    # it is in suppress_ids but contributes no match.
+    merged = v1q._merge_recall_and_cold({"x"}, [], cold, top_k=10)
+    ids = [m["id"] for m in merged]
+    assert "x" not in ids, "a filter-failing live recall row must suppress its cold copy"
+    assert ids == ["y"], merged
+
+
+def test_merge_suppresses_cold_for_recall_id_past_top_k():
+    """A recall id whose live row ranked past top_k still suppresses the cold copy.
+
+    `suppress_ids` carries the id even though no corresponding row is in
+    `recall_matches` (it was capped out), so the stale cold copy is dropped.
+    """
+    cold = [{"id": "x", "score": 0.1, "metadata": {"stale": True}}]
+    merged = v1q._merge_recall_and_cold({"x"}, [], cold, top_k=10)
+    assert [m["id"] for m in merged] == [], merged
+
+
 def test_merge_tombstone_and_live_mix():
     """A tombstone suppresses while a live recall row for another id wins."""
-    recall_rows = [
-        {"id": "del", "score": 0.0, "metadata": {}, "deleted": True},
+    suppress = {"del", "upd"}
+    recall_matches = [
         {"id": "upd", "score": 4.0, "metadata": {"v": 2}, "deleted": False},
     ]
     cold = [
-        {"id": "del", "score": 0.1, "metadata": {}},   # suppressed
-        {"id": "upd", "score": 0.2, "metadata": {"v": 1}},  # overridden
+        {"id": "del", "score": 0.1, "metadata": {}},   # suppressed (tombstone)
+        {"id": "upd", "score": 0.2, "metadata": {"v": 1}},  # overridden (live)
         {"id": "cold_only", "score": 3.0, "metadata": {}},
     ]
-    merged = v1q._merge_recall_and_cold(recall_rows, cold, top_k=10)
+    merged = v1q._merge_recall_and_cold(suppress, recall_matches, cold, top_k=10)
     by_id = {m["id"]: m for m in merged}
     assert "del" not in by_id
     assert by_id["upd"]["metadata"] == {"v": 2} and by_id["upd"]["score"] == 4.0
@@ -174,13 +209,13 @@ def test_merge_tombstone_and_live_mix():
 
 def test_merge_truncates_to_top_k():
     """The union is sorted ascending and truncated to top_k."""
-    recall_rows = [{"id": "r", "score": 2.5, "metadata": {}, "deleted": False}]
+    recall_matches = [{"id": "r", "score": 2.5, "metadata": {}, "deleted": False}]
     cold = [
         {"id": "c1", "score": 1.0, "metadata": {}},
         {"id": "c2", "score": 2.0, "metadata": {}},
         {"id": "c3", "score": 3.0, "metadata": {}},
     ]
-    merged = v1q._merge_recall_and_cold(recall_rows, cold, top_k=2)
+    merged = v1q._merge_recall_and_cold({"r"}, recall_matches, cold, top_k=2)
     assert [m["id"] for m in merged] == ["c1", "c2"]
 
 
@@ -212,10 +247,13 @@ def test_run_query_union_merges_recall_and_cold(union_on, monkeypatch):
 
     def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
         captured["watermark"] = watermark
-        return [
-            {"id": "cold", "score": 2.0, "metadata": {"c": 2}, "deleted": False},
-            {"id": "fresh", "score": 1.0, "metadata": {}, "deleted": False},
-        ]
+        return (
+            {"cold", "fresh"},
+            [
+                {"id": "cold", "score": 2.0, "metadata": {"c": 2}, "deleted": False},
+                {"id": "fresh", "score": 1.0, "metadata": {}, "deleted": False},
+            ],
+        )
 
     monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
     monkeypatch.setattr(v1q, "recall_search", _fake_recall)
@@ -229,6 +267,67 @@ def test_run_query_union_merges_recall_and_cold(union_on, monkeypatch):
     assert [m["id"] for m in out["matches"]] == ["fresh", "cold"]
 
 
+def test_run_query_union_filter_failing_live_recall_suppresses_stale_cold(
+    union_on, monkeypatch
+):
+    """P1 regression: a live re-upsert that fails the filter hides its stale cold copy.
+
+    cold X `{color: red}` (passes filter `{color: red}`); recall live X
+    `{color: blue}` (fails the filter), `lsn > watermark`. A query `{color: red}`
+    must NOT return X — recall is authoritative and X's current version no longer
+    matches the filter, so the stale, filter-matching cold copy must not leak.
+    """
+    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+        # Cold shard still holds the OLD X (color=red), which DOES pass the filter.
+        return (
+            [
+                {"id": "X", "score": 0.1, "metadata": {"color": "red"}},
+                {"id": "Y", "score": 0.5, "metadata": {"color": "red"}},
+            ],
+            "cold",
+        )
+
+    def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
+        # X re-upserted as color=blue → fails {color: red} → NOT a match, but it
+        # IS above the watermark so it suppresses the stale cold X.
+        return ({"X"}, [])
+
+    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
+    monkeypatch.setattr(v1q, "recall_search", _fake_recall)
+
+    out = v1q.run_query("t1", _parsed(flt={"color": "red"}))
+    ids = [m["id"] for m in out["matches"]]
+    assert "X" not in ids, "stale cold X must be suppressed by the live recall re-upsert"
+    assert ids == ["Y"], out
+
+
+def test_run_query_union_live_recall_past_top_k_suppresses_stale_cold(
+    union_on, monkeypatch
+):
+    """A filter-passing live recall row ranked past `top_k` still hides stale cold X.
+
+    The recall row for X is above the watermark (so it suppresses) but ranked past
+    `top_k` within recall, so it is not in the returned matches. The stale cold X
+    must not surface in its place.
+    """
+    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+        # Stale cold X ranks well within the final top_k by COLD distance.
+        return ([{"id": "X", "score": 0.05, "metadata": {}}], "cold")
+
+    def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
+        # X is above the watermark (suppresses) but its live row ranked past
+        # top_k within recall, so it contributed no match.
+        return ({"X"}, [])
+
+    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
+    monkeypatch.setattr(v1q, "recall_search", _fake_recall)
+
+    out = v1q.run_query("t1", _parsed(top_k=1))
+    assert [m["id"] for m in out["matches"]] == [], out
+
+
 def test_run_query_union_no_shard_returns_recall_synchronously(union_on, monkeypatch):
     """No cold shard + recall has data → SYNCHRONOUS recall result, NOT ephemeral.
 
@@ -240,7 +339,10 @@ def test_run_query_union_no_shard_returns_recall_synchronously(union_on, monkeyp
 
     def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
         assert watermark == 0, "no shard → watermark 0 → all recall rows qualify"
-        return [{"id": "just-written", "score": 0.0, "metadata": {}, "deleted": False}]
+        return (
+            {"just-written"},
+            [{"id": "just-written", "score": 0.0, "metadata": {}, "deleted": False}],
+        )
 
     monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
     monkeypatch.setattr(v1q, "recall_search", _fake_recall)
@@ -257,7 +359,7 @@ def test_run_query_union_no_shard_no_recall_falls_back_to_ephemeral(union_on, mo
         v1q, "_hot_search",
         lambda *a, **k: None,
     )
-    monkeypatch.setattr(v1q, "recall_search", lambda *a, **k: [])
+    monkeypatch.setattr(v1q, "recall_search", lambda *a, **k: (set(), []))
     published = {}
     monkeypatch.setattr(v1q, "publish", lambda topic, msg: published.update({"topic": topic, "msg": msg}))
 
@@ -384,11 +486,13 @@ class _FakeRecallConn:
         pass
 
 
-def test_recall_search_applies_filter_to_live_rows_keeps_tombstones(monkeypatch):
-    """The AND-of-equals filter is applied to LIVE rows; tombstones pass through.
+def test_recall_search_filter_gates_matches_not_suppression(monkeypatch):
+    """The filter decides MATCHES; every recall id above the watermark suppresses.
 
-    A live row failing the filter is dropped; a live row matching it is kept; a
-    tombstone is returned regardless (it must still suppress a cold id).
+    A live row matching the filter is a MATCH; a live row FAILING the filter is
+    NOT a match but is STILL in `suppress_ids`; a tombstone is in `suppress_ids`
+    but never a match. This is the P1 fix: suppression keys on "any recall row
+    for this id", not "a recall row that became a match".
     """
     import adapters.state.state as state_mod
 
@@ -401,14 +505,17 @@ def test_recall_search_applies_filter_to_live_rows_keeps_tombstones(monkeypatch)
     cur = _FakeRecallCursor(rows)
     monkeypatch.setattr(state_mod, "_recall_conn", lambda: _FakeRecallConn(cur))
 
-    out = state_mod.recall_search(
+    suppress_ids, matches = state_mod.recall_search(
         "t1", "ds", [0.0, 0.0], top_k=10, watermark=5, flt={"lang": "en"}
     )
-    by_id = {r["id"]: r for r in out}
+    by_id = {r["id"]: r for r in matches}
+    # MATCHES: only the filter-passing live row.
     assert "match" in by_id and by_id["match"]["deleted"] is False
-    assert "nomatch" not in by_id, "live row failing the filter must be dropped"
-    assert "tomb" in by_id and by_id["tomb"]["deleted"] is True, (
-        "a tombstone must be returned regardless of the filter so it can suppress"
+    assert "nomatch" not in by_id, "a live row failing the filter is not a match"
+    assert "tomb" not in by_id, "a tombstone is never a match"
+    # SUPPRESSION: EVERY id above the watermark, regardless of filter/deleted.
+    assert suppress_ids == {"match", "nomatch", "tomb"}, (
+        "a filtered-out live row AND a tombstone must both suppress their cold id"
     )
     # The watermark + partition are bound into the SQL.
     sql, params = cur.executed
@@ -439,41 +546,42 @@ def test_recall_search_squares_pgvector_distance(monkeypatch):
     assert "power(embedding <-> %s, 2)" in sql, "recall score must be L2-SQUARED"
 
 
-def test_recall_search_truncates_live_rows_to_top_k(monkeypatch):
-    """At most `top_k` LIVE rows are returned (the closest, by distance order)."""
+def test_recall_search_truncates_live_matches_to_top_k(monkeypatch):
+    """At most `top_k` LIVE rows are MATCHES (the closest, by distance order)."""
     import adapters.state.state as state_mod
 
     rows = [
         ("a", 1.0, {}, False),
         ("b", 2.0, {}, False),
-        ("c", 3.0, {}, False),  # beyond top_k=2 → dropped
+        ("c", 3.0, {}, False),  # beyond top_k=2 → not a match (but suppresses)
     ]
     cur = _FakeRecallCursor(rows)
     monkeypatch.setattr(state_mod, "_recall_conn", lambda: _FakeRecallConn(cur))
-    out = state_mod.recall_search("t", "d", [0.0], top_k=2, watermark=0)
-    assert [r["id"] for r in out] == ["a", "b"]
+    suppress_ids, matches = state_mod.recall_search("t", "d", [0.0], top_k=2, watermark=0)
+    assert [r["id"] for r in matches] == ["a", "b"]
+    # `c` ranked past top_k → not a match, but STILL suppresses its stale cold id.
+    assert suppress_ids == {"a", "b", "c"}
 
 
-def test_recall_search_returns_tombstone_beyond_top_k_live_rows(monkeypatch):
-    """A tombstone further out than `top_k` live rows is STILL returned.
+def test_recall_search_returns_match_and_suppresses_past_top_k_and_tombstones(monkeypatch):
+    """Matches are capped at `top_k` live rows; suppression covers EVERYTHING.
 
-    Correctness: a tombstone's recall embedding can differ from the cold shard's
-    consolidated embedding for the same id, so we cannot assume the cold match
-    ranks beyond `top_k` just because the tombstone does. The scan must not stop
-    after `top_k` live rows — it keeps collecting tombstones for suppression.
+    Correctness: a live row past `top_k` or a far-out tombstone has a recall
+    embedding that can differ from the cold shard's consolidated embedding for the
+    same id, so its stale cold copy could rank within the final `top_k` by COLD
+    distance — it must be suppressed. The scan never stops early; `suppress_ids`
+    holds every id above the watermark.
     """
     import adapters.state.state as state_mod
 
     rows = [
         ("live1", 1.0, {}, False),
         ("live2", 2.0, {}, False),
-        ("live3", 3.0, {}, False),   # beyond top_k=2 → dropped (not a match)
-        ("tomb", 9.0, {}, True),     # far out, but MUST be returned to suppress
+        ("live3", 3.0, {}, False),   # beyond top_k=2 → not a match, but suppresses
+        ("tomb", 9.0, {}, True),     # far out, never a match, but suppresses
     ]
     cur = _FakeRecallCursor(rows)
     monkeypatch.setattr(state_mod, "_recall_conn", lambda: _FakeRecallConn(cur))
-    out = state_mod.recall_search("t", "d", [0.0], top_k=2, watermark=0)
-    by_id = {r["id"]: r for r in out}
-    assert set(by_id) == {"live1", "live2", "tomb"}, out
-    assert by_id["tomb"]["deleted"] is True
-    assert "live3" not in by_id, "live rows past top_k are not returned"
+    suppress_ids, matches = state_mod.recall_search("t", "d", [0.0], top_k=2, watermark=0)
+    assert [r["id"] for r in matches] == ["live1", "live2"], matches
+    assert suppress_ids == {"live1", "live2", "live3", "tomb"}, suppress_ids

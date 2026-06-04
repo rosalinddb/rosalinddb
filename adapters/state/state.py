@@ -1209,15 +1209,30 @@ def recall_search(
     top_k: int,
     watermark: int,
     flt: Optional[dict] = None,
-) -> List[dict]:
+) -> Tuple[set, List[dict]]:
     """Brute-force exact L2 search of the recall tier above `watermark`.
 
-    Returns up to `top_k` rows as dicts `{"id", "score", "metadata", "deleted"}`,
-    ascending by `score`, where `score` is the FAISS-aligned **L2-squared**
-    distance — pgvector's `<->` (plain Euclidean L2) SQUARED, so it can be merged
-    directly with the cold shard's FAISS L2² distances. Both tiers store the same
-    UN-normalised vectors, so squaring is the only alignment needed (the most
-    likely silent ranking bug — it has a dedicated test).
+    Returns `(suppress_ids, matches)`:
+
+      - `suppress_ids` — the set of EVERY recall id above the watermark (every
+        live row AND every tombstone), regardless of the filter and regardless of
+        `top_k`. Recall is authoritative for any id with `lsn > watermark`, so the
+        merge uses this set to drop the stale cold copy of that id unconditionally
+        (live-but-filtered-out, ranked-past-top_k, and tombstoned ids all
+        suppress their cold twin). Keying suppression on "any recall row for this
+        id" — not "a recall row that became a match" — is the fix for the leak
+        where a re-upsert that fails the filter (or ranks past `top_k`) let a
+        stale cold copy survive.
+      - `matches` — up to `top_k` filter-passing LIVE rows as dicts
+        `{"id", "score", "metadata", "deleted"}`, ascending by `score`, the
+        candidate recall MATCHES. Tombstones are NEVER matches; a live row that
+        fails the filter is NOT a match (it only suppresses, via `suppress_ids`).
+
+    `score` is the FAISS-aligned **L2-squared** distance — pgvector's `<->` (plain
+    Euclidean L2) SQUARED, so it can be merged directly with the cold shard's
+    FAISS L2² distances. Both tiers store the same UN-normalised vectors, so
+    squaring is the only alignment needed (the most likely silent ranking bug —
+    it has a dedicated test).
 
     Scope (I1 partition + I3 watermark pairing):
       WHERE tenant_id=? AND dataset=? AND lsn > :watermark
@@ -1226,18 +1241,14 @@ def recall_search(
     `consolidated_lsn` of the shard the cold search ACTUALLY resolved (the caller
     pairs them), never a watermark read independently.
 
-    Tombstones are NOT filtered out here: a `deleted=true` row above the
-    watermark is returned (with `deleted=True`) so the caller can suppress a
-    matching consolidated id. Only LIVE rows are eligible to BE a match; that
-    distinction is made by the caller during the merge.
-
     The metadata `filter` (AND-of-equals, same semantics as the cold path's
     `metadata_matches_filter`) is applied to LIVE rows in Python after the scan,
     NOT pushed into SQL — the recall set is small by construction (bounded by
     consolidation cadence, not data size) so an exact scan + Python filter is
     sub-millisecond and keeps the equality semantics byte-identical to the cold
-    path (exact type+value, no JSONB coercion surprises). A tombstone is returned
-    regardless of the filter so a delete always suppresses its consolidated id.
+    path (exact type+value, no JSONB coercion surprises). The filter gates only
+    whether a live row becomes a MATCH; it never removes an id from
+    `suppress_ids`.
 
     Only ever called when `recall_enabled()` is True (the query path gates it),
     so it never runs — and never opens a recall connection — with the flag off.
@@ -1249,11 +1260,12 @@ def recall_search(
     # is bound TWICE — once for the score expression, once for the ORDER BY — so
     # the same literal drives both.
     #
-    # No SQL `LIMIT`: tombstones must ALL be returned for suppression (a tombstone
-    # past the top_k-th live row can still suppress a cold id — see the loop
-    # below), and the live-row `top_k` truncation happens in Python. The recall
-    # set is small by construction (bounded by consolidation cadence, not data
-    # size — §Recall search), so materialising the whole partition is cheap.
+    # No SQL `LIMIT`: EVERY id above the watermark must enter `suppress_ids` (a
+    # tombstone, a filtered-out live row, or a live row past the top_k-th — each
+    # still suppresses its stale cold twin, see below), and the live-row `top_k`
+    # truncation of the MATCH list happens in Python. The recall set is small by
+    # construction (bounded by consolidation cadence, not data size — §Recall
+    # search), so materialising the whole partition is cheap.
     with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -1270,40 +1282,46 @@ ORDER BY embedding <-> %s ASC
         rows = cur.fetchall()
 
     flt = flt or {}
-    out: List[dict] = []
+    # `suppress_ids`: EVERY id above the watermark. Recall is authoritative for
+    # `lsn > watermark`, so the stale cold copy of any such id is always dropped —
+    # whether the recall row is a tombstone, fails the filter, or ranks past
+    # `top_k`. The cold id's FAISS distance is over the CONSOLIDATED embedding,
+    # which may differ from the (stale) recall embedding, so we cannot assume the
+    # cold match ranks beyond `top_k` just because the recall row does. Built
+    # WITHOUT the filter and WITHOUT the top_k cap on purpose.
+    suppress_ids: set = set()
+    matches: List[dict] = []
     live_count = 0
     for rid, score, metadata, deleted in rows:
-        # `metadata` is JSONB → psycopg2 already decodes it to a Python dict.
-        meta = metadata if isinstance(metadata, dict) else (metadata or {})
+        # `metadata` is JSONB → psycopg2 decodes it to a Python dict (or None for
+        # a SQL NULL); coalesce None to `{}`.
+        meta = metadata or {}
+        # Every recall row for this id suppresses its cold twin (live OR
+        # tombstone, filter-matching OR not, within top_k OR not).
+        suppress_ids.add(rid)
         if deleted:
-            # A tombstone is ALWAYS returned (it suppresses a consolidated id),
-            # regardless of the filter and regardless of `top_k`. We do NOT stop
-            # the scan after `top_k` live rows: a tombstone further out in the
-            # distance ordering must still suppress its cold id — the cold id's
-            # FAISS distance is computed over the CONSOLIDATED embedding, which
-            # may differ from this tombstone's (stale) recall embedding, so we
-            # cannot assume the cold match ranks beyond `top_k` just because the
-            # tombstone does. The recall set is small by construction, so the full
-            # scan for tombstones is cheap.
-            out.append(
-                {"id": rid, "score": float(score), "metadata": meta, "deleted": True}
-            )
+            # A tombstone is NEVER a match (a deleted vector must not appear); it
+            # only suppresses (already recorded above). Keep scanning.
             continue
-        # Live row past the top_k closest survivors: it cannot be a match (the
-        # `top_k` closer live rows already beat it) AND it is not a tombstone, so
-        # it has no effect on the merge — skip it. Keep scanning for tombstones.
+        # Live row past the top_k closest survivors: it cannot be a MATCH (the
+        # `top_k` closer live rows already beat it). It has already suppressed its
+        # cold twin, so skip it as a candidate and keep scanning.
         if live_count >= top_k:
             continue
-        # Live row: apply the AND-of-equals filter. A null/empty filter matches
-        # everything. The predicate must match `metadata_matches_filter` exactly
-        # (type+value, no coercion), so reuse that logic.
+        # Live row: apply the AND-of-equals filter to decide whether it is a
+        # MATCH. A live row that fails the filter is NOT a match — but it has
+        # ALREADY been added to `suppress_ids`, so the stale cold copy of its id
+        # is still dropped (the P1 fix: an authoritative live re-upsert that fails
+        # the query filter must not let a stale, filter-matching cold copy leak).
+        # The predicate must match `metadata_matches_filter` exactly (type+value,
+        # no coercion), so reuse that logic.
         if flt and not _metadata_matches_filter(meta, flt):
             continue
-        out.append(
+        matches.append(
             {"id": rid, "score": float(score), "metadata": meta, "deleted": False}
         )
         live_count += 1
-    return out
+    return suppress_ids, matches
 
 
 def _metadata_matches_filter(metadata: dict, flt: dict) -> bool:
