@@ -39,12 +39,11 @@ def state(monkeypatch):
 class _FakeCur:
     """Records executed SQL/params; returns a scripted row set / fetchone.
 
-    `recall_search` / `recall_list_rows` now issue TWO scans each — a
-    `NOT deleted` LIVE/MATCH scan and a separate full SUPPRESS scan — so the fake
-    projects the scripted partition rows to the columns the CURRENT statement
-    selects: the SUPPRESS scan (`SELECT id ...`) yields `(id,)` for EVERY row, the
-    LIVE list scan (`SELECT id, metadata ...`) yields `(id, metadata)` for
-    not-deleted rows only. Each scripted row is `(id, metadata, deleted)`.
+    `recall_search` / `recall_list_rows` are now SINGLE-SNAPSHOT — ONE scan each
+    over `lsn > W` returning every row (live AND tombstoned) with its `deleted`
+    flag, split in Python (task #17 / #30). So `recall_list_rows`'s one scan
+    (`SELECT id, deleted, metadata ...`) yields `(id, deleted, metadata)` for
+    EVERY row. Each scripted partition row is `(id, metadata, deleted)`.
     """
 
     def __init__(self, rows=None, seq_start=0):
@@ -73,12 +72,10 @@ class _FakeCur:
 
     def fetchall(self):
         sql = self._last_sql
-        # SUPPRESS scan: `SELECT id FROM recall_vectors WHERE ...` — every id.
-        if "SELECT id\nFROM recall_vectors" in sql:
-            return [(rid,) for rid, _meta, _del in self._rows]
-        # LIVE list scan: `SELECT id, metadata ... AND NOT deleted ...` — not-deleted.
-        if "SELECT id, metadata" in sql and "NOT deleted" in sql:
-            return [(rid, meta) for rid, meta, deleted in self._rows if not deleted]
+        # `recall_list_rows` single scan: `SELECT id, deleted, metadata ...` — the
+        # FULL partition above the watermark, split (live / suppress) in Python.
+        if "SELECT id, deleted, metadata" in sql:
+            return [(rid, deleted, meta) for rid, meta, deleted in self._rows]
         # Fallback: the raw scripted rows (point-lookup style helpers).
         return list(self._rows)
 
@@ -202,11 +199,60 @@ def test_get_vector_with_embedding_absent(state, monkeypatch):
     assert status is None and meta is None and emb is None
 
 
-# --- recall_list_rows ------------------------------------------------------
+# --- recall_list_rows (single-snapshot, task #30 — the b1 twin) -----------
+
+
+def test_list_rows_runs_exactly_one_execute(state, monkeypatch):
+    """The list scan is ONE `cur.execute` — the structural fix for the b1 twin.
+
+    The old shape ran TWO `cur.execute`s (a `NOT deleted` LIVE scan + a separate
+    full SUPPRESS scan) in two READ COMMITTED snapshots, which is exactly what let
+    a between-scan re-UPSERT over-suppress: the SUPPRESS scan saw an id the LIVE
+    scan missed, so the call site dropped the cold copy AND appended no recall live
+    row — the record transiently VANISHED from the list. Asserting a single
+    execute is the deterministic regression: one statement is one MVCC snapshot, so
+    `suppress_ids ⊇ live_ids` always holds.
+    """
+    cur = _wire(state, monkeypatch, rows=[])
+    state.recall_list_rows("t", "ds", watermark=0)
+    scan_calls = [c for c in cur.calls if "recall_vectors" in c[0]]
+    assert len(scan_calls) == 1, (
+        f"recall_list_rows must drive the scan with EXACTLY one execute "
+        f"(the single-snapshot fix); saw {len(scan_calls)}: "
+        f"{[s for s, _ in scan_calls]}"
+    )
+
+
+def test_list_rows_scan_selects_deleted_in_one_statement(state, monkeypatch):
+    """The single statement scopes to `(tenant, dataset)` AND `lsn > W` and
+    SELECTs `deleted` so tombstones are split out in Python (not in SQL).
+
+    The one scan must carry the partition + watermark predicate itself (no second
+    statement), and it must return `deleted` so suppression is derived from EVERY
+    row while only not-deleted rows become live — keeping tombstone-suppress
+    correct without re-deriving suppression from the live subset alone.
+    """
+    cur = _wire(state, monkeypatch, rows=[])
+    state.recall_list_rows("ten", "data", watermark=42)
+    scan_calls = [c for c in cur.calls if "recall_vectors" in c[0]]
+    (sql, params) = scan_calls[0]
+    assert "tenant_id" in sql and "dataset" in sql
+    assert "lsn > %s" in sql, "scan must filter lsn > watermark"
+    assert "deleted" in sql, "scan must SELECT `deleted` to split tombstones in Python"
+    # No `NOT deleted` WHERE clause — the split is by the Python `deleted` flag.
+    assert "NOT deleted" not in sql, (
+        "the single scan returns ALL rows; the live/suppress split is in Python"
+    )
+    assert params == ("ten", "data", 42)
 
 
 def test_list_rows_live_and_suppress(state, monkeypatch):
-    """Live rows return; suppress_ids includes EVERY id above the watermark."""
+    """Live rows return; suppress_ids includes EVERY id above the watermark.
+
+    From ONE snapshot: `suppress_ids` is every id (live AND tombstoned), `live`
+    is only the not-deleted subset, so `suppress_ids ⊇ live_ids` always — the
+    union-completeness guarantee the b1-twin race violated.
+    """
     cur = _wire(
         state,
         monkeypatch,
@@ -223,8 +269,32 @@ def test_list_rows_live_and_suppress(state, monkeypatch):
     assert by_id["live2"]["metadata"] == {}
     # suppress carries the tombstone too (recall-authoritative for all ids).
     assert suppress == {"live1", "tomb1", "live2"}
+    # The completeness invariant: every live id is also a suppress id.
+    assert {r["id"] for r in live} <= suppress
     sql, params = cur.calls[-1]
     assert "lsn > %s" in sql and params == ("t", "ds", 9)
+
+
+def test_list_rows_reupserted_live_id_is_listed_and_suppresses(state, monkeypatch):
+    """A re-upserted (live, cross-watermark) id is listed AND suppresses its twin.
+
+    The b1-twin failure was a live, above-watermark id ending up in `suppress_ids`
+    but NOT in `live` (the cold copy dropped, no recall row appended → the record
+    vanished). From a single snapshot a live id is ALWAYS both.
+    """
+    _wire(state, monkeypatch, rows=[("re", {"v": "fresh"}, False)])
+    live, suppress = state.recall_list_rows("t", "ds", watermark=3)
+    assert [r["id"] for r in live] == ["re"], "a live id above the watermark is listed"
+    assert live[0]["metadata"] == {"v": "fresh"}, "recall metadata wins"
+    assert "re" in suppress, "and it suppresses its stale cold twin"
+
+
+def test_list_rows_tombstone_suppresses_cold_twin_and_is_not_listed(state, monkeypatch):
+    """A tombstone suppresses its cold twin and is NEVER listed as a live row."""
+    _wire(state, monkeypatch, rows=[("dead", {"stale": True}, True)])
+    live, suppress = state.recall_list_rows("t", "ds", watermark=0)
+    assert live == [], "a tombstone is never a live list row"
+    assert suppress == {"dead"}, "but it hides its cold copy from the list"
 
 
 def test_list_rows_empty_partition(state, monkeypatch):
@@ -286,11 +356,12 @@ def test_delete_never_flips_in_place(state, monkeypatch):
 def test_delete_placeholder_embedding_matches_dimension(state, monkeypatch):
     """A cold-only delete's tombstone gets a zero placeholder of the dataset dim.
 
-    `recall_search` now excludes tombstones from its MATCH scan in SQL, so the
-    placeholder is never ranked against a query vector — its dimension is a
-    belt-and-suspenders match for the `NOT NULL vector` column rather than a
-    search-ranking correctness dependency. The helper still writes a zero-vector
-    of the dataset dimension.
+    `recall_search`'s single-snapshot scan ranks ALL rows (live AND tombstoned)
+    by `ORDER BY embedding <-> q`, so the placeholder zero-vector IS fed to
+    pgvector's `<->` — its dimension MUST match the `NOT NULL vector` column or the
+    operator raises a dimension-mismatch error (a real correctness dependency).
+    The tombstone still never becomes a MATCH (the Python split skips it via
+    `if deleted`). The helper writes a zero-vector of the dataset dimension.
     """
     cur = _wire(state, monkeypatch, seq_start=0)
     state.recall_delete_vector("t", "ds", "x", dimension=4)

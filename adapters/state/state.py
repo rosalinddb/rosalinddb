@@ -1735,43 +1735,71 @@ def recall_list_rows(
     Scope (I1 + I3): `WHERE tenant_id=? AND dataset=? AND lsn > :watermark`. The
     recall set is small by construction (consolidation-bounded), so materialising
     the whole partition is cheap. Only ever called when `recall_enabled()` is True.
+
+    SINGLE-SNAPSHOT SCAN — `live_rows` and `suppress_ids` come from ONE SQL
+    statement (task #30, the b1 twin on the LIST path). They are NOT two separate
+    scans: they are derived in Python from the rows of a SINGLE SELECT over
+    `lsn > watermark`. This is load-bearing for correctness, not a style choice,
+    and mirrors what `recall_search` does on the query path (task #17):
+
+      - The old shape ran TWO statements on a default READ COMMITTED recall
+        connection — (a) a LIVE scan (`... AND NOT deleted ...`), then (b) a
+        SUPPRESS scan over all ids. Under READ COMMITTED EACH `cur.execute` takes
+        a FRESH MVCC snapshot, so a re-UPSERT that COMMITS BETWEEN scan (a) and
+        scan (b) makes (b) observe ids that (a) never saw → `suppress_ids ⊋
+        live_ids`. At the call site (`services/source_registry/main.py` list
+        endpoint) the cold copy of that id is DROPPED (it is in `suppress_ids`)
+        AND no recall live row is appended (the live scan missed it), so the
+        record transiently VANISHES from the list — the identical b1 over-
+        suppression race, on the list path.
+      - A SINGLE SELECT is evaluated against ONE MVCC snapshot EVEN UNDER READ
+        COMMITTED (a statement-level snapshot is taken once, at statement start,
+        and is stable for the whole statement). So `suppress_ids` (every returned
+        id) and `live_rows` (the not-deleted subset) are split from the SAME
+        consistent row set — `suppress_ids ⊇ live_ids` ALWAYS holds, no concurrent
+        commit can wedge between them. That is precisely what eliminates the race.
+
+    The scan returns `(id, deleted, metadata)` so the tombstone/live split is done
+    in Python BY THE EXPLICIT `deleted` FLAG, not by a `... AND NOT deleted`
+    clause. Splitting on the flag (rather than re-deriving suppression from the
+    live scan alone) is what keeps tombstone-suppress correct: deriving
+    `suppress_ids` from only the live rows would re-open the tombstone leak (a
+    tombstone would no longer hide its stale cold twin). Every returned id —
+    live AND tombstoned — suppresses; only `deleted = false` rows become
+    `live_rows`.
     """
-    # TWO SEPARATE SCANS, mirroring `recall_search`'s split — DO NOT collapse them
-    # into one "all rows then skip `deleted` in Python" scan:
-    #   (a) the LIVE scan — `... AND NOT deleted ...` — yields only the rows the
-    #       list union surfaces, so a tombstone's placeholder embedding/metadata
-    #       can never leak into `live_rows` as a property of the QUERY, not of a
-    #       Python-side skip.
-    #   (b) the SUPPRESS scan — every id above the watermark (live AND tombstoned)
-    #       — preserves tombstone-suppress EXACTLY: a tombstone HIDES the cold id
-    #       from the list, a live recall row replaces the cold copy.
+    # ONE statement, ONE MVCC snapshot. Select every row above the watermark with
+    # its `deleted` flag and split it in Python: `suppress_ids` = every id (live
+    # AND tombstoned), `live_rows` = the not-deleted subset. DO NOT split this back
+    # into two scans — two `cur.execute`s are two READ COMMITTED snapshots and a
+    # between-scan commit re-opens the b1-twin over-suppression race (see docstring
+    # / `recall_search`, which is now single-snapshot too).
     with recall_pooled_conn() as conn, conn.cursor() as cur:
-        # (a) LIVE scan: not-deleted rows only.
         cur.execute(
             """
-SELECT id, metadata
-FROM recall_vectors
-WHERE tenant_id = %s AND dataset = %s AND NOT deleted AND lsn > %s
-            """,
-            (tenant_id, dataset, watermark),
-        )
-        live_db_rows = cur.fetchall()
-        # (b) SUPPRESS scan: EVERY id above the watermark (live AND tombstoned).
-        cur.execute(
-            """
-SELECT id
+SELECT id, deleted, metadata
 FROM recall_vectors
 WHERE tenant_id = %s AND dataset = %s AND lsn > %s
             """,
             (tenant_id, dataset, watermark),
         )
-        suppress_rows = cur.fetchall()
-    # Every recall id above the watermark suppresses its stale cold twin
-    # (tombstone OR live), exactly as `recall_search` builds `suppress_ids`.
-    suppress_ids: set = {rid for (rid,) in suppress_rows}
-    live_rows: List[dict] = [
-        {"id": rid, "metadata": metadata or {}} for rid, metadata in live_db_rows
-    ]
+        rows = cur.fetchall()
+    # Split the SINGLE snapshot's rows in Python:
+    #   - `suppress_ids` — EVERY returned id (tombstone OR live). Recall is
+    #     authoritative for `lsn > watermark`, so the stale cold twin of any such
+    #     id is dropped, exactly as `recall_search` builds `suppress_ids`. Added
+    #     for every row, before the live/tombstone decision, so a tombstone still
+    #     suppresses its cold copy.
+    #   - `live_rows` — `{"id", "metadata"}` for the `deleted = false` rows only;
+    #     a tombstone's placeholder metadata never leaks into the list. NULL
+    #     metadata (JSONB SQL NULL → None) coalesces to `{}`.
+    suppress_ids: set = set()
+    live_rows: List[dict] = []
+    for rid, deleted, metadata in rows:
+        suppress_ids.add(rid)
+        if deleted:
+            continue
+        live_rows.append({"id": rid, "metadata": metadata or {}})
     return live_rows, suppress_ids
 
 
@@ -1801,12 +1829,15 @@ def recall_delete_vector(
     `dataset.dimension`). A brand-new tombstone — deleting an id present only in
     the COLD tier, with no prior recall row — still needs an `embedding` for the
     `NOT NULL` column, and we write a zero-vector of the dataset dimension so it
-    matches the partition's dimension. NOTE: `recall_search` now EXCLUDES
-    tombstones from its MATCH scan in SQL (`... AND NOT deleted ...`), so the
-    placeholder is never ranked against a query vector and can no longer trigger
-    pgvector's "different vector dimensions" error or crowd out a real match — the
-    placeholder's dimension is now a belt-and-suspenders match for the column, not
-    a correctness dependency of the search ranking. It is never folded into a
+    matches the partition's dimension. NOTE: `recall_search`'s single-snapshot
+    scan ranks ALL rows (live AND tombstoned) by `ORDER BY embedding <-> q`, so the
+    placeholder zero-vector IS still fed to pgvector's `<->` — its dimension MUST
+    match the column or the operator raises pgvector's "different vector
+    dimensions" error (this is a real correctness dependency, not belt-and-
+    suspenders). What a tombstone can NOT do is become a MATCH or crowd out a real
+    live match: the Python split skips tombstones with `if deleted: continue`
+    BEFORE the top_k / live_count logic, so the placeholder never lands in
+    `matches` even though it sorts first by raw distance. It is never folded into a
     shard either (consolidation only `_remove_ids`'s a tombstoned id). On a
     conflict the existing embedding is left untouched.
 
