@@ -1,0 +1,67 @@
+@startuml recall-internal-write
+' SEQUENCE: the synchronous Recall WRITE path IN ISOLATION
+' (services.source_registry.main -> adapters.state.state.recall_upsert_vectors).
+' (a) Allocate an LSN BLOCK from recall_lsn_seq in ONE atomic upsert-increment
+'     (last_lsn = last_lsn + N RETURNING) -- the seq-row lock makes commit-order
+'     == LSN-order, so lsn is strictly monotonic per (tenant, dataset).
+' (b) ONE multi-row UPSERT into recall_vectors, last-write-wins on the PK,
+'     deleted=false. One transaction, committed before returning -> the row is
+'     immediately queryable (read-your-writes). The cap/CONSOLIDATE enqueue is
+'     shown in recall-internal-bounding, not here.
+
+title Recall internals: synchronous write (read-your-writes)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+actor "client" as client
+participant "cp\n(recall_upsert_vectors)" as cp
+database "recall_lsn_seq\n(per (tenant,dataset))" as seq
+database "recall_vectors" as rv
+
+client -> cp : POST /vectors {N records}
+activate cp
+cp -> cp : collapse intra-batch dup ids\n(last input wins) -> N distinct
+
+== one transaction on a dedicated recall connection ==
+
+group atomic LSN block allocation
+  cp -> seq : INSERT .. ON CONFLICT\nDO UPDATE last_lsn = last_lsn + N\nRETURNING last_lsn
+  activate seq
+  note right of seq #FDF3E7
+    Postgres serialises upserts on the
+    single seq row -> commit-order ==
+    LSN-order -> strictly MONOTONIC per
+    (tenant, dataset). Block reserved =
+    last_lsn-N+1 .. last_lsn, assigned
+    in input order.
+  end note
+  seq --> cp : last_lsn
+  deactivate seq
+end
+
+cp -> rv : SINGLE multi-row UPSERT (execute_values)\nON CONFLICT (tenant,dataset,id) DO UPDATE\nembedding, metadata, lsn=EXCLUDED, deleted=FALSE
+activate rv
+note right of rv #E9F7E9
+  Last-write-wins on the PK: a re-sent id
+  overwrites its row with the fresh higher
+  lsn and CLEARS any tombstone (deleted->false).
+  Never a duplicate.
+end note
+rv --> cp : N rows upserted
+deactivate rv
+
+cp -> cp : COMMIT (whole batch all-or-nothing)
+note over cp #E7F3FD
+  Durable in Postgres BEFORE returning ->
+  the rows are IMMEDIATELY queryable.
+  RB_RECALL on -> 200 (sync), not 202.
+end note
+cp --> client : 200 {accepted, rejected, errors}
+deactivate cp
+
+@enduml
