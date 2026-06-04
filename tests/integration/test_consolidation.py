@@ -240,6 +240,21 @@ def _migrate_recall(recall_url):
     state_mod.migrate_recall(force=True)
 
 
+def _write_landing_batch(s3_landing_prefix, tenant, dataset, upload, records):
+    """Land a parquet batch under the dataset's landing prefix (mirrors validator).
+
+    Bulk imports BYPASS recall and land into the cold path. Writing a parquet
+    part under `{LANDING_PREFIX}/{tenant}/{dataset}/...` and then calling
+    `builder.run_once` drives the same `_run_once_locked` bulk-import build a real
+    import (DATASET_READY) would — without going through `POST /vectors` (which,
+    flag-on, writes recall instead).
+    """
+    from adapters.landing.parquet_writer import write_parquet
+
+    prefix = f"{s3_landing_prefix}/{tenant}/{dataset}/upload-{upload}"
+    return write_parquet(prefix, records)
+
+
 # --- I1 + I2: read-your-writes THROUGH a consolidation --------------------
 
 
@@ -273,12 +288,41 @@ def test_read_your_writes_through_consolidation(
     assert out["mode"] == "recall", out
     assert out["matches"][0]["id"] == "fact-1"
 
-    # CONSOLIDATE: fold the recall partition into a cold shard.
-    n = builder.run_consolidate_once("ryw", tenant)
+    # DURING: hook the trim so a query fires at the exact mid-consolidation
+    # instant — AFTER the cold shard + catalog row are committed (the trim only
+    # ever runs post-commit, I2) but BEFORE the recall rows are removed. This is
+    # the one moment a vector lives in BOTH tiers; the union must still return it
+    # exactly once (no visibility gap, no duplicate). A before/after pair would
+    # never exercise this window. The real trim runs after the probe so the test
+    # still ends in the fully-consolidated state.
+    real_trim = builder.recall_trim
+    during = {}
+
+    def _probe_then_trim(t, d, grace):
+        # The shard is already committed at this point.
+        during["shard"] = _state_latest(builder, t, "ryw")
+        during["out"] = _query(client, s["token"], "ryw", [1.0, 0.0, 0.0, 0.0], top_k=2)
+        return real_trim(t, d, grace)
+
+    builder.recall_trim = _probe_then_trim
+    try:
+        # CONSOLIDATE: fold the recall partition into a cold shard.
+        n = builder.run_consolidate_once("ryw", tenant)
+    finally:
+        builder.recall_trim = real_trim
     assert n == 2, "two live recall rows folded"
     shard = _state_latest(builder, tenant, "ryw")
     assert shard["build_type"] == "consolidate"
     assert shard["consolidated_lsn"] == 2
+
+    # The mid-consolidation probe ran AFTER the commit (shard present) and the
+    # vector was visible THROUGH the consolidation — exactly once, no gap.
+    assert during["shard"] is not None and during["shard"]["build_type"] == "consolidate"
+    mid = during["out"]
+    mid_ids = [m["id"] for m in mid["matches"]]
+    assert "fact-1" in mid_ids, f"vector vanished mid-consolidation: {mid}"
+    assert mid_ids.count("fact-1") == 1, f"duplicate mid-consolidation: {mid_ids}"
+    assert set(mid_ids) == {"fact-1", "fact-2"}, mid
 
     # AFTER: still returned — now from the cold shard (mode hot|cold), not lost.
     out = _query(client, s["token"], "ryw", [1.0, 0.0, 0.0, 0.0], top_k=2)
@@ -677,3 +721,200 @@ def test_consolidation_flag_off_noop(
     )
     assert r.status_code == 202, r.text
     assert consume("CONSOLIDATE", block=False) is None, "flag off enqueues no CONSOLIDATE"
+
+
+# --- watermark carry-forward across non-consolidate builds (I1/I4) ---------
+
+
+def test_non_consolidate_build_carries_watermark_forward(
+    monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+):
+    """A bulk import (and a delete) between consolidations must NOT regress the
+    watermark, and a subsequent consolidation's grace trim must still drain.
+
+    Regression guard for the P1 watermark carry-forward: a non-consolidate build
+    (ingest/incremental/delete) that defaulted `consolidated_lsn=0` would reset
+    the per-dataset watermark, making the 2nd-newest shard carry watermark 0 →
+    `recall_trim` deletes nothing → recall stalls (never drains) and the union
+    re-scans already-consolidated rows. We assert the newest shard's watermark
+    never regresses below the consolidation high-water mark, the grace trim still
+    fires on the next consolidation, and the union shows no dup/loss.
+    """
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
+    _migrate_recall(recall_url)
+    _truncate_recall(recall_url)
+
+    client, state_mod, v1q, builder = _build_client(
+        monkeypatch, s3_landing_prefix, s3_indexes_prefix, tmp_path, recall_on=True
+    )
+    s = _signup(client, email="carry@example.com")
+    tenant = _tenant_of(client, s)
+    client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "cw", "dimension": 4})
+
+    # 1. Consolidate to N=2 → cold shard with consolidated_lsn=2.
+    _post_recall(client, s["token"], "cw", [
+        {"id": "a", "values": [1.0, 0.0, 0.0, 0.0], "metadata": {}},
+        {"id": "b", "values": [0.0, 1.0, 0.0, 0.0], "metadata": {}},
+    ])
+    builder.run_consolidate_once("cw", tenant)
+    shard = state_mod.get_latest_shard(tenant, "cw")
+    assert shard["consolidated_lsn"] == 2, shard
+    consolidate_watermark = 2
+
+    # 2. A BULK IMPORT (lands, bypasses recall) builds the next newest shard.
+    #    Pre-fix this committed consolidated_lsn=0 (watermark regression).
+    _write_landing_batch(s3_landing_prefix, tenant, "cw", "imp1", [
+        {"id": f"imp{i}", "values": [0.0, 0.0, float(i + 1), 0.0], "metadata": {}}
+        for i in range(3)
+    ])
+    n = builder.run_once("cw", tenant)
+    assert n == 3 and builder._LAST_BUILD["build_type"] == "incremental"
+    after_import = state_mod.get_latest_shard(tenant, "cw")
+    assert after_import["consolidated_lsn"] >= consolidate_watermark, (
+        "bulk import regressed the watermark: "
+        f"{after_import['consolidated_lsn']} < {consolidate_watermark}"
+    )
+
+    # 3. A DELETE-BY-ID build also produces a new newest shard; it too must carry
+    #    the watermark forward (not reset to 0).
+    builder.run_delete_once("cw", tenant, "imp0")
+    after_delete = state_mod.get_latest_shard(tenant, "cw")
+    assert after_delete["consolidated_lsn"] >= consolidate_watermark, (
+        "delete-by-id regressed the watermark: "
+        f"{after_delete['consolidated_lsn']} < {consolidate_watermark}"
+    )
+
+    # 4. The grace trim must STILL drain on the next consolidation. Write a fresh
+    #    recall row (lsn 3) and consolidate: now the 2nd-newest shard carries a
+    #    watermark >= 2 (not the regressed 0), so the trim deletes the original
+    #    a/b recall rows (lsn 1,2) instead of no-opping.
+    _post_recall(client, s["token"], "cw", [
+        {"id": "c", "values": [0.0, 0.0, 0.0, 1.0], "metadata": {}},
+    ])
+    builder.run_consolidate_once("cw", tenant)
+    remaining = _recall_lsns(recall_url, tenant, "cw")
+    assert 1 not in remaining and 2 not in remaining, (
+        "grace trim STALLED — watermark regression left lsn 1,2 in recall "
+        f"(would never drain): {remaining}"
+    )
+
+    # 5. The union shows no dup/loss: every live id returned exactly once.
+    out = _query(client, s["token"], "cw", [0.0, 0.0, 1.0, 0.0], top_k=10)
+    ids = [m["id"] for m in out["matches"]]
+    # `imp0` was deleted; `a,b,c,imp1,imp2` survive.
+    assert "imp0" not in ids, f"deleted id resurfaced: {ids}"
+    assert set(ids) == {"a", "b", "c", "imp1", "imp2"}, f"dup/loss in union: {ids}"
+    assert len(ids) == len(set(ids)), f"duplicate in union: {ids}"
+
+
+# --- snapshot self-consistency under a concurrent recall writer (I1) -------
+
+
+def test_snapshot_self_consistent_under_concurrent_writer(
+    monkeypatch, recall_url, s3_landing_prefix, s3_indexes_prefix, tmp_path
+):
+    """A row committed concurrently with the snapshot is never dropped (no loss).
+
+    The snapshot is a single MVCC statement (the bound N is derived in a scalar
+    sub-SELECT of the same query), so a write that commits during the snapshot
+    either lands inside the snapshot's max-lsn (folded into the shard) or above it
+    (left in recall, excluded by the trim). It can NEVER be both excluded from the
+    shard AND trimmed from recall. We race a real concurrent recall writer against
+    the snapshot and assert the snapshot+trim loses nothing.
+    """
+    import threading
+
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
+    _migrate_recall(recall_url)
+    _truncate_recall(recall_url)
+
+    client, state_mod, v1q, builder = _build_client(
+        monkeypatch, s3_landing_prefix, s3_indexes_prefix, tmp_path, recall_on=True
+    )
+    s = _signup(client, email="race@example.com")
+    tenant = _tenant_of(client, s)
+    client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "rc", "dimension": 4})
+
+    # Seed an initial batch so a shard + watermark exist.
+    _post_recall(client, s["token"], "rc", [
+        {"id": "seed0", "values": [1.0, 0.0, 0.0, 0.0], "metadata": {}},
+        {"id": "seed1", "values": [0.0, 1.0, 0.0, 0.0], "metadata": {}},
+    ])
+
+    # Direct self-consistency check on the snapshot itself: under a concurrent
+    # writer that commits MANY rows while the snapshot runs, the returned
+    # `max_lsn` must EQUAL the max lsn among the returned rows (single MVCC
+    # snapshot). The old two-statement form (independent `SELECT MAX(lsn)` then
+    # `SELECT ... WHERE lsn <= N`) could return an `N` that does not match the row
+    # set, and every returned row must be `<= max_lsn` with no gap to the bound.
+    stop = threading.Event()
+
+    def _hammer():
+        i = 0
+        while not stop.is_set():
+            state_mod.recall_upsert_vectors(tenant, "rc", [
+                {"id": f"h{i}", "values": [0.0, 0.0, 0.0, float(i + 1)], "metadata": {}},
+            ])
+            i += 1
+
+    hammer = threading.Thread(target=_hammer)
+    hammer.start()
+    try:
+        for _ in range(20):
+            snap_n, snap_rows = state_mod.recall_snapshot_for_consolidation(tenant, "rc")
+            row_max = max((r["lsn"] for r in snap_rows), default=0)
+            assert snap_n == row_max, (
+                f"snapshot bound {snap_n} != max lsn of returned rows {row_max} "
+                "(not a single MVCC snapshot)"
+            )
+            assert all(r["lsn"] <= snap_n for r in snap_rows), "row above the bound"
+    finally:
+        stop.set()
+        hammer.join()
+
+    # Wrap the snapshot so a concurrent writer commits a NEW recall row WHILE the
+    # snapshot statement is in flight. The writer uses a fresh connection (its own
+    # txn); whichever side of the MVCC snapshot it lands on, the row must survive.
+    real_snapshot = state_mod.recall_snapshot_for_consolidation
+    raced = {"id": "racer"}
+
+    def _racing_snapshot(t, d):
+        # Fire the concurrent write just before the snapshot statement runs.
+        def _write():
+            state_mod.recall_upsert_vectors(t, d, [
+                {"id": raced["id"], "values": [0.0, 0.0, 1.0, 0.0], "metadata": {}},
+            ])
+        th = threading.Thread(target=_write)
+        th.start()
+        try:
+            return real_snapshot(t, d)
+        finally:
+            th.join()
+
+    monkeypatch.setattr(builder, "recall_snapshot_for_consolidation", _racing_snapshot)
+
+    # Consolidate with the race in flight, then a SECOND consolidation so the
+    # grace trim definitely fires (the racer, whichever side it landed on, must
+    # not be lost from BOTH tiers).
+    builder.run_consolidate_once("rc", tenant)
+    monkeypatch.setattr(
+        builder, "recall_snapshot_for_consolidation", real_snapshot
+    )
+    # A trailing write guarantees the next snapshot advances and the prior shard
+    # becomes the 2nd-newest, so the grace trim runs.
+    _post_recall(client, s["token"], "rc", [
+        {"id": "tail", "values": [0.0, 0.0, 0.0, 1.0], "metadata": {}},
+    ])
+    builder.run_consolidate_once("rc", tenant)
+    builder.run_consolidate_once("rc", tenant)
+
+    # The racer is NEVER lost: it is either in the cold shard (folded) or still in
+    # recall (above the trim watermark). The union must return it exactly once.
+    out = _query(client, s["token"], "rc", [0.0, 0.0, 1.0, 0.0], top_k=10)
+    ids = [m["id"] for m in out["matches"]]
+    assert raced["id"] in ids, (
+        f"row committed concurrently with the snapshot was LOST from both tiers: {ids}"
+    )
+    assert ids.count(raced["id"]) == 1, f"duplicate of the raced row: {ids}"
+    # All seeded + tail rows survive too — snapshot+trim loses nothing.
+    assert {"seed0", "seed1", "tail"}.issubset(set(ids)), f"loss: {ids}"

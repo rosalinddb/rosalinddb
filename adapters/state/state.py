@@ -1367,14 +1367,25 @@ def recall_snapshot_for_consolidation(
     """Snapshot a recall partition for a consolidation: `(max_lsn, rows)`.
 
     Reads EVERY row for `(tenant, dataset)` — live rows AND tombstones — up to
-    the current `max(lsn) = N`, in a SINGLE transaction so `N` and the rows it
-    bounds are mutually consistent (no row with `lsn > N` is read, no row with
-    `lsn <= N` is missed). The builder folds the live rows into the new shard,
-    applies the tombstones (`deleted=true` ids are removed and never added), and
-    commits the catalog row with `consolidated_lsn = N`.
+    the partition's `max(lsn) = N`, in ONE statement so the bound `N` and the
+    rows it selects come from a SINGLE MVCC snapshot. The bound is derived in a
+    scalar sub-SELECT (`lsn <= (SELECT COALESCE(MAX(lsn),0) FROM recall_vectors
+    WHERE ...)`), so the whole `SELECT` is one statement and the rows are exactly
+    those at or below the max LSN as of that statement's snapshot — self-
+    consistent independent of writer internals (no inter-statement gap, no
+    reliance on the recall-write seq-lock / commit-order==LSN-order coupling).
+    A concurrent write that commits during the snapshot has a higher LSN than the
+    max captured by the sub-SELECT, so it is excluded by the `lsn <=` bound and
+    left in recall — not partly-included and not lost.
+
+    The watermark `N` is then derived from the max LSN of the RETURNED rows (`0`
+    if empty), so it matches the row set exactly and the caller commits the
+    catalog row with `consolidated_lsn = N`. The builder folds the live rows into
+    the new shard, applies the tombstones (`deleted=true` ids are removed and
+    never added), and stamps that watermark.
 
     Returns:
-      - `max_lsn` — the highest LSN in the partition, the watermark the
+      - `max_lsn` — the highest LSN among the returned rows, the watermark the
         consolidation will stamp (`0` when the partition is empty — nothing to
         consolidate).
       - `rows` — `[{"id", "values", "metadata", "lsn", "deleted"}, ...]` for
@@ -1382,33 +1393,29 @@ def recall_snapshot_for_consolidation(
         parsed float list (pgvector's text `vector` literal → `list[float]`);
         `metadata` is the JSONB dict (coalesced to `{}`).
 
-    Bounding the read at the snapshot's own `max(lsn)` — rather than "everything"
-    — means a write that lands AFTER the snapshot (a higher LSN) is left in
-    recall untouched: it is simply not in this consolidation's set, stays
-    queryable via the union (`lsn > consolidated_lsn`), and the next
-    consolidation folds it. This is what makes read-your-writes hold THROUGH a
-    consolidation (I1 + I2).
+    A write that lands AFTER the snapshot (a higher LSN) is left in recall
+    untouched: it is simply not in this consolidation's set, stays queryable via
+    the union (`lsn > consolidated_lsn`), and the next consolidation folds it.
+    This is what makes read-your-writes hold THROUGH a consolidation (I1 + I2).
     """
     with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
-        # Single transaction: take the partition's max LSN, then read every row
-        # at or below it. A concurrent write (higher LSN) is excluded by the
-        # `lsn <= N` bound, so the snapshot is internally consistent.
-        cur.execute(
-            "SELECT COALESCE(MAX(lsn), 0) FROM recall_vectors "
-            "WHERE tenant_id = %s AND dataset = %s",
-            (tenant_id, dataset),
-        )
-        max_lsn = int(cur.fetchone()[0] or 0)
-        if max_lsn == 0:
-            return 0, []
+        # ONE statement: derive the bound N inside the same query via a scalar
+        # sub-SELECT, so N and the selected rows share a single MVCC snapshot. A
+        # concurrent write (higher LSN) is excluded by the `lsn <=` bound, so the
+        # snapshot is internally consistent without depending on transaction
+        # isolation level or on the recall writer's seq-lock allocation order.
         cur.execute(
             """
 SELECT id, embedding, metadata, lsn, deleted
 FROM recall_vectors
-WHERE tenant_id = %s AND dataset = %s AND lsn <= %s
+WHERE tenant_id = %s AND dataset = %s
+  AND lsn <= (
+    SELECT COALESCE(MAX(lsn), 0) FROM recall_vectors
+    WHERE tenant_id = %s AND dataset = %s
+  )
 ORDER BY lsn ASC
             """,
-            (tenant_id, dataset, max_lsn),
+            (tenant_id, dataset, tenant_id, dataset),
         )
         rows: List[dict] = []
         for rid, embedding, metadata, lsn, deleted in cur.fetchall():
@@ -1421,6 +1428,9 @@ ORDER BY lsn ASC
                     "deleted": bool(deleted),
                 }
             )
+    # Derive the watermark from the returned rows so it matches the set exactly
+    # (the rows are ascending by LSN). Empty partition -> 0, nothing to do.
+    max_lsn = rows[-1]["lsn"] if rows else 0
     return max_lsn, rows
 
 
@@ -2653,12 +2663,18 @@ def add_shard(
         subsequent ingest never re-reads previously indexed uploads.
 
     `consolidated_lsn` (migration 008) is the recall-tier watermark: the highest
-    recall LSN folded into this shard. It partitions every vector into exactly
-    one tier — `lsn <= consolidated_lsn` lives in this shard, `lsn >` lives in
-    recall (I1). It is `0` for every non-consolidate build (default-off: a flag-
-    off deploy never sets a non-zero value), and the highest LSN drained for a
-    consolidation. It is written here, at consolidation commit, never per write
-    (the seam lives across two databases — I2's commit-then-trim keeps it safe).
+    recall LSN folded into any shard of this dataset so far (a per-dataset high-
+    water mark). It partitions every vector into exactly one tier —
+    `lsn <= consolidated_lsn` lives in the cold shard, `lsn >` lives in recall
+    (I1). A consolidation advances it to the snapshot's `max(lsn)`; every other
+    build (ingest/incremental/delete) carries the prior newest shard's value
+    forward so the watermark stays monotonic — a non-consolidate fold only
+    touches recall-owned rows (`lsn > watermark`) and must NOT regress it (a
+    regression stalls the grace-trim and re-unions already-consolidated rows).
+    The default `0` is correct only for a dataset's very first shard (no
+    consolidated predecessor) and, with the flag off, for every shard. The value
+    is set here at every build commit, never per recall write (the seam lives
+    across two databases — I2's commit-then-trim keeps it safe).
     """
     uris = list(indexed_landing_uris or [])
     consolidated_lsn = int(consolidated_lsn or 0)
@@ -2734,7 +2750,18 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
 
 
 def list_shards(tenant_id: str, dataset_name: str) -> List[dict]:
-    """Return shards for a `(tenant_id, dataset_name)` sorted newest-first."""
+    """Return shards for a `(tenant_id, dataset_name)` sorted newest-first.
+
+    The ordering must be a TOTAL order: `_grace_watermark` selects `shards[1]`
+    (the 2nd-newest) and `get_latest_shard` selects `shards[0]`, so a tie would
+    make those selections nondeterministic and could mis-bound the grace-trim.
+    Memory mode orders by the monotonic insertion `id` (already total). The
+    Postgres path orders by `created_at DESC` but `created_at` is
+    `TIMESTAMPTZ DEFAULT now()` (transaction-start time), so two shards built in
+    the same transaction window could share it; the `id DESC` tiebreaker (the
+    serial PK, strictly increasing) makes the order provably total and matches
+    memory mode's `id`-desc semantics.
+    """
     if _MEMORY_MODE:
         return [
             dict(r)
@@ -2746,7 +2773,7 @@ def list_shards(tenant_id: str, dataset_name: str) -> List[dict]:
             """
 SELECT * FROM shard_catalog
 WHERE tenant_id=%s AND dataset_name=%s
-ORDER BY created_at DESC
+ORDER BY created_at DESC, id DESC
             """,
             (tenant_id, dataset_name),
         )

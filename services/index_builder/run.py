@@ -624,9 +624,15 @@ def _write_shard(
     status flip + sweep (which differ slightly between build/delete/consolidate).
 
     `consolidated_lsn` (default 0) is the recall-tier watermark stamped on the
-    `shard_catalog` row — the highest recall LSN folded into this shard. Only the
-    consolidation path passes a non-zero value; every other build leaves it 0
-    (default-off: a flag-off deploy never sets it).
+    `shard_catalog` row — the highest recall LSN folded into ANY shard of this
+    dataset so far (a per-dataset high-water mark, not a per-build value). The
+    consolidation path advances it to the snapshot's `max(lsn)`; every other
+    build (ingest/incremental/delete) must CARRY FORWARD the prior newest shard's
+    value (`latest_shard.consolidated_lsn`) so the watermark stays monotonic — a
+    non-consolidate fold only touches recall-owned rows (`lsn > watermark`), so
+    it neither advances nor may regress the watermark. The default 0 applies only
+    to a dataset's very first shard (no consolidated predecessor) and, with the
+    flag off, to every shard (a flag-off deploy never consolidates).
     """
     checksum = hashlib.sha256(blob).hexdigest()
     # Shard filename must be collision-proof: two builds completing in the
@@ -855,6 +861,17 @@ def _run_once_locked(dataset: str, tenant: str) -> int:
                 index_type_str,
                 build_type=build_type,
                 indexed_uris=indexed_uris,
+                # Carry the prior newest shard's recall watermark FORWARD. The
+                # watermark is a per-dataset high-water mark, not a per-build
+                # value: an ingest folds landing parts (recall-tier rows are
+                # `lsn > watermark`, never touched), so it neither consolidates
+                # nor un-consolidates anything and MUST NOT move the watermark.
+                # Defaulting to 0 here would REGRESS it, stalling the grace-trim
+                # (the 2nd-newest shard would carry watermark 0 → `recall_trim`
+                # deletes nothing → recall never drains) and re-unioning already-
+                # consolidated rows on every query. Carrying it forward keeps the
+                # partition honest and the watermark monotonic.
+                consolidated_lsn=int((latest_shard or {}).get("consolidated_lsn", 0) or 0),
             )
         except Exception as exc:  # noqa: BLE001
             update_dataset_status(tenant, dataset, "error", error_message=f"index build: {exc}")
@@ -1003,6 +1020,13 @@ def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
                 index_type_str,
                 build_type="delete",
                 indexed_uris=indexed_uris,
+                # Carry the prior newest shard's recall watermark FORWARD (see
+                # the ingest path): a delete-by-id removes one cold vector but
+                # touches no recall row, so it must not move — let alone regress
+                # to 0 — the per-dataset watermark, or the grace-trim stalls.
+                consolidated_lsn=int(
+                    (latest_shard or {}).get("consolidated_lsn", 0) or 0
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             update_dataset_status(
@@ -1114,9 +1138,11 @@ def _run_consolidate_locked(dataset: str, tenant: str) -> int:
     """
     with build_index_span(tenant=tenant, dataset=dataset):
         # 1. SNAPSHOT the recall partition up to its current max LSN N. The read
-        #    is a single transaction so N and the rows it bounds are consistent;
-        #    a write that lands after this (higher LSN) stays in recall and the
-        #    union keeps serving it (read-your-writes through consolidation).
+        #    is a SINGLE statement (the bound N is derived in a scalar sub-SELECT
+        #    of the same query), so N and the rows it selects come from one MVCC
+        #    snapshot and are self-consistent regardless of the recall writer's
+        #    internals; a write that lands after this (higher LSN) stays in recall
+        #    and the union keeps serving it (read-your-writes through consolidation).
         try:
             max_lsn, recall_rows = recall_snapshot_for_consolidation(tenant, dataset)
         except Exception as exc:  # noqa: BLE001
