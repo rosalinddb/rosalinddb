@@ -7,13 +7,20 @@ exactly one RosalindDB *dataset*.
 Two caveats are load-bearing and called out in the module-level docstring,
 :meth:`search`, and ``integrations/mem0/README.md``:
 
-  1. **L2-squared distance -> similarity.** RosalindDB's ``/v1/query`` returns a
-     raw FAISS L2-squared distance (``score``, *lower is closer*). mem0 expects a
-     *similarity* where *higher is better*. This adapter converts each distance
-     ``d`` to ``1 / (1 + d)``: a strictly decreasing function of ``d``, so the
-     ordering is preserved (smaller distance -> higher similarity), the exact
-     match ``d == 0`` maps to the maximum ``1.0``, and the value is bounded in
-     ``(0, 1]``. We do *not* claim it is a cosine similarity.
+  1. **L2-squared distance -> similarity (NOT cosine-scaled).** RosalindDB's
+     ``/v1/query`` returns a raw FAISS L2-squared distance (``score``, *lower is
+     closer*). mem0 expects a *similarity* where *higher is better*. This adapter
+     converts each distance ``d`` to ``1 / (1 + d)``: a strictly decreasing
+     function of ``d``, so the ordering is preserved (smaller distance -> higher
+     similarity), the exact match ``d == 0`` maps to the maximum ``1.0``, and the
+     value is bounded in ``(0, 1]``. We do *not* claim it is a cosine similarity.
+
+     **Threshold caveat:** because this scale is *not* cosine, mem0's hard-coded,
+     cosine-tuned thresholds (the dedup gate ``>= 0.95`` and the search-result
+     gate, default ``0.1``) behave differently here than with a cosine store. To
+     keep them meaningful, **normalize embeddings to unit length** (then
+     ``L2^2 = 2(1 - cos)``, so ``d`` — and thus ``1/(1+d)`` — is monotonic in
+     cosine distance) and/or tune those mem0 thresholds. See ``README.md``.
 
   2. **Filters are exhaustive server-side, and read-your-writes needs RB_RECALL.**
      mem0's flat ``user_id`` / ``agent_id`` / ``run_id`` filters pass straight
@@ -175,25 +182,68 @@ class RosalindDB(VectorStoreBase):
         """Update = re-upsert the id (last-write-wins).
 
         RosalindDB ``POST .../vectors`` is an upsert, so an update is a single
-        re-upsert of the full record. Because the endpoint replaces the whole
-        record, a partial update needs the current value/metadata: any field
-        left ``None`` is backfilled from the existing row's metadata. ``vector``
-        cannot be read back (values are not returned in v1), so a metadata-only
-        update reuses a zero placeholder vector ONLY if the row is absent;
-        otherwise callers should pass ``vector`` to avoid clobbering it.
+        re-upsert of the full ``{id, values, metadata}`` record. Because the
+        endpoint replaces the whole record, a partial update must reconstruct the
+        fields it is not changing — and crucially it must NEVER write a placeholder
+        embedding, which would corrupt the stored vector.
+
+        Two paths:
+
+          - **vector supplied** (mem0's normal path — ``Memory`` always passes
+            ``vector``): re-upsert with the new embedding. ``payload=None`` is
+            backfilled from the existing row's metadata.
+          - **metadata-only** (``vector=None``): fetch the CURRENT embedding via
+            ``GET ...?include_values=true`` and re-upsert it unchanged alongside
+            the new/merged metadata — so a metadata edit PRESERVES the real
+            vector (last-write-wins on metadata). No zero/placeholder vector is
+            ever written.
+
+        v1 limitation: ``include_values`` only returns an embedding for a
+        **recall-resident** vector. If the id is CONSOLIDATED (cold-only — the
+        cold FAISS ``reconstruct`` is a deferred follow-up), the embedding cannot
+        be read back, and rather than corrupt it this raises ``ValueError`` — the
+        caller must pass ``vector=...`` explicitly. See ``README.md``.
         """
         record: dict = {"id": str(vector_id)}
-        if payload is None:
-            # Preserve existing metadata when only the vector changes.
-            try:
-                existing = self.client.get(self.collection_name, str(vector_id))
-                payload = existing.get("metadata", {})
-            except VectorNotFoundError:
-                payload = {}
-        record["metadata"] = payload or {}
-        record["values"] = (
-            list(vector) if vector is not None else [0.0] * self.embedding_model_dims
-        )
+
+        if vector is not None:
+            # Fast path: the new embedding is supplied. Backfill metadata only.
+            if payload is None:
+                try:
+                    existing = self.client.get(self.collection_name, str(vector_id))
+                    payload = existing.get("metadata", {})
+                except VectorNotFoundError:
+                    payload = {}
+            record["metadata"] = payload or {}
+            record["values"] = list(vector)
+            self.client.upsert(self.collection_name, [record])
+            return
+
+        # Metadata-only path: fetch the CURRENT embedding so we re-upsert the real
+        # vector unchanged (NEVER a placeholder). `include_values=True` returns the
+        # stored embedding for a recall-resident vector.
+        try:
+            existing = self.client.get(
+                self.collection_name, str(vector_id), include_values=True
+            )
+        except VectorNotFoundError:
+            raise ValueError(
+                f"cannot update metadata for unknown vector id {vector_id!r}"
+            )
+        embedding = existing.get("embedding")
+        if embedding is None:
+            # Cold-only / consolidated id: the embedding is not readable in v1
+            # (cold reconstruct is deferred). Refuse rather than clobber it.
+            raise ValueError(
+                "metadata-only update for a consolidated vector requires passing "
+                "vector=...; cold reconstruct is a future include_values follow-up"
+            )
+        # Merge new metadata over the existing (last-write-wins on shared keys).
+        merged = dict(existing.get("metadata") or {})
+        if payload:
+            merged.update(payload)
+        record["metadata"] = merged
+        record["values"] = list(embedding)
         self.client.upsert(self.collection_name, [record])
 
     def delete(self, vector_id):
@@ -255,10 +305,20 @@ class RosalindDB(VectorStoreBase):
         return [rows]
 
     def keyword_search(self, query, top_k=5, filters=None):
-        """Not supported — RosalindDB v1 has no BM25 / full-text index."""
-        raise NotImplementedError(
-            "RosalindDB has no keyword/BM25 search; use search() (vector search)."
+        """Unsupported — RosalindDB v1 has no BM25 / full-text index → ``None``.
+
+        Returns ``None`` (NOT a raise), matching ``VectorStoreBase``'s base
+        default for an unsupported keyword backend. This is load-bearing:
+        mem0 2.0.4's ``Memory.search`` calls ``vector_store.keyword_search(...)``
+        UNCONDITIONALLY on every search and only afterward guards the result with
+        ``if keyword_results is not None`` (``mem0/memory/main.py``). Raising here
+        would propagate out of every ``Memory.search(...)`` and crash it; returning
+        ``None`` cleanly signals "no keyword results" and the vector hits stand.
+        """
+        logger.debug(
+            "keyword_search is unsupported on RosalindDB (no BM25); returning None."
         )
+        return None
 
     # search_batch is inherited from VectorStoreBase (loops over search()).
 

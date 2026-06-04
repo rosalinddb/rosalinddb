@@ -120,6 +120,53 @@ def test_update_preserves_metadata_when_payload_omitted(store):
     assert rec["values"] == [2, 2, 2, 2]
 
 
+def test_metadata_only_update_preserves_embedding_no_zero_vector(store):
+    # vector=None must NOT clobber the embedding: the adapter reads it back via
+    # include_values=true and re-upserts the REAL vector unchanged.
+    store.client.get.return_value = {
+        "id": "id1",
+        "metadata": {"data": "old", "user_id": "u1"},
+        "embedding": [0.1, 0.2, 0.3, 0.4],
+    }
+    store.update("id1", payload={"data": "new"})
+    # Must request the stored values.
+    assert store.client.get.call_args.kwargs.get("include_values") is True
+    rec = store.client.upsert.call_args.args[1][0]
+    # The real embedding is re-upserted unchanged — never a zero placeholder.
+    assert rec["values"] == [0.1, 0.2, 0.3, 0.4]
+    assert rec["values"] != [0.0, 0.0, 0.0, 0.0]
+    # Metadata is last-write-wins merged over the existing.
+    assert rec["metadata"] == {"data": "new", "user_id": "u1"}
+
+
+def test_metadata_only_update_none_payload_keeps_existing_metadata(store):
+    store.client.get.return_value = {
+        "id": "id1",
+        "metadata": {"data": "keep"},
+        "embedding": [1.0, 0.0, 0.0, 0.0],
+    }
+    store.update("id1")  # vector=None, payload=None -> pure no-op-ish refresh
+    rec = store.client.upsert.call_args.args[1][0]
+    assert rec["values"] == [1.0, 0.0, 0.0, 0.0]
+    assert rec["metadata"] == {"data": "keep"}
+
+
+def test_metadata_only_update_consolidated_vector_raises_not_zeros(store):
+    # Cold-only id: include_values returns no embedding. The adapter must REFUSE
+    # (raise) rather than write a placeholder vector.
+    store.client.get.return_value = {"id": "id1", "metadata": {"data": "x"}}
+    with pytest.raises(ValueError, match="consolidated vector requires passing vector"):
+        store.update("id1", payload={"data": "y"})
+    store.client.upsert.assert_not_called()
+
+
+def test_metadata_only_update_unknown_id_raises(store):
+    store.client.get.side_effect = VectorNotFoundError("not_found", "gone")
+    with pytest.raises(ValueError):
+        store.update("missing", payload={"data": "y"})
+    store.client.upsert.assert_not_called()
+
+
 def test_delete_maps_to_delete_endpoint(store):
     store.delete("id9")
     store.client.delete.assert_called_once_with("col", "id9")
@@ -211,9 +258,12 @@ def test_none_filter_values_are_dropped(store):
 # -- keyword search unsupported --------------------------------------------
 
 
-def test_keyword_search_not_implemented(store):
-    with pytest.raises(NotImplementedError):
-        store.keyword_search("hello")
+def test_keyword_search_returns_none_not_raises(store):
+    # mem0's Memory.search calls keyword_search unconditionally and guards with
+    # `if result is not None`, so it MUST return None (not raise) — a raise would
+    # crash every Memory.search against this adapter.
+    assert store.keyword_search("hello") is None
+    assert store.keyword_search("hi", top_k=3, filters={"user_id": "u1"}) is None
 
 
 def test_search_batch_loops_over_search(store):
