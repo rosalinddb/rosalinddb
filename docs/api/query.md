@@ -214,6 +214,7 @@ envelope, never as 200 with an empty list.
 |---|---|---|
 | 503 | `cache_unavailable` | local shard cache fs unreadable / unwritable (e.g. a bind-mount permission problem; check `CACHE_DIR`) |
 | 503 | `storage_unavailable` | object-store fetch failed (S3 outage, missing shard, network partition) |
+| 503 | `recall_unavailable` | the recall (pgvector) tier was unreachable for this query (connection drop / TLS reset / sustained recall-pool exhaustion); the query is safe to retry once recall recovers. Only reachable when the recall union is on (`RB_RECALL`). The query does **not** silently degrade to consolidated-only results — that would drop recent unconsolidated writes (read-your-writes) without signal |
 | 503 | `ephemeral_error` | unclassified failure inside the ephemeral runner |
 | 503 | `cache_capacity_exceeded` | SSD shard tier rejected the load (admission floor); only reachable when `RB_SHARD_TIER_BYTES` is set — raise the cap |
 
