@@ -57,10 +57,31 @@ from services.auth.quota import (
 # Recall-tier flag + sync write path. Default OFF — when off, nothing below is
 # reached and `post_vectors` behaves byte-identically to today (202, landing
 # write, VALIDATE_DATASET). See docs/architecture/recall-consolidate.md.
-from adapters.state.state import recall_enabled, recall_upsert_vectors
+from adapters.state.state import (
+    recall_enabled,
+    recall_partition_count,
+    recall_upsert_vectors,
+)
 
 
 logger = logging.getLogger(__name__)
+
+# Per-(tenant, dataset) recall-row cap. After a recall write, if the partition's
+# row count exceeds this, a `CONSOLIDATE` is enqueued to flush the partition into
+# a Consolidated shard — bounding the recall set the union brute-force-scans and
+# keeping one tenant from evicting another's working set. Read live (per call)
+# so a test can retune it without a reload; a missing/malformed value falls back
+# to the default. Only consulted under `recall_enabled()`. See
+# docs/architecture/recall-consolidate.md, "Scale-to-zero preservation".
+_DEFAULT_RECALL_MAX_ROWS = 2000
+
+
+def _recall_max_rows() -> int:
+    """Return the per-(tenant, dataset) recall-row cap (`RB_RECALL_MAX_ROWS`)."""
+    raw = os.getenv("RB_RECALL_MAX_ROWS")
+    if raw and raw.strip().lstrip("-").isdigit() and int(raw) > 0:
+        return int(raw)
+    return _DEFAULT_RECALL_MAX_ROWS
 
 
 # Observability bootstrap. Runs at import so it works both when this module is
@@ -532,6 +553,28 @@ async def post_vectors(
                     503,
                     "recall_write_failed",
                     "Recall-tier write failed; the batch was not persisted",
+                )
+
+            # Per-tenant recall cap: if this partition now exceeds
+            # `RB_RECALL_MAX_ROWS`, enqueue a `CONSOLIDATE` so the builder flushes
+            # it into a Consolidated shard. This bounds the recall set the query
+            # union brute-force-scans (the union PR's otherwise-unbounded scan)
+            # and stops one tenant evicting another's working set. Best-effort
+            # AFTER the durable write: a count/enqueue failure must NOT fail the
+            # already-committed write (the next write — or the idle sweep — re-
+            # checks and re-enqueues), so it never turns a 200 into an error.
+            try:
+                if recall_partition_count(tenant_id, name) > _recall_max_rows():
+                    await run_in_threadpool(
+                        publish, "CONSOLIDATE", {"tenant": tenant_id, "dataset": name}
+                    )
+            except Exception:  # noqa: BLE001 - cap check is best-effort
+                logger.warning(
+                    "recall cap check/enqueue failed for tenant=%s dataset=%s "
+                    "(write already committed; will retry next write/idle sweep)",
+                    tenant_id,
+                    name,
+                    exc_info=True,
                 )
         obs_metrics.record_upload("accepted" if accepted_count > 0 else "rejected")
         obs_metrics.record_vectors_ingested(accepted_count)

@@ -51,12 +51,17 @@ from adapters.state.state import (
     add_shard,
     dataset_build_lock,
     get_latest_shard,
+    list_shards,
     set_row_count,
     update_dataset_status,
     get_dataset,
     superseded_shards,
     delete_shards,
     list_import_jobs,
+    recall_enabled,
+    recall_snapshot_for_consolidation,
+    recall_trim,
+    recall_idle_partitions,
 )
 from adapters.storage.storage import delete as storage_delete, exists as storage_exists
 from adapters.landing.parquet_reader import (
@@ -86,6 +91,33 @@ INDEXES_PREFIX = os.getenv("INDEXES_PREFIX", "s3://rosalinddb/indexes")
 LANDING_PREFIX = os.getenv("LANDING_PREFIX", "s3://rosalinddb/landing")
 TENANT_PREFIX = os.getenv("TENANT_PREFIX", "true").lower() == "true"
 METRICS_PORT = int(os.getenv("METRICS_PORT", "9101"))
+
+# --- Recall→Consolidated consolidation knobs (RB_RECALL, default OFF) ------
+#
+# Both default to safe/current behaviour and are read live (per call) so a test
+# can retune them without a module reload. They ONLY ever take effect under
+# `recall_enabled()`; with the flag off the consolidate consumer never runs, the
+# idle sweep is skipped, and nothing here is reached. See
+# docs/architecture/recall-consolidate.md, "Scale-to-zero preservation".
+
+
+def _recall_idle_seconds() -> float:
+    """Idle window (s) after which a recall partition is consolidated to zero.
+
+    `RB_RECALL_IDLE_S` (default 60): a (tenant, dataset) whose newest recall
+    write is older than this is swept to a `CONSOLIDATE` by the builder's idle
+    tick → drains to 0 recall rows → idle queries skip pgvector entirely
+    (scale-to-zero). A missing/malformed value falls back to the default.
+    """
+    raw = os.getenv("RB_RECALL_IDLE_S")
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    return 60.0
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -574,6 +606,7 @@ def _write_shard(
     *,
     build_type: str,
     indexed_uris: List[str],
+    consolidated_lsn: int = 0,
 ) -> str:
     """Write a freshly-built shard + sidecar, catalog it, reconcile, prewarm.
 
@@ -584,10 +617,16 @@ def _write_shard(
     opt-in `PREWARM_SHARD` hint is published. Returns the shard URI.
 
     Extracted from `_run_once_locked` so the `DELETE_VECTORS` path
-    (`run_delete_once`) reuses the EXACT same write/catalog/prewarm behaviour
-    instead of duplicating it — a delete is just another way to produce the
-    next shard generation. The caller owns the per-dataset advisory lock and
-    the status flip + sweep (which differ slightly between build and delete).
+    (`run_delete_once`) and the `CONSOLIDATE` path (`run_consolidate_once`)
+    reuse the EXACT same write/catalog/prewarm behaviour instead of duplicating
+    it — a delete or a consolidation is just another way to produce the next
+    shard generation. The caller owns the per-dataset advisory lock and the
+    status flip + sweep (which differ slightly between build/delete/consolidate).
+
+    `consolidated_lsn` (default 0) is the recall-tier watermark stamped on the
+    `shard_catalog` row — the highest recall LSN folded into this shard. Only the
+    consolidation path passes a non-zero value; every other build leaves it 0
+    (default-off: a flag-off deploy never sets it).
     """
     checksum = hashlib.sha256(blob).hexdigest()
     # Shard filename must be collision-proof: two builds completing in the
@@ -619,6 +658,7 @@ def _write_shard(
         index_type_str,
         build_type=build_type,
         indexed_landing_uris=indexed_uris,
+        consolidated_lsn=consolidated_lsn,
     )
     # Reconcile dataset.row_count to the just-built shard's true unique-vector
     # count. The validator's `increment_row_count` runs per-batch without
@@ -988,6 +1028,303 @@ def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
         return 1
 
 
+# --- CONSOLIDATE (recall -> consolidated flush) ---------------------------
+#
+# The recall→consolidated flush: snapshot a (tenant, dataset) recall partition
+# up to its current max LSN N, fold the LIVE rows into a new Consolidated shard,
+# apply tombstones (deleted ids are removed + never carried forward), COMMIT the
+# catalog row with `consolidated_lsn = N` (`build_type='consolidate'`), run the
+# supersede sweep + evict superseded shards from the query cache, and THEN trim
+# the recall rows — grace-bounded (up to the 2nd-newest shard's watermark) and
+# idempotent.
+#
+# ORDER IS LOAD-BEARING (I2): build → commit catalog → grace-bounded trim. NEVER
+# trim before commit. A crash between commit and trim leaves recall rows with
+# `lsn <= consolidated_lsn` that the union harmlessly excludes (`lsn >
+# consolidated_lsn`) and the next consolidation GCs — safe across the two
+# databases WITHOUT a distributed transaction. See
+# docs/architecture/recall-consolidate.md, invariants I1/I2/I3/I4.
+
+
+def run_consolidate_once(dataset: str, tenant: str) -> int:
+    """Consolidate a (tenant, dataset) recall partition into a Consolidated shard.
+
+    Gated by the per-dataset advisory lock (single-replica serialization),
+    exactly like `run_once` / `run_delete_once`. Returns the number of LIVE
+    recall rows folded into the new shard (`0` when the partition is empty — a
+    clean no-op, nothing to consolidate, message safe to ack), or the
+    `BUILD_SKIPPED` sentinel when another replica holds the lock (the caller
+    redelivers). Any failure flips the dataset to `error` and returns 0.
+
+    No-op when the recall tier is OFF (`recall_enabled()` False): a `CONSOLIDATE`
+    message can only have been enqueued under the flag, but guard defensively so
+    a stray message with the flag off never opens a recall connection.
+    """
+    if not recall_enabled():
+        # Defensive: the flag is off, so there is no recall store to drain.
+        # Treat as a clean no-op (ack) — never open a recall connection.
+        return 0
+    with dataset_build_lock(tenant, dataset) as acquired:
+        if not acquired:
+            print(
+                f"builder: dataset {tenant}/{dataset} is already being built "
+                f"by another replica — skipping consolidate (will be redelivered)"
+            )
+            return BUILD_SKIPPED
+        return _run_consolidate_locked(dataset, tenant)
+
+
+def _grace_watermark(tenant: str, dataset: str) -> int:
+    """Return the 2nd-newest shard's `consolidated_lsn` — the grace-bounded trim
+    watermark (I4).
+
+    The recall trim deletes rows only up to the watermark of the shard that is
+    now ≥ 2 generations old, i.e. the **2nd-newest** shard — symmetric to the
+    `SHARD_KEEP=2` sweep that retains the newest shard plus one grace buffer. An
+    in-flight query that resolved the (now second-newest) shard moments before
+    this consolidation wrote the newest one still filters recall with that older
+    shard's smaller watermark, so its rows must remain in recall until that
+    shard itself is superseded. Trimming only up to the 2nd-newest watermark
+    guarantees that.
+
+    Returns `0` when there is no 2nd-newest shard yet (the dataset has 0 or 1
+    shards) — the first consolidation trims nothing, which is correct: its new
+    shard is the only one, so an in-flight query can only have resolved it (or
+    no shard) and every recall row is still needed.
+
+    Called AFTER the new shard is committed, so `list_shards` already includes
+    it: index `[1]` is the shard immediately before the just-written newest.
+    """
+    shards = list_shards(tenant, dataset)
+    if len(shards) < 2:
+        return 0
+    second_newest = shards[1]
+    raw = second_newest.get("consolidated_lsn", 0)
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _run_consolidate_locked(dataset: str, tenant: str) -> int:
+    """Run the consolidation — caller holds the per-dataset advisory lock.
+
+    build → commit catalog (watermark N) → grace-bounded trim. See
+    `run_consolidate_once`.
+    """
+    with build_index_span(tenant=tenant, dataset=dataset):
+        # 1. SNAPSHOT the recall partition up to its current max LSN N. The read
+        #    is a single transaction so N and the rows it bounds are consistent;
+        #    a write that lands after this (higher LSN) stays in recall and the
+        #    union keeps serving it (read-your-writes through consolidation).
+        try:
+            max_lsn, recall_rows = recall_snapshot_for_consolidation(tenant, dataset)
+        except Exception as exc:  # noqa: BLE001
+            update_dataset_status(
+                tenant, dataset, "error", error_message=f"consolidate snapshot: {exc}"
+            )
+            return 0
+
+        if max_lsn == 0 or not recall_rows:
+            # Empty partition — nothing to consolidate. Clean no-op: leave the
+            # dataset status untouched (a never-written-to recall partition has
+            # no in-flight build to settle).
+            return 0
+
+        # Partition the snapshot into LIVE upserts (folded into the shard) and
+        # tombstones (their ids removed from the shard + never added). A row's
+        # `deleted` flag is last-write-wins per id already (recall UPSERT), and
+        # the snapshot has at most one row per id (PK is (tenant, dataset, id)),
+        # so the two sets are disjoint by id.
+        live_rows = [r for r in recall_rows if not r["deleted"]]
+        tombstone_ids = [r["id"] for r in recall_rows if r["deleted"]]
+
+        latest_shard = get_latest_shard(tenant, dataset)
+        is_incremental = latest_shard is not None
+
+        try:
+            shard_uri = _build_consolidated_shard(
+                tenant, dataset, latest_shard, live_rows, tombstone_ids, max_lsn
+            )
+        except Exception as exc:  # noqa: BLE001
+            update_dataset_status(
+                tenant, dataset, "error", error_message=f"consolidate build: {exc}"
+            )
+            _LAST_BUILD["build_type"] = "error"
+            return 0
+
+        if shard_uri is None:
+            # Nothing was actually written (e.g. only tombstones for ids that
+            # were never in the cold shard, and no live rows + no prior shard).
+            # The catalog is unchanged, so there is no watermark to advance and
+            # nothing to trim safely — leave recall as is for the next pass.
+            return 0
+
+        # 2. The catalog row is COMMITTED with `consolidated_lsn = N` (inside
+        #    `_build_consolidated_shard` -> `_write_shard` -> `add_shard`). Only
+        #    NOW (strictly after commit — I2) do we touch recall.
+        obs_metrics.record_index_build("consolidate")
+        update_dataset_status(
+            tenant,
+            dataset,
+            "indexed",
+            last_indexed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+
+        # 3. Sweep superseded shards (keep newest 2) + evict their query-cache
+        #    entries — same discipline as a build/delete. Best-effort. Runs
+        #    BEFORE the trim does not matter for correctness (the trim's
+        #    grace-bound reads `list_shards` itself), but mirrors build/delete.
+        try:
+            _sweep_superseded_shards(tenant, dataset)
+        except Exception as exc:  # noqa: BLE001
+            print(f"builder: shard sweep failed for {tenant}/{dataset}: {exc}")
+
+        # 4. GRACE-BOUNDED, IDEMPOTENT TRIM (I4). Delete recall rows only up to
+        #    the 2nd-newest shard's watermark, so an in-flight query that
+        #    resolved an older shard still finds its recall rows. Best-effort —
+        #    a trim failure leaves rows the union harmlessly excludes
+        #    (`lsn > consolidated_lsn`) and the next consolidation GCs them
+        #    (cross-DB crash safety). The trim must run AFTER the commit above.
+        grace = _grace_watermark(tenant, dataset)
+        try:
+            trimmed = recall_trim(tenant, dataset, grace)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"builder: recall trim failed for {tenant}/{dataset} "
+                f"(grace_watermark={grace}): {exc}"
+            )
+            trimmed = 0
+
+        _LAST_BUILD.update(
+            build_type="consolidate",
+            vectors_added=len(live_rows),
+            parts_read=0,
+            parts_read_uris=[],
+        )
+        print(
+            f"builder: consolidated {tenant}/{dataset} — folded {len(live_rows)} "
+            f"live + {len(tombstone_ids)} tombstones, watermark={max_lsn}, "
+            f"incremental={is_incremental}, trimmed={trimmed} (grace={grace})"
+        )
+        return len(live_rows)
+
+
+def _build_consolidated_shard(
+    tenant: str,
+    dataset: str,
+    latest_shard: Optional[dict],
+    live_rows: List[dict],
+    tombstone_ids: List[str],
+    consolidated_lsn: int,
+) -> Optional[str]:
+    """Fold a recall snapshot into a new Consolidated shard; return its URI.
+
+    Reuses the existing build tail: an INCREMENTAL fold loads the current shard's
+    FAISS index + sidecar, removes any overlapping/tombstoned ids, `add()`s the
+    live rows, merges the sidecar, and writes via `_write_shard`; a FROM-SCRATCH
+    fold (no prior shard) trains a fresh index over the live rows. The catalog
+    row is committed with `build_type='consolidate'` and `consolidated_lsn` set
+    (the watermark, I2). The landing manifest is carried forward unchanged — a
+    consolidation does not touch landing parts (recall data never lands).
+
+    Returns the new shard URI, or `None` when there is genuinely nothing to
+    write (no prior shard AND no live rows — a tombstone-only first
+    consolidation): there is no index to remove from and nothing to add, so the
+    catalog is left unchanged and the caller skips the watermark advance + trim.
+    """
+    live_ids = [r["id"] for r in live_rows]
+    live_metas = [r["metadata"] for r in live_rows]
+    if live_rows:
+        vectors = np.array([r["values"] for r in live_rows], dtype=np.float32)
+        live_int_ids = np.array([_id_to_int64(i) for i in live_ids], dtype=np.int64)
+    else:
+        vectors = np.empty((0, 0), dtype=np.float32)
+        live_int_ids = np.array([], dtype=np.int64)
+
+    if latest_shard is not None:
+        # --- incremental fold onto the current shard's index ---------------
+        index = faiss.deserialize_index(
+            np.frombuffer(read_bytes(latest_shard["shard_uri"]), dtype=np.uint8)
+        )
+        if not hasattr(index, "id_map"):
+            raise RuntimeError(
+                "consolidate: loaded shard index has no `id_map` "
+                f"(type {type(index).__name__}); cannot upsert by id"
+            )
+        existing_int_ids = set(faiss.vector_to_array(index.id_map).tolist())
+
+        # Remove stale cold copies of every live upsert id (last-write-wins) AND
+        # every tombstoned id (apply the delete). One overlap-gated removal pass
+        # — `remove_ids` is an O(N) scan, so skip it when nothing overlaps.
+        tombstone_int_ids = [_id_to_int64(i) for i in tombstone_ids]
+        to_remove = [
+            int(i)
+            for i in (list(live_int_ids) + tombstone_int_ids)
+            if int(i) in existing_int_ids
+        ]
+        if to_remove:
+            _remove_ids(index, to_remove)
+
+        existing_sidecar = read_shard_sidecar(latest_shard["shard_uri"])
+        if live_rows:
+            _add_to_index(index, vectors, live_int_ids)
+        index_type_str = latest_shard.get("index_type", "flat")
+        blob = _serialize_index(index)
+
+        # Merge the sidecar: start from the existing map, drop tombstoned ids,
+        # overlay the live upserts' (id, metadata).
+        merged_sidecar = dict(existing_sidecar)
+        for tid in tombstone_ids:
+            merged_sidecar.pop(str(_id_to_int64(tid)), None)
+        merged_sidecar.update(_sidecar_dict(live_ids, live_metas))
+        sidecar_blob = json.dumps(merged_sidecar).encode("utf-8")
+        total_vectors = int(getattr(index, "ntotal", 0))
+        # Recall data never lands, so the landing manifest is unchanged.
+        indexed_uris = list(latest_shard.get("indexed_landing_uris", []) or [])
+    else:
+        # --- from-scratch fold (no prior shard) ----------------------------
+        if not live_rows:
+            # Tombstone-only first consolidation: no index to write. The trim is
+            # still safe to run later (the rows are tombstones for ids that were
+            # never consolidated), but there is no shard to advance — return None
+            # so the caller leaves the catalog untouched and trims nothing this
+            # pass. (The tombstones simply wait for a future consolidation that
+            # also carries live rows, or age out via consolidate-on-idle once
+            # there is a shard. They never produce a stale read — there is no
+            # cold shard for them to leak from.)
+            return None
+        nlist_target = _choose_nlist(int(vectors.shape[0]))
+        if (
+            INDEX_TYPE == "ivfflat"
+            and nlist_target >= 4
+            and vectors.shape[0] >= IVF_TRAINING_FLOOR
+        ):
+            blob = build_ivfflat(vectors, live_int_ids)
+            index_type_str = "ivfflat"
+        else:
+            blob = build_flat(vectors, live_int_ids)
+            index_type_str = "flat"
+        sidecar_blob = _build_sidecar(live_ids, live_metas)
+        total_vectors = int(vectors.shape[0])
+        indexed_uris = []
+
+    # COMMIT the new shard + catalog row with the watermark (I2). `_write_shard`
+    # writes the .bin/.meta.json, calls `add_shard(..., consolidated_lsn=N)`,
+    # reconciles row_count, and publishes the prewarm hint.
+    return _write_shard(
+        tenant,
+        dataset,
+        blob,
+        sidecar_blob,
+        total_vectors,
+        index_type_str,
+        build_type="consolidate",
+        indexed_uris=indexed_uris,
+        consolidated_lsn=consolidated_lsn,
+    )
+
+
 class MetricsHandler(BaseHTTPRequestHandler):
     """HTTP handler for metrics endpoints."""
 
@@ -1065,13 +1402,22 @@ def start_metrics_server():
 
 
 def main_loop():
-    """Blocking loop that builds shards and applies deletes from the queue.
+    """Blocking loop that builds shards, applies deletes, and consolidates.
 
-    Consumes TWO topics: `DATASET_READY` (an ingest needs folding into a
-    shard) and `DELETE_VECTORS` (a consolidated-tier delete-by-id needs applying to
-    the newest shard). Each iteration drains one message from each topic so a
-    steady stream of one never starves the other; `DATASET_READY` is polled
-    with a short block so the loop still parks when both are idle.
+    Consumes THREE topics: `DATASET_READY` (an ingest needs folding into a
+    shard), `DELETE_VECTORS` (a consolidated-tier delete-by-id needs applying to
+    the newest shard), and `CONSOLIDATE` (a recall partition needs flushing into
+    a Consolidated shard + the watermark advanced — the recall→consolidated
+    flush). Each iteration drains one message from each topic so a steady stream
+    of one never starves the others; `DATASET_READY` is polled with a short
+    block so the loop still parks when all are idle.
+
+    Consolidate-on-idle: each idle tick (when the blocking `DATASET_READY` poll
+    times out) the loop runs a lightweight sweep that enqueues `CONSOLIDATE` for
+    every recall partition whose newest write is older than `RB_RECALL_IDLE_S`,
+    draining idle datasets to zero recall rows (scale-to-zero). The sweep ONLY
+    runs under `recall_enabled()` and is rate-limited so it does not hammer the
+    recall store; with the flag off it is never reached.
 
     Reliable-queue contract: a message is `ack`-ed once its handler reaches a
     terminal outcome (success, or a handled failure that flipped the
@@ -1098,15 +1444,66 @@ def main_loop():
     start_reaper_thread(stop_event())
     while not should_stop():
         # `DATASET_READY` is the blocking poll so the loop parks when idle;
-        # `DELETE_VECTORS` is then drained non-blocking so a delete never
-        # waits a full `DATASET_READY` timeout behind an empty build queue.
+        # `DELETE_VECTORS` and `CONSOLIDATE` are then drained non-blocking so
+        # neither waits a full `DATASET_READY` timeout behind an empty build
+        # queue.
         ready_msg = consume("DATASET_READY", block=True, timeout=1.0)
         if ready_msg:
             _dispatch(ready_msg, _handle_dataset_ready, "build")
+        else:
+            # Idle tick (the blocking poll timed out): run the lightweight
+            # consolidate-on-idle sweep. No-op + opens no recall connection when
+            # the flag is off.
+            _maybe_sweep_idle_recall()
         delete_msg = consume("DELETE_VECTORS", block=False)
         if delete_msg:
             _dispatch(delete_msg, _handle_delete_vectors, "delete")
+        consolidate_msg = consume("CONSOLIDATE", block=False)
+        if consolidate_msg:
+            _dispatch(consolidate_msg, _handle_consolidate, "consolidate")
     print("builder: shutdown signal received — exiting consume loop")
+
+
+# Last wall-clock the idle sweep ran. The sweep is rate-limited to once per
+# `RB_RECALL_IDLE_S` window so the idle tick (every ~1s when the build queue is
+# empty) does not hammer the recall store with a GROUP BY scan every second.
+_LAST_IDLE_SWEEP_AT: float = 0.0
+
+
+def _maybe_sweep_idle_recall() -> None:
+    """Consolidate-on-idle: enqueue `CONSOLIDATE` for idle recall partitions.
+
+    Runs on the builder loop's idle tick. No-op (and opens NO recall connection)
+    unless `recall_enabled()`. Rate-limited to once per idle window so the
+    GROUP BY scan over the recall store runs at most ~once per `RB_RECALL_IDLE_S`,
+    not every ~1s idle tick. Each idle `(tenant, dataset)` partition gets one
+    `CONSOLIDATE` enqueue, which the consumer drains to ZERO recall rows — after
+    which idle queries skip pgvector entirely (scale-to-zero preserved).
+
+    Best-effort: a recall-store error is logged and the next tick retries; it
+    must never crash the build loop.
+    """
+    if not recall_enabled():
+        return
+    global _LAST_IDLE_SWEEP_AT
+    idle_seconds = _recall_idle_seconds()
+    now = time.time()
+    if now - _LAST_IDLE_SWEEP_AT < idle_seconds:
+        return
+    _LAST_IDLE_SWEEP_AT = now
+    try:
+        partitions = recall_idle_partitions(idle_seconds)
+    except Exception as exc:  # noqa: BLE001
+        print(f"builder: consolidate-on-idle sweep failed: {exc}")
+        return
+    for tenant, dataset in partitions:
+        try:
+            publish("CONSOLIDATE", {"tenant": tenant, "dataset": dataset})
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"builder: consolidate-on-idle enqueue failed for "
+                f"{tenant}/{dataset}: {exc}"
+            )
 
 
 def _dispatch(msg, handler, kind: str) -> None:
@@ -1220,6 +1617,27 @@ def _handle_delete_vectors(msg) -> bool:
         # Another replica holds the per-dataset lock — signal a nack/redeliver.
         return False
     # Hit, no-op, or handled error all reached a terminal outcome — ack.
+    return True
+
+
+def _handle_consolidate(msg) -> bool:
+    """Consolidate one CONSOLIDATE message — flush a recall partition to a shard.
+
+    Returns `True` once the consolidation reaches a terminal state — folded,
+    a clean no-op (empty recall partition / flag off), or a handled failure that
+    flipped the dataset to `error`; the caller then acks. Returns `False` if it
+    was SKIPPED because another replica holds the per-dataset lock; the caller
+    then `nack`s for redelivery. A duplicate `CONSOLIDATE` (cap + idle can both
+    enqueue one) is idempotent: the second run snapshots whatever recall rows
+    remain and either folds them or is a clean no-op.
+    """
+    dataset = msg["dataset"]
+    tenant = msg.get("tenant", "default")
+    result = run_consolidate_once(dataset, tenant)
+    if result == BUILD_SKIPPED:
+        # Another replica holds the per-dataset lock — signal a nack/redeliver.
+        return False
+    # Folded, no-op, or handled error all reached a terminal outcome — ack.
     return True
 
 
