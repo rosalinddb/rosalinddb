@@ -76,3 +76,25 @@ def test_keep_one_leaves_only_newest(state):
     ids = _add(state, "t1", "ds", 3)
     stale = state.superseded_shards("t1", "ds", keep=1)
     assert {s["id"] for s in stale} == set(ids[:2])
+
+
+def test_add_shard_defaults_consolidated_lsn_to_zero(state):
+    """Every non-consolidate build leaves the recall watermark at 0 (default-off)."""
+    state.add_shard(
+        "t1", "ds", "memory://idx/ds/s.bin", checksum="c", vector_count=1,
+        index_type="flat",
+    )
+    shard = state.get_latest_shard("t1", "ds")
+    assert shard["consolidated_lsn"] == 0
+    assert shard["build_type"] == "full"
+
+
+def test_add_shard_round_trips_consolidated_lsn(state):
+    """A consolidation stamps the watermark + build_type='consolidate' on the row."""
+    state.add_shard(
+        "t1", "ds", "memory://idx/ds/c.bin", checksum="c", vector_count=3,
+        index_type="flat", build_type="consolidate", consolidated_lsn=42,
+    )
+    shard = state.get_latest_shard("t1", "ds")
+    assert shard["consolidated_lsn"] == 42
+    assert shard["build_type"] == "consolidate"

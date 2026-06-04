@@ -333,3 +333,107 @@ def test_flag_on_recall_write_failure_returns_503_envelope(env, monkeypatch):
     body = r.json()
     assert body["error"]["code"] == "recall_write_failed"
     assert "message" in body["error"]
+
+
+# --- per-tenant recall cap → CONSOLIDATE enqueue --------------------------
+
+
+def _drain_consolidate():
+    """Pop every queued `CONSOLIDATE` message; return the list."""
+    from adapters.queue.queue import consume
+
+    msgs = []
+    while True:
+        m = consume("CONSOLIDATE", block=False)
+        if not m:
+            break
+        msgs.append(m)
+    return msgs
+
+
+def test_cap_exceeded_enqueues_consolidate(env, monkeypatch):
+    """Recall partition over `RB_RECALL_MAX_ROWS` → a CONSOLIDATE is enqueued."""
+    _drain_consolidate()
+    _enable_recall(env, monkeypatch, lambda t, d, recs: len(recs))
+    # Tiny cap so 3 accepted rows trip it; the count is stubbed above the cap.
+    monkeypatch.setenv("RB_RECALL_MAX_ROWS", "2")
+    monkeypatch.setattr(env.main, "recall_partition_count", lambda t, d: 5)
+
+    s = _signup(env.client, email="cap@example.com")
+    env.client.post(
+        "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
+    )
+    r = env.client.post(
+        "/v1/datasets/v/vectors",
+        headers={**_auth(s["token"]), "Content-Type": "application/x-ndjson"},
+        data=_BODY,
+    )
+    assert r.status_code == 200, r.text
+    msgs = _drain_consolidate()
+    assert len(msgs) == 1, f"cap exceeded must enqueue one CONSOLIDATE: {msgs}"
+    assert msgs[0]["dataset"] == "v"
+
+
+def test_cap_not_exceeded_no_consolidate(env, monkeypatch):
+    """Recall partition under the cap → NO CONSOLIDATE enqueued."""
+    _drain_consolidate()
+    _enable_recall(env, monkeypatch, lambda t, d, recs: len(recs))
+    monkeypatch.setenv("RB_RECALL_MAX_ROWS", "2000")
+    monkeypatch.setattr(env.main, "recall_partition_count", lambda t, d: 3)
+
+    s = _signup(env.client, email="undercap@example.com")
+    env.client.post(
+        "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
+    )
+    r = env.client.post(
+        "/v1/datasets/v/vectors",
+        headers={**_auth(s["token"]), "Content-Type": "application/x-ndjson"},
+        data=_BODY,
+    )
+    assert r.status_code == 200, r.text
+    assert _drain_consolidate() == [], "under-cap write must not enqueue CONSOLIDATE"
+
+
+def test_cap_check_failure_does_not_fail_write(env, monkeypatch):
+    """A cap-count failure (after the durable write) must NOT turn 200 into error."""
+    _drain_consolidate()
+    _enable_recall(env, monkeypatch, lambda t, d, recs: len(recs))
+
+    def _boom(t, d):
+        raise RuntimeError("recall count query failed")
+
+    monkeypatch.setattr(env.main, "recall_partition_count", _boom)
+
+    s = _signup(env.client, email="capfail@example.com")
+    env.client.post(
+        "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
+    )
+    r = env.client.post(
+        "/v1/datasets/v/vectors",
+        headers={**_auth(s["token"]), "Content-Type": "application/x-ndjson"},
+        data=_BODY,
+    )
+    assert r.status_code == 200, "cap-check failure must not fail the committed write"
+    assert _drain_consolidate() == []
+
+
+def test_flag_off_never_enqueues_consolidate(env, monkeypatch):
+    """Flag OFF: the cap path is never reached → no CONSOLIDATE, no recall count."""
+    _drain_consolidate()
+
+    def _boom(t, d):  # pragma: no cover - must never be called
+        raise AssertionError("cap check ran with the flag off")
+
+    monkeypatch.setattr(env.main, "recall_partition_count", _boom)
+
+    s = _signup(env.client, email="capoff@example.com")
+    env.client.post(
+        "/v1/datasets", headers=_auth(s["token"]), json={"name": "v", "dimension": 4}
+    )
+    r = env.client.post(
+        "/v1/datasets/v/vectors",
+        headers={**_auth(s["token"]), "Content-Type": "application/x-ndjson"},
+        data=_BODY,
+    )
+    assert r.status_code == 202, r.text
+    assert _drain_consolidate() == []
