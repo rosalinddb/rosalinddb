@@ -20,11 +20,20 @@
 //       partition grows and every query brute-force-scans the whole thing.
 //
 // Custom metrics:
-//   rb_write_latency   Trend (ms)   write-batch latency
-//   rb_writes          Counter      accepted memory-writes (-> throughput ops/s)
-//   rb_search_latency  Trend (ms)   query latency
+//   rb_write_latency   Trend (ms)   write-batch latency (SUCCESSFUL 2xx only)
+//   rb_writes          Counter      accepted BATCH memory-writes -> throughput
+//                                   ops/s. This is the recall-WRITE LOAD only;
+//                                   it EXCLUDES the per-iteration sentinel probe
+//                                   write (a correctness check, ~1/(MEMORIES_PER+1)
+//                                   ~17% of write ops at the default 5). So
+//                                   rb_writes is batch-memory throughput, NOT
+//                                   total recall write ops/s.
+//   rb_search_latency  Trend (ms)   query latency (SUCCESSFUL 2xx only)
 //   rb_ryw_hit         Rate         read-your-writes: sentinel id returned?
-//   rb_ryw_lag_ms      Trend (ms)   read-your-writes round-trip lag
+//                                   (failed sentinel write OR failed/empty probe
+//                                   query counts as a MISS)
+//   rb_ryw_lag_ms      Trend (ms)   read-your-writes round-trip lag (genuine
+//                                   HITS only)
 //   rb_errors          Rate         non-2xx across all request kinds
 //
 // Env:
@@ -105,12 +114,17 @@ function datasetFor(vu) {
 }
 
 // Create a dataset; tolerate 409 (already exists) so first-touch is idempotent
-// across VUs (shared mode) and across the warmup re-check.
+// across VUs (shared mode) and across the warmup re-check. A 409 is an
+// EXPECTED status here (the dataset already exists — fine on a --keep-up re-run
+// against a populated stack), so we mark 200/201/409 as expected via a
+// per-request responseCallback. Otherwise k6 would count the setup() 409 toward
+// the built-in http_req_failed rate even though it is not a real failure.
+const datasetExistsOk = http.expectedStatuses(200, 201, 409);
 function ensureDataset(name) {
   const res = http.post(
     `${BASE_URL}/v1/datasets`,
     JSON.stringify({ name, dimension: DIM }),
-    { headers: authHeaders() }
+    { headers: authHeaders(), responseCallback: datasetExistsOk }
   );
   // 200/201 created, 409 already exists — both are fine.
   return res.status === 200 || res.status === 201 || res.status === 409;
@@ -161,8 +175,13 @@ export default function (data) {
   });
   const wok = wres.status === 200; // recall ON -> synchronous 200
   errors.add(!wok, { op: 'write' });
-  writeLatency.add(wres.timings.duration);
   if (wok) {
+    // Record latency ONLY on success so the published p50/p95/p99 are over
+    // successful requests (the standard convention). Error-response latency
+    // (a fast fast-fail or a slow timeout at the scaling cliff) would otherwise
+    // contaminate the percentiles the per-agent-vs-shared comparison hinges on.
+    // Failures still count toward rb_errors / http_req_failed above.
+    writeLatency.add(wres.timings.duration);
     // Count accepted records for a true write-throughput number.
     let accepted = MEMORIES_PER;
     try {
@@ -188,7 +207,9 @@ export default function (data) {
   });
   const sok = sres.status >= 200 && sres.status < 300;
   errors.add(!sok, { op: 'search' });
-  searchLatency.add(sres.timings.duration);
+  // Same as the write path: record search latency only on a 2xx so percentiles
+  // are over successful queries. Failures count toward rb_errors / http_req_failed.
+  if (sok) searchLatency.add(sres.timings.duration);
 
   // --- (c) READ-YOUR-WRITES probe ---------------------------------------
   // Write a sentinel with a known id + known vector, then query with that
@@ -208,7 +229,12 @@ export default function (data) {
   const pwok = pwres.status === 200;
   errors.add(!pwok, { op: 'ryw_write' });
 
-  if (pwok) {
+  if (!pwok) {
+    // A failed sentinel write means the write was never visible — that is a
+    // read-your-writes MISS, not an absence of evidence. Recording nothing here
+    // would inflate the hit-rate by exclusion. No genuine hit -> no lag sample.
+    rywHit.add(false);
+  } else {
     const pbody = {
       dataset: ds,
       vector: sentinelVec,
@@ -221,7 +247,6 @@ export default function (data) {
     });
     const pqok = pqres.status >= 200 && pqres.status < 300;
     errors.add(!pqok, { op: 'ryw_query' });
-    rywLag.add(Date.now() - t0);
 
     let hit = false;
     if (pqok) {
@@ -233,7 +258,12 @@ export default function (data) {
         }
       } catch (_e) { hit = false; }
     }
+    // A failed/empty probe query is a MISS (the write was not read back), so it
+    // counts toward the hit-rate as false. Record the lag Trend ONLY on a
+    // genuine hit (sentinel id actually returned) — a 503 or empty round-trip
+    // must not land in the lag distribution.
     rywHit.add(hit);
+    if (hit) rywLag.add(Date.now() - t0);
   }
 }
 
@@ -259,7 +289,7 @@ function textSummary(data) {
     v === undefined ? '-' : typeof v === 'number' ? v.toFixed(2) : v;
   return [
     `--- agent-memory bench (MODE=${MODE} AGENTS=${AGENTS} DIM=${DIM} MEMORIES_PER=${MEMORIES_PER} DURATION=${DURATION}) ---`,
-    `writes            : ${fmt(w.count)}  (throughput ${fmt(w.rate)} ops/s)`,
+    `writes (batch)    : ${fmt(w.count)}  (throughput ${fmt(w.rate)} ops/s, excl. sentinel probe)`,
     `write p50/p95/p99 : ${fmt(wl.med)} / ${fmt(wl['p(95)'])} / ${fmt(wl['p(99)'])} ms`,
     `search p50/p95/p99: ${fmt(sl.med)} / ${fmt(sl['p(95)'])} / ${fmt(sl['p(99)'])} ms`,
     `read-your-writes  : hit-rate ${fmt((ryw.rate || 0) * 100)}%  lag p95 ${fmt(lag['p(95)'])} ms`,

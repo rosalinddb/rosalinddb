@@ -132,6 +132,31 @@ the id comes back and the round-trip lag).
 - **Error rate** (`rb_errors`) across writes, searches, and probes.
 - A **per-agent vs shared** comparison across agent counts.
 
+### Metric conventions (read before quoting numbers)
+
+- **`rb_writes` is batch-memory write throughput** — the workload — and
+  **excludes** the per-iteration sentinel probe write (a correctness check, not
+  the workload). At the default `MEMORIES_PER=5` the probe is ~1/(5+1) ≈ **17%**
+  of write ops, so `rb_writes` understates *total* recall write load by that
+  much; it is **not** total recall ops/s. The pgvector CPU you see in the
+  utilization table covers the batch writes *plus* the sentinel write *plus* the
+  two queries per iteration.
+- **Latency percentiles are over successful (2xx) responses only.**
+  `rb_write_latency` / `rb_search_latency` record a sample only on a 2xx, the
+  standard convention — error-response latency (a fast fast-fail or a slow
+  timeout, most likely in the shared 100-agent scaling-cliff cell) would
+  otherwise skew the p50/p95/p99. Failures still count toward `rb_errors` and
+  k6's built-in `http_req_failed`.
+- **`rb_ryw_hit` counts failures as misses.** A failed sentinel write or a
+  failed/empty probe query records `false` (a real read-your-writes miss), so
+  the hit-rate can't be inflated by silently excluding failures. `rb_ryw_lag_ms`
+  is recorded only on a genuine hit (the sentinel id actually came back).
+- **Within-cell latency is non-stationary.** Sentinels and batches accumulate in
+  the recall partition for the whole cell and are never deleted, so the
+  exhaustive scan cost grows monotonically during a 2m cell; a cell's p95 blends
+  cheap early iterations with expensive late ones. This is the intended cliff
+  signal, not a steady-state number.
+
 ### Two modes
 
 - **`per-agent`** (default, recommended) — each agent owns its OWN dataset. The

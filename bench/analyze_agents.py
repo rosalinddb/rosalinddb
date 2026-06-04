@@ -221,6 +221,23 @@ def render_md(cells: list[dict[str, Any]]) -> str:
         "`agent_id` (exhaustive server-side scan)."
     )
     lines.append("")
+    lines.append(
+        "**Metric notes.** `write tput` (`rb_writes`) is **batch-memory write "
+        "throughput** — the workload — and **excludes** the per-iteration "
+        "sentinel probe write (a correctness check, ~17% of write ops at the "
+        "default MEMORIES_PER=5); it is NOT total recall write ops/s, and the "
+        "pgvector CPU attributed to writes also covers the sentinel write + 2 "
+        "queries/iteration. Latency percentiles are over **successful (2xx) "
+        "requests only**; errors count toward `err %` / `http_req_failed`. RYW "
+        "hit-rate counts a failed sentinel write or failed/empty probe query as "
+        "a **miss**; RYW lag is recorded only on genuine hits. Within a cell, "
+        "latency is **non-stationary**: sentinels + batches accumulate in the "
+        "recall partition for the whole cell and are never deleted, so the "
+        "exhaustive scan cost grows monotonically and the reported p95 blends "
+        "cheap early iterations with expensive late ones (this is the intended "
+        "cliff signal, not steady-state)."
+    )
+    lines.append("")
 
     modes = sorted({c["mode"] for c in cells})
 
