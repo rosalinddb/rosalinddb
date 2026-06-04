@@ -444,6 +444,125 @@ def _reconstruct_surviving(index, survivor_int_ids: list[int]) -> np.ndarray:
     return out
 
 
+def _is_ivf_index(index) -> bool:
+    """True iff `index` wraps an IVF (so `remove_ids` can trip the FAISS abort).
+
+    `remove_ids` is safe on a *flat* `IndexIDMap2(IndexFlatL2)` shard — only the
+    IVF removal trips the FAISS 1.8.0 `j == index->ntotal` C++ assertion. We
+    detect IVF via `try_extract_index_ivf` (returns `None` for a flat index)
+    rather than the catalog's `index_type` string so the decision is grounded in
+    the actual loaded index, not a possibly-stale sidecar/catalog label.
+    """
+    return faiss.try_extract_index_ivf(index) is not None
+
+
+def _union_rebuild_blob(
+    index,
+    existing_sidecar: dict,
+    drop_int_ids: set[int],
+    new_ids: list[str],
+    new_vectors: np.ndarray,
+    new_metas: list[dict],
+) -> tuple[bytes, bytes, str, int]:
+    """Rebuild a shard as a UNION instead of `remove_ids`-ing the dropped ids.
+
+    Shared by every path that must drop ids overlapping an existing IVF shard —
+    the consolidation fold (#18, `_build_consolidated_shard`), the landing-ingest
+    incremental upsert, and the single-id delete (#28). All three would otherwise
+    `remove_ids` the stale copies, which on an `IndexIDMap2(IVFFlat)` trips a
+    FAISS 1.8.0 C++ assertion (`j == index->ntotal`, IndexIDMap.cpp:181) that
+    `abort()`s the whole builder process — NOT a catchable Python error. So we
+    REBUILD a fresh shard from scratch (which never removes):
+
+        surviving vectors (existing ids NOT in `drop_int_ids`)
+        ∪ the new/updated vectors (`new_ids`/`new_vectors`/`new_metas`)
+
+    IVFFlat survivor reconstruction is LOSSLESS (raw float32), and the rebuild
+    re-trains the IVF quantizer over the union, keeping recall sound as the
+    dataset evolves. For a delete `new_*` are empty (survivors only); for an
+    upsert they carry the incoming batch.
+
+    CRITICAL (review P1, carried from #18): the rebuilt index must carry each
+    survivor's ORIGINAL int64 — the exact hash its vector was reconstructed under
+    — NOT a re-hash of a synthesised string id. For a survivor present in the
+    sidecar `_id_to_int64(entry["id"]) == sid` round-trips, but a survivor MISSING
+    from a partial/unreadable sidecar (`read_shard_sidecar` degrades to `{}`) is
+    given a synthesised `str(sid)` id; re-hashing that gives
+    `_id_to_int64(str(sid)) != sid`, stamping the vector under a WRONG int64 —
+    unreachable by its true id and un-removable by a future tombstone. So we
+    CONCATENATE the actual survivor int64s with the new ids' int64s rather than
+    re-hashing the union string ids, and key the sidecar by those same int64s.
+
+    Returns `(index_blob, sidecar_blob, index_type_str, total_vectors)`.
+    """
+    existing_int_ids = set(faiss.vector_to_array(index.id_map).tolist())
+    survivor_int_ids = [
+        int(i) for i in existing_int_ids if int(i) not in drop_int_ids
+    ]
+    survivor_vectors = _reconstruct_surviving(index, survivor_int_ids)
+
+    # Map each survivor int64 back to its (string id, metadata) via the existing
+    # sidecar — for the SIDECAR only. A survivor missing from the sidecar still
+    # keeps its vector; we synthesise a stable string id from the int64 so it has
+    # a sidecar entry and is never silently dropped.
+    survivor_ids: list[str] = []
+    survivor_metas: list[dict] = []
+    for sid in survivor_int_ids:
+        entry = existing_sidecar.get(str(sid))
+        if entry is not None:
+            survivor_ids.append(entry.get("id", str(sid)))
+            survivor_metas.append(entry.get("metadata", {}) or {})
+        else:
+            survivor_ids.append(str(sid))
+            survivor_metas.append({})
+
+    has_new = len(new_ids) > 0 and new_vectors.size > 0
+    union_ids = survivor_ids + list(new_ids)
+    union_metas = survivor_metas + list(new_metas)
+    if survivor_vectors.shape[0] and has_new:
+        union_vectors = np.concatenate([survivor_vectors, new_vectors], axis=0)
+    elif has_new:
+        union_vectors = new_vectors
+    else:
+        union_vectors = survivor_vectors
+    # Carry survivors' ORIGINAL int64s through unchanged (see CRITICAL note
+    # above); only the new rows are hashed from their string ids. Order matches
+    # `union_vectors`/`union_ids`/`union_metas` (survivors first).
+    union_int_ids = np.array(
+        survivor_int_ids + [_id_to_int64(i) for i in new_ids],
+        dtype=np.int64,
+    )
+
+    # Rebuild via the from-scratch builder selection (IVFFlat when the union is
+    # large enough to train, else flat) — never `remove_ids`.
+    nlist_target = _choose_nlist(int(union_vectors.shape[0]))
+    if (
+        INDEX_TYPE == "ivfflat"
+        and nlist_target >= 4
+        and union_vectors.shape[0] >= IVF_TRAINING_FLOOR
+    ):
+        blob = build_ivfflat(union_vectors, union_int_ids)
+        index_type_str = "ivfflat"
+    else:
+        blob = build_flat(union_vectors, union_int_ids)
+        index_type_str = "flat"
+    # Keep index↔sidecar consistent: stamp the sidecar under the SAME int64s
+    # carried into the index (`union_int_ids`), not a re-hash of `union_ids`,
+    # which would re-derive the WRONG key for a missing-from-sidecar survivor.
+    sidecar_blob = json.dumps(
+        {
+            str(int(int64_id)): {
+                "id": raw_id,
+                "metadata": meta if isinstance(meta, dict) else {},
+            }
+            for int64_id, raw_id, meta in zip(
+                union_int_ids.tolist(), union_ids, union_metas
+            )
+        }
+    ).encode("utf-8")
+    return blob, sidecar_blob, index_type_str, int(union_vectors.shape[0])
+
+
 # Number of newest shards to retain when sweeping superseded ones. The newest
 # shard is the one queries load; the one before it is a grace buffer for an
 # in-flight query that resolved it as the latest shard moments before this
@@ -835,22 +954,54 @@ def _run_once_locked(dataset: str, tenant: str) -> int:
                     faiss.vector_to_array(index.id_map).tolist()
                 )
                 overlap = [int(i) for i in int_ids if int(i) in existing_int_ids]
-                if overlap:
-                    _remove_ids(index, overlap)
-                # Still read the sidecar for the metadata merge below — it is
-                # NOT used for the overlap gate above.
+                # Still read the sidecar for the metadata merge / union rebuild
+                # below — it is NOT used for the overlap gate above.
                 existing_sidecar = read_shard_sidecar(latest_shard["shard_uri"])
-                _add_to_index(index, vectors, int_ids)
-                index_type_str = latest_shard.get("index_type", "flat")
-                blob = _serialize_index(index)
-                # Merge the existing sidecar with the new batch's entries so
-                # the shard's id/metadata map covers batch1 + batch2. A dict
-                # update overwrites by key, so an upserted id's metadata
-                # reflects the NEW (within-batch-deduped) value.
-                merged_sidecar = dict(existing_sidecar)
-                merged_sidecar.update(_sidecar_dict(ids, metas))
-                sidecar_blob = json.dumps(merged_sidecar).encode("utf-8")
-                total_vectors = int(getattr(index, "ntotal", 0))
+                if overlap and _is_ivf_index(index):
+                    # UNION-REBUILD PATH (#28, same fix as #18's consolidation
+                    # fold). The incoming batch re-upserts ids already in an IVF
+                    # shard, so we would otherwise `_remove_ids(overlap)` the
+                    # stale copies before re-adding. On an `IndexIDMap2(IVFFlat)`
+                    # that trips a FAISS 1.8.0 C++ assertion (`j ==
+                    # index->ntotal`, IndexIDMap.cpp:181) that `abort()`s the
+                    # whole builder process — NOT a catchable Python error. So
+                    # instead of remove+add we REBUILD the shard from scratch as
+                    # a UNION: surviving cold vectors (existing ids the batch does
+                    # NOT re-upsert) ∪ the incoming batch (carrying its NEW
+                    # values), preserving every survivor's ORIGINAL int64. The
+                    # re-upserted ids appear ONLY in the new set, so they win
+                    # last-write and are never duplicated. (See
+                    # `_union_rebuild_blob` for the lossless-reconstruct + P1
+                    # original-int64 details.)
+                    blob, sidecar_blob, index_type_str, total_vectors = (
+                        _union_rebuild_blob(
+                            index,
+                            existing_sidecar,
+                            drop_int_ids=set(overlap),
+                            new_ids=ids,
+                            new_vectors=vectors,
+                            new_metas=metas,
+                        )
+                    )
+                else:
+                    # Cheap path: no overlap (append-only) OR a flat shard where
+                    # `remove_ids` is safe (only the IVF removal trips the
+                    # abort). Remove the stale copies — overlap-gated so this
+                    # O(N) scan is skipped in the common append-only case — then
+                    # `add()` the new batch onto the loaded index, no rebuild.
+                    if overlap:
+                        _remove_ids(index, overlap)
+                    _add_to_index(index, vectors, int_ids)
+                    index_type_str = latest_shard.get("index_type", "flat")
+                    blob = _serialize_index(index)
+                    # Merge the existing sidecar with the new batch's entries so
+                    # the shard's id/metadata map covers batch1 + batch2. A dict
+                    # update overwrites by key, so an upserted id's metadata
+                    # reflects the NEW (within-batch-deduped) value.
+                    merged_sidecar = dict(existing_sidecar)
+                    merged_sidecar.update(_sidecar_dict(ids, metas))
+                    sidecar_blob = json.dumps(merged_sidecar).encode("utf-8")
+                    total_vectors = int(getattr(index, "ntotal", 0))
                 indexed_uris = sorted(already_indexed | set(new_parts))
             else:
                 # --- first ingest: full train + build, exactly as before
@@ -1019,17 +1170,45 @@ def _run_delete_locked(dataset: str, tenant: str, vector_id: str) -> int:
                 update_dataset_status(tenant, dataset, "indexed")
                 return 0
 
-            _remove_ids(index, [target])
-            blob = _serialize_index(index)
+            if _is_ivf_index(index):
+                # UNION-REBUILD PATH (#28, same fix as #18's consolidation fold).
+                # Deleting `target` from an IVF shard would `_remove_ids([target])`
+                # it, but on an `IndexIDMap2(IVFFlat)` that trips a FAISS 1.8.0 C++
+                # assertion (`j == index->ntotal`, IndexIDMap.cpp:181) that
+                # `abort()`s the whole builder process — NOT a catchable Python
+                # error — and even when it does not abort it leaves the IVF
+                # inverted lists with non-sequential ids, so the shard's direct
+                # map can no longer be built (a later consolidation fold's
+                # `reconstruct` would then fail). So instead of removing we REBUILD
+                # the shard from scratch as the UNION of the SURVIVORS (every
+                # existing id except `target`) with no new rows, preserving each
+                # survivor's ORIGINAL int64. The deleted id is in neither set, so
+                # it is simply absent from the rebuilt shard.
+                existing_sidecar = read_shard_sidecar(latest_shard["shard_uri"])
+                blob, sidecar_blob, index_type_str, total_vectors = (
+                    _union_rebuild_blob(
+                        index,
+                        existing_sidecar,
+                        drop_int_ids={target},
+                        new_ids=[],
+                        new_vectors=np.empty((0, int(index.d)), dtype=np.float32),
+                        new_metas=[],
+                    )
+                )
+            else:
+                # Flat shard: `remove_ids` is safe (only the IVF removal trips the
+                # abort), so drop the id in place and re-serialize — no rebuild.
+                _remove_ids(index, [target])
+                blob = _serialize_index(index)
 
-            # Drop the deleted id from the sidecar so the id/metadata map
-            # matches the index exactly. Keyed by the str(int64) hash.
-            sidecar = dict(read_shard_sidecar(latest_shard["shard_uri"]))
-            sidecar.pop(str(target), None)
-            sidecar_blob = json.dumps(sidecar).encode("utf-8")
+                # Drop the deleted id from the sidecar so the id/metadata map
+                # matches the index exactly. Keyed by the str(int64) hash.
+                sidecar = dict(read_shard_sidecar(latest_shard["shard_uri"]))
+                sidecar.pop(str(target), None)
+                sidecar_blob = json.dumps(sidecar).encode("utf-8")
 
-            index_type_str = latest_shard.get("index_type", "flat")
-            total_vectors = int(getattr(index, "ntotal", 0))
+                index_type_str = latest_shard.get("index_type", "flat")
+                total_vectors = int(getattr(index, "ntotal", 0))
             # Carry the superseded shard's landing manifest forward unchanged —
             # the parts are still folded in (minus one removed vector), so a
             # later ingest still treats them as already-indexed.
