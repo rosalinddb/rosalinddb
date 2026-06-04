@@ -1188,6 +1188,148 @@ DO UPDATE SET
     return n
 
 
+# --- Recall-tier read path (brute-force exact search) ----------------------
+#
+# The query union (PR4): when the recall tier is on, `POST /v1/query` searches
+# BOTH the consolidated (cold) shard AND the recall tier, then merges. This is
+# the recall half — a brute-force exact L2 scan over `recall_vectors`, scoped to
+# one `(tenant, dataset)` partition and to the rows ABOVE the resolved shard's
+# watermark (`lsn > consolidated_lsn`). It returns BOTH live rows and tombstones
+# (`deleted` rows above the watermark) so the merge in `v1_query` can suppress a
+# consolidated id whose recall version is a tombstone. The metric is aligned to
+# FAISS by SQUARING pgvector's plain-L2 `<->` (both tiers store the same
+# un-normalised vectors). See docs/architecture/recall-consolidate.md, "Read
+# path — the union" and invariants I1/I3.
+
+
+def recall_search(
+    tenant_id: str,
+    dataset: str,
+    vector: List[float],
+    top_k: int,
+    watermark: int,
+    flt: Optional[dict] = None,
+) -> List[dict]:
+    """Brute-force exact L2 search of the recall tier above `watermark`.
+
+    Returns up to `top_k` rows as dicts `{"id", "score", "metadata", "deleted"}`,
+    ascending by `score`, where `score` is the FAISS-aligned **L2-squared**
+    distance — pgvector's `<->` (plain Euclidean L2) SQUARED, so it can be merged
+    directly with the cold shard's FAISS L2² distances. Both tiers store the same
+    UN-normalised vectors, so squaring is the only alignment needed (the most
+    likely silent ranking bug — it has a dedicated test).
+
+    Scope (I1 partition + I3 watermark pairing):
+      WHERE tenant_id=? AND dataset=? AND lsn > :watermark
+    The recall tier owns `lsn > consolidated_lsn`; the cold shard owns `<=` — so
+    the union is complete with no double-count. `watermark` MUST be the
+    `consolidated_lsn` of the shard the cold search ACTUALLY resolved (the caller
+    pairs them), never a watermark read independently.
+
+    Tombstones are NOT filtered out here: a `deleted=true` row above the
+    watermark is returned (with `deleted=True`) so the caller can suppress a
+    matching consolidated id. Only LIVE rows are eligible to BE a match; that
+    distinction is made by the caller during the merge.
+
+    The metadata `filter` (AND-of-equals, same semantics as the cold path's
+    `metadata_matches_filter`) is applied to LIVE rows in Python after the scan,
+    NOT pushed into SQL — the recall set is small by construction (bounded by
+    consolidation cadence, not data size) so an exact scan + Python filter is
+    sub-millisecond and keeps the equality semantics byte-identical to the cold
+    path (exact type+value, no JSONB coercion surprises). A tombstone is returned
+    regardless of the filter so a delete always suppresses its consolidated id.
+
+    Only ever called when `recall_enabled()` is True (the query path gates it),
+    so it never runs — and never opens a recall connection — with the flag off.
+    """
+    qlit = _to_pgvector_literal(vector)
+    # Pull every candidate row for this partition above the watermark, ordered by
+    # the FAISS-aligned squared L2 distance. `power(embedding <-> %s, 2)` squares
+    # pgvector's plain-L2 `<->` so the score matches FAISS L2². The query vector
+    # is bound TWICE — once for the score expression, once for the ORDER BY — so
+    # the same literal drives both.
+    #
+    # No SQL `LIMIT`: tombstones must ALL be returned for suppression (a tombstone
+    # past the top_k-th live row can still suppress a cold id — see the loop
+    # below), and the live-row `top_k` truncation happens in Python. The recall
+    # set is small by construction (bounded by consolidation cadence, not data
+    # size — §Recall search), so materialising the whole partition is cheap.
+    with contextlib.closing(_recall_conn()) as conn, conn, conn.cursor() as cur:
+        cur.execute(
+            """
+SELECT id,
+       power(embedding <-> %s, 2) AS score,
+       metadata,
+       deleted
+FROM recall_vectors
+WHERE tenant_id = %s AND dataset = %s AND lsn > %s
+ORDER BY embedding <-> %s ASC
+            """,
+            (qlit, tenant_id, dataset, watermark, qlit),
+        )
+        rows = cur.fetchall()
+
+    flt = flt or {}
+    out: List[dict] = []
+    live_count = 0
+    for rid, score, metadata, deleted in rows:
+        # `metadata` is JSONB → psycopg2 already decodes it to a Python dict.
+        meta = metadata if isinstance(metadata, dict) else (metadata or {})
+        if deleted:
+            # A tombstone is ALWAYS returned (it suppresses a consolidated id),
+            # regardless of the filter and regardless of `top_k`. We do NOT stop
+            # the scan after `top_k` live rows: a tombstone further out in the
+            # distance ordering must still suppress its cold id — the cold id's
+            # FAISS distance is computed over the CONSOLIDATED embedding, which
+            # may differ from this tombstone's (stale) recall embedding, so we
+            # cannot assume the cold match ranks beyond `top_k` just because the
+            # tombstone does. The recall set is small by construction, so the full
+            # scan for tombstones is cheap.
+            out.append(
+                {"id": rid, "score": float(score), "metadata": meta, "deleted": True}
+            )
+            continue
+        # Live row past the top_k closest survivors: it cannot be a match (the
+        # `top_k` closer live rows already beat it) AND it is not a tombstone, so
+        # it has no effect on the merge — skip it. Keep scanning for tombstones.
+        if live_count >= top_k:
+            continue
+        # Live row: apply the AND-of-equals filter. A null/empty filter matches
+        # everything. The predicate must match `metadata_matches_filter` exactly
+        # (type+value, no coercion), so reuse that logic.
+        if flt and not _metadata_matches_filter(meta, flt):
+            continue
+        out.append(
+            {"id": rid, "score": float(score), "metadata": meta, "deleted": False}
+        )
+        live_count += 1
+    return out
+
+
+def _metadata_matches_filter(metadata: dict, flt: dict) -> bool:
+    """AND-of-equals predicate — the recall-side mirror of the cold path's
+    `services.query_api.v1_query.metadata_matches_filter`.
+
+    Duplicated (kept tiny and in sync) rather than imported so the state adapter
+    does not take a dependency on the query service package — the same
+    classifier-duplication rationale the query path already uses for its
+    ephemeral-runner twin. Semantics are identical: every filter key must be
+    present with an EXACTLY-equal value (same `type()` and `==`); a `null` filter
+    value never matches; an empty filter matches everything.
+    """
+    for key, want in flt.items():
+        if want is None:
+            return False
+        if key not in metadata:
+            return False
+        got = metadata[key]
+        if type(got) is not type(want):
+            return False
+        if got != want:
+            return False
+    return True
+
+
 # --- Per-dataset build advisory lock (multi-worker safety) ----------------
 
 
