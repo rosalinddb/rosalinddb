@@ -254,6 +254,35 @@ def test_evict_shard_drops_entry():
     assert v1q.evict_shard("doomed") is False
 
 
+def test_oversize_warned_set_is_bounded(monkeypatch):
+    """`_OVERSIZE_WARNED` must not grow forever: `cache_clear()` empties it and
+    `evict_shard(id)` drops that id, so a re-added shard can warn again and the
+    set can never accumulate ids for shards that are long gone."""
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_BYTES", 500)
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_SIZE", 0)
+    v1q.cache_clear()
+    assert v1q._OVERSIZE_WARNED == set()
+
+    # An oversized put records a one-time-per-shard warning mark.
+    v1q._cache_put("huge1", object(), _SizedSidecar(5000))
+    v1q._cache_put("huge2", object(), _SizedSidecar(5000))
+    assert "huge1" in v1q._OVERSIZE_WARNED
+    assert "huge2" in v1q._OVERSIZE_WARNED
+
+    # evict_shard(id) drops just that id from the warned set...
+    v1q.evict_shard("huge1")
+    assert "huge1" not in v1q._OVERSIZE_WARNED
+    assert "huge2" in v1q._OVERSIZE_WARNED
+
+    # ...so a re-added shard can warn again (set re-populates for huge1).
+    v1q._cache_put("huge1", object(), _SizedSidecar(5000))
+    assert "huge1" in v1q._OVERSIZE_WARNED
+
+    # cache_clear() empties the warned set entirely.
+    v1q.cache_clear()
+    assert v1q._OVERSIZE_WARNED == set()
+
+
 def test_shard_cache_bytes_env_override(monkeypatch):
     """`RB_SHARD_CACHE_BYTES` is the operator knob: reloading the module with
     the env set must apply the override to the byte budget."""

@@ -244,7 +244,9 @@ FAISS call, not the surrounding plumbing.
 4. On miss: download the shard `.bin` and `.bin.meta.json` from object
    storage, `faiss.read_index` the bytes, parse the sidecar.
 5. Insert into the cache with a measured byte footprint. Evict LRU entries
-   until the running total fits `RB_SHARD_CACHE_BYTES` (default 512 MB).
+   until the running total fits `RB_SHARD_CACHE_BYTES` (default 1 GiB). A
+   shard larger than the whole budget is gracefully bypassed (never inserted,
+   warm neighbours untouched) rather than admitted then immediately evicted.
    The byte budget — not a count cap — is what bounds DP memory: shard
    footprints span ~100× across datasets (a 1k-vector shard vs a 1M-vector
    ~430 MB one), so a count cap cannot pin memory usage. See
@@ -356,7 +358,7 @@ The notable env vars, beyond `RB_REQUIRE_AUTH` and `RB_ENABLE_QUOTAS`:
 | `QUERY_DP_URL` | (compose: `http://query_dp:8080`) | CP's base URL for the shared Query-DP pool. |
 | `RB_PROXY_SECRET` | unset | If set on both `cp` and `query-dp`, the DP rejects CP requests without a matching `X-RB-Proxy-Secret`. |
 | `RB_QUERY_NPROBE` | `64` | IVF cells to scan per query. |
-| `RB_SHARD_CACHE_BYTES` | `536870912` (512 MB) | Query-DP in-process shard-cache budget. |
+| `RB_SHARD_CACHE_BYTES` | `1073741824` (1 GiB) | Query-DP in-process shard-cache budget. A shard larger than the whole budget is gracefully bypassed (served uncached), not admitted then evicted. |
 | `QUEUE_MAX_ATTEMPTS` | `5` | Deliveries before a message is dead-lettered. |
 | `QUEUE_RECLAIM_TIMEOUT` | `300` | Seconds before the reaper considers a processing-list message stale. |
 | `IMPORT_MAX_BYTES` | `5368709120` (5 GiB) | Bulk-import staged-upload size cap. |

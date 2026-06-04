@@ -30,9 +30,9 @@ deactivate fsL
 dpL -> dpL : faiss.read_index(path)\n(deserialise into Python object)
 note left of dpL #FFD9B0
   RAM cost on open: ~6.3 GB resident.
-  Cache cannot admit one shard above
-  RB_SHARD_CACHE_BYTES (default 512 MB)
-  without immediately evicting itself.
+  A shard above RB_SHARD_CACHE_BYTES
+  (default 1 GiB) is gracefully bypassed:
+  served uncached, warm neighbours kept.
 end note
 
 dpR -> fsR : open shard.bin

@@ -225,8 +225,9 @@ RB_SHARD_CACHE_SIZE = max(0, int(os.getenv("RB_SHARD_CACHE_SIZE", "0")))
 # Shard ids already warned about for exceeding the cache budget. Keeps the
 # oversize WARNING "one-time-ish" — logged once per shard id per process so an
 # under-provisioned operator gets a loud signal without a per-query log storm.
-# Bounded implicitly by the number of distinct oversized shards a process sees;
-# in practice a tiny set (an operator fixes the budget once they notice).
+# Kept strictly bounded: `evict_shard()` discards a swept shard's id and
+# `cache_clear()` empties the set, so it never accumulates ids for shards that
+# are gone and a re-added shard can warn again.
 _OVERSIZE_WARNED: set = set()
 
 
@@ -797,6 +798,9 @@ def evict_shard(shard_id) -> bool:
     global _SHARD_CACHE_BYTES_USED
     with _SHARD_CACHE_LOCK:
         entry = _SHARD_CACHE.pop(shard_id, None)
+        # Drop any oversize-warned mark so a re-added shard can warn again and
+        # the warned set cannot grow without bound as shards come and go.
+        _OVERSIZE_WARNED.discard(shard_id)
         if entry is None:
             return False
         _SHARD_CACHE_BYTES_USED -= entry[2]
@@ -809,6 +813,8 @@ def cache_clear() -> None:
     with _SHARD_CACHE_LOCK:
         _SHARD_CACHE.clear()
         _SHARD_CACHE_BYTES_USED = 0
+        # Keep the oversize-warned set bounded: a full reset clears it too.
+        _OVERSIZE_WARNED.clear()
 
 
 router = APIRouter()

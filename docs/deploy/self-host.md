@@ -70,7 +70,7 @@ The ~10 most useful knobs. Every other env var lives in the source — grep
 | `RB_RATE_LIMIT_RPS` | Sustained rate-limit ceiling (when quotas enabled) | `50` |
 | `RB_RATE_LIMIT_BURST` | Burst capacity | `100` |
 | `RB_QUERY_NPROBE` | FAISS IVF nprobe — recall vs. latency knob | `64` |
-| `RB_SHARD_CACHE_BYTES` | Per-DP shard cache byte budget | `512 MiB` |
+| `RB_SHARD_CACHE_BYTES` | Per-DP shard cache byte budget | `1 GiB` |
 | `IMPORT_MAX_BYTES` | Bulk-import staged-upload size cap | `5 GiB` |
 | `RB_PG_POOL_MAX` | Per-process Postgres pool ceiling | `10` |
 | `CORS_ALLOW_ORIGINS` | Comma-separated extra CORS origins for browser clients | `""` (localhost dev range always allowed) |
