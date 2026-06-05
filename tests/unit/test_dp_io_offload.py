@@ -6,7 +6,7 @@ THE PROBLEM
 -----------
 `dp_v1_query` is an ``async def`` FastAPI handler, but it calls
 ``execute_v1_query`` synchronously on the event loop.  On a shard *cache miss*
-``execute_v1_query`` → ``run_query`` → ``_hot_search`` performs:
+``execute_v1_query`` → ``run_query`` → ``_search_consolidated_shard`` performs:
 
   1. ``_ensure_cached`` → ``read_bytes(shard_uri)`` — blocking boto3 GET
      (~80-134 ms on S3/R2, any latency on MinIO).

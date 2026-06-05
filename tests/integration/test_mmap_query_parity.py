@@ -161,7 +161,7 @@ def _run_query_under_flag(flag_value: str, tenant: str, dataset: str,
     # Bind CACHE_DIR after reload — reload re-reads the env, but the module
     # captured the value via `os.getenv("CACHE_DIR", "/var/cache/shards")`
     # at import; setenv before reload already covered that.
-    out = v1q._hot_search(tenant, dataset, query_vec, top_k=top_k)
+    out = v1q._consolidated_search(tenant, dataset, query_vec, top_k=top_k)
     assert out is not None, "no shard found — fixture wiring is wrong"
     matches, mode = out
     return matches, mode, v1q._MMAP_ENABLED
