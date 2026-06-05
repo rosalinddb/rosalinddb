@@ -188,10 +188,13 @@ def test_delta_fold_grace_is_generation_aware(
     extra_recs, _ = _deterministic_recall_rows(5, _DIM, 22, "x")
     _post_recall(client, s["token"], "dt", extra_recs)
     n2 = builder.run_consolidate_once("dt", tenant)
-    # Grace 0 means the base band was NOT trimmed, so this fold re-snapshots the
-    # whole live partition (the 80 base ids + the 5 new) — deltas accumulate
-    # under the flag until PR-D's major compaction. That is expected and fine.
-    assert n2 == _N_BASE + 5
+    # Grace 0 means the base band is NOT trimmed, so the snapshot STILL contains
+    # the already-folded base rows (lsn <= the base frontier) alongside the 5 new
+    # ones. A delta fold must write ONLY the rows above the frontier — the base +
+    # prior deltas already cover the rest — so the fold processes exactly the 5
+    # new rows (O(new), not O(recall)). (A frontier filter, not a re-fold of the
+    # whole partition — the bench-found minor-compaction invariant.)
+    assert n2 == 5
 
     # STILL one generation (the new shard is a delta on the same base), so grace
     # stays 0 and the live base is never swept out from under its delta. The
@@ -199,6 +202,11 @@ def test_delta_fold_grace_is_generation_aware(
     # PR-D's major compaction.
     gen = state_mod.live_generation(tenant, "dt")
     assert len(gen["deltas"]) == 1
+    # The delta holds ONLY the 5 new rows (the cheap O(new) fold), not a re-fold
+    # of the whole live partition, and its band is contiguous (not degenerate).
+    delta = gen["deltas"][0]
+    assert int(delta["vector_count"]) == 5
+    assert int(delta["covered_lsn_lo"]) <= int(delta["covered_lsn_hi"])
     assert state_mod.grace_watermark(tenant, "dt", keep=2) == 0
     assert state_mod.dataset_watermark(tenant, "dt") == _N_BASE + 5
     # The base + its delta both survive the sweep (no live shard GC'd) — the P0
