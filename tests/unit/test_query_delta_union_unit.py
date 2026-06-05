@@ -394,6 +394,162 @@ def test_search_union_concatenates_across_shards(monkeypatch):
     assert any(i.startswith("d1_") for i in got), "delta1 ids missing from union"
 
 
+# --- re-upsert / overlap dedup (delta-wins precedence) -------------------------
+
+
+def _make_overlap_generation(
+    tenant="t1", dataset="ds", seed=4,
+    base_uri="memory://idx/base.bin", delta_uri="memory://idx/delta0.bin",
+):
+    """Build a base + ONE delta that SHARE an id "x" with DIFFERENT vectors.
+
+    The base holds id "x" with vector vA and metadata `{"v": "base"}`; a NEWER
+    delta holds the SAME id "x" with vector vB (far from vA) and metadata
+    `{"v": "delta"}`. This is the re-upsert scenario: PR-B folded the new copy
+    of "x" into the delta but the OLD copy stays in the base, so the concatenated
+    union would otherwise return "x" TWICE. A handful of disjoint base/delta
+    neighbours fill out the shards. Returns `(_Generation-like dict, vA, vB)`.
+    """
+    train = _rng_vectors(64, seed=seed + 100)
+    master = _master_quantizer(train)
+
+    # Base: "x" with vA + a few disjoint neighbours.
+    vA = _rng_vectors(1, seed=seed)[0]
+    base_extra_ids = [f"b{i}" for i in range(6)]
+    base_extra_vecs = _rng_vectors(6, seed=seed + 1)
+    base_ids = ["x"] + base_extra_ids
+    base_vecs = np.vstack([vA[None, :], base_extra_vecs])
+    base_metas = [{"v": "base"}] + [{"src": "base"} for _ in base_extra_ids]
+    base_blob = _build_bare_ivf_shard(master, base_ids, base_vecs)
+    _write_shard_objects(base_uri, base_blob, base_ids, base_metas)
+    base_id = _register(
+        tenant, dataset, base_uri, base_vecs, level=0, parent_shard_id=None,
+        quantizer_version=1, covered_lsn_lo=0, covered_lsn_hi=100,
+        consolidated_lsn=100,
+    )
+
+    # Delta: the NEWER copy of "x" with vB (deliberately far from vA) + neighbours.
+    vB = _rng_vectors(1, seed=seed + 50)[0]
+    delta_extra_ids = [f"d{i}" for i in range(6)]
+    delta_extra_vecs = _rng_vectors(6, seed=seed + 2)
+    delta_ids = ["x"] + delta_extra_ids
+    delta_vecs = np.vstack([vB[None, :], delta_extra_vecs])
+    delta_metas = [{"v": "delta"}] + [{"src": "delta"} for _ in delta_extra_ids]
+    delta_blob = _build_bare_ivf_shard(master, delta_ids, delta_vecs)
+    _write_shard_objects(delta_uri, delta_blob, delta_ids, delta_metas)
+    _register(
+        tenant, dataset, delta_uri, delta_vecs, level=1, parent_shard_id=base_id,
+        quantizer_version=1, covered_lsn_lo=101, covered_lsn_hi=110,
+        consolidated_lsn=110,
+    )
+    return {"tenant": tenant, "dataset": dataset, "master": master}, vA, vB
+
+
+def test_reupsert_dedups_to_single_newest_copy(monkeypatch):
+    """Re-upsert: base "x"=vA + newer delta "x"=vB → union returns "x" ONCE, delta-wins.
+
+    The OLD base copy and the NEW delta copy of "x" both surface from their own
+    shard's top_k; the consolidated-vs-consolidated dedup must collapse them to
+    EXACTLY ONE entry, keeping the NEWEST band (the delta). We query AT vA (the
+    stale base vector) so a naive concat would rank the stale base copy first —
+    proving the dedup keeps the delta's identity (metadata), not the base's.
+    """
+    monkeypatch.setenv("RB_DELTA_TIER", "1")
+    gen, vA, vB = _make_overlap_generation()
+    out = v1q._resolve_shard(gen["tenant"], gen["dataset"], {})
+    top_k = 10
+    matches, mode = v1q._search_consolidated_shard(
+        gen["tenant"], gen["dataset"], vA.tolist(), top_k, None, None, out
+    )
+    ids = _ids_from_matches(matches)
+    assert ids.count("x") == 1, f"re-upserted id must appear exactly once, got {ids}"
+    # Delta-wins: the surviving copy carries the DELTA's metadata/identity.
+    x_match = next(m for m in matches if m["id"] == "x")
+    assert x_match["metadata"] == {"v": "delta"}, (
+        "newest-band (delta) copy must win the dedup, not the stale base copy"
+    )
+    assert mode in ("hot", "cold")
+
+
+def test_reupsert_dedup_through_merge_no_duplicate(monkeypatch):
+    """End-to-end through the UNCHANGED merge: no duplicate "x", a real result kept.
+
+    A naive concat would consume two of the top_k slots with the duplicate "x"
+    and push a real neighbour out. After delta-wins dedup, the merge's sort +
+    truncate yields a duplicate-free top_k.
+    """
+    monkeypatch.setenv("RB_DELTA_TIER", "1")
+    gen, vA, vB = _make_overlap_generation(seed=17)
+    out = v1q._resolve_shard(gen["tenant"], gen["dataset"], {})
+    top_k = 10
+    matches, _ = v1q._search_consolidated_shard(
+        gen["tenant"], gen["dataset"], vA.tolist(), top_k, None, None, out
+    )
+    merged = v1q._merge_recall_and_consolidated(set(), [], matches, top_k)
+    ids = _ids_from_matches(merged)
+    assert len(ids) == len(set(ids)), f"merged union must have no duplicate ids: {ids}"
+    # "x" appears AT MOST once — never the stale-base + new-delta pair. (It may
+    # rank past top_k when vB is far from the query; dedup-correctness is the
+    # no-duplicate invariant, not that the re-upserted id always survives.)
+    assert ids.count("x") <= 1
+
+
+def test_reupsert_dedup_composes_with_tombstone(monkeypatch):
+    """Dedup + delete compose: a tombstoned re-upserted id is suppressed entirely.
+
+    "x" is re-upserted (base vA + delta vB) AND tombstoned in the delta. The
+    dedup keeps exactly its newest copy; tombstone suppression then drops that
+    one copy — so "x" is ABSENT, with no lingering stale base duplicate.
+    """
+    monkeypatch.setenv("RB_DELTA_TIER", "1")
+    # Build the overlap generation, then re-register the delta WITH a tombstone on
+    # "x" so the same delta both supersedes AND deletes the id.
+    state_mod._MEM_SHARDS.clear()
+    with storage._MEM_LOCK:
+        storage._MEM_OBJECTS.clear()
+    v1q.cache_clear()
+    train = _rng_vectors(64, seed=204)
+    master = _master_quantizer(train)
+    vA = _rng_vectors(1, seed=4)[0]
+    base_ids = ["x"] + [f"b{i}" for i in range(6)]
+    base_vecs = np.vstack([vA[None, :], _rng_vectors(6, seed=5)])
+    base_metas = [{"v": "base"}] + [{"src": "base"} for _ in range(6)]
+    _write_shard_objects(
+        "memory://idx/base.bin",
+        _build_bare_ivf_shard(master, base_ids, base_vecs), base_ids, base_metas,
+    )
+    base_id = _register(
+        "t1", "ds", "memory://idx/base.bin", base_vecs, level=0, parent_shard_id=None,
+        quantizer_version=1, covered_lsn_lo=0, covered_lsn_hi=100, consolidated_lsn=100,
+    )
+    vB = _rng_vectors(1, seed=54)[0]
+    delta_ids = ["x"] + [f"d{i}" for i in range(6)]
+    delta_vecs = np.vstack([vB[None, :], _rng_vectors(6, seed=6)])
+    delta_metas = [{"v": "delta"}] + [{"src": "delta"} for _ in range(6)]
+    _write_shard_objects(
+        "memory://idx/delta0.bin",
+        _build_bare_ivf_shard(master, delta_ids, delta_vecs), delta_ids, delta_metas,
+    )
+    _register(
+        "t1", "ds", "memory://idx/delta0.bin", delta_vecs, level=1,
+        parent_shard_id=base_id, quantizer_version=1, covered_lsn_lo=101,
+        covered_lsn_hi=110, consolidated_lsn=110,
+        tombstone_int_ids=[id_to_int64("x")],
+    )
+
+    out = v1q._resolve_shard("t1", "ds", {})
+    top_k = 10
+    matches, _ = v1q._search_consolidated_shard("t1", "ds", vA.tolist(), top_k, None, None, out)
+    # Dedup already collapsed "x" to one copy inside _search_consolidated_shard.
+    assert _ids_from_matches(matches).count("x") <= 1
+    suppress = v1q._tombstone_suppress_ids(out)
+    assert "x" in suppress
+    merged = v1q._merge_recall_and_consolidated(suppress, [], matches, top_k)
+    assert "x" not in _ids_from_matches(merged), (
+        "a re-upserted-then-deleted id must be absent (no stale base duplicate)"
+    )
+
+
 # --- tombstone suppression (cold-vs-cold delete) -------------------------------
 
 

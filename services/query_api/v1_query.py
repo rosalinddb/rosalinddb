@@ -1216,7 +1216,23 @@ def _search_consolidated_shard(
         # --- Flag ON: loop-search the base + live deltas, concatenate -------
         if not shards:
             return None
-        all_matches: List[dict] = []
+        # DELTA-WINS DEDUP (review #11 BLOCKER): when an id is RE-UPSERTED, PR-B
+        # folds the NEW copy into a delta but the OLD copy stays in the base, so
+        # the concatenated union would return that id TWICE (stale base copy +
+        # new delta copy), consuming two top_k slots and pushing a real result
+        # out. The frontier-tombstone path only suppresses DELETES, not
+        # re-upsert duplicates. So dedup the concatenated consolidated matches by
+        # id, keeping the copy from the NEWEST band (greatest `covered_lsn_hi`).
+        # `resolved["shards"]` is ordered by `covered_lsn_lo` ASCENDING (base
+        # oldest → deltas newest), so writing each shard's matches into an
+        # `id -> match` dict in that order lets the later/newer copy overwrite
+        # the earlier/older one — newest-wins. The deduped matches are that
+        # dict's values; the UNCHANGED `_merge_recall_and_consolidated` still
+        # sorts by score + truncates top_k. This is consolidated-vs-consolidated
+        # ONLY — recall stays authoritative and is merged separately. It COMPOSES
+        # with tombstone suppression: a deleted id is suppressed entirely; a
+        # re-upserted id keeps exactly its newest copy.
+        deduped: Dict[str, dict] = {}
         # `mode` is the WEAKEST cache state across the fan-out: if ANY shard was
         # a cold load the query paid a cold tax, so the customer-facing mode is
         # "cold"; only when EVERY shard was a warm cache hit is it "hot".
@@ -1225,9 +1241,11 @@ def _search_consolidated_shard(
             shard_matches, is_cold = _search_one_shard(
                 tenant, dataset, vector, top_k, flt, nprobe, shard
             )
-            all_matches.extend(shard_matches)
+            for m in shard_matches:
+                # Later iterations are newer bands → overwrite to keep newest.
+                deduped[m["id"]] = m
             any_cold = any_cold or is_cold
-        return all_matches, ("cold" if any_cold else "hot")
+        return list(deduped.values()), ("cold" if any_cold else "hot")
 
     # --- Flag OFF: single-shard search, byte-identical to today -------------
     latest = resolved.get("shard")
@@ -1773,10 +1791,10 @@ def _tombstone_suppress_ids(resolved: Optional[Dict[str, Any]]) -> set:
         uri = shard.get("shard_uri")
         if not uri:
             continue
-        try:
-            sidecar = read_shard_sidecar(uri)
-        except Exception:  # noqa: BLE001 - a missing/unreadable sidecar is non-fatal here
-            continue
+        # `read_shard_sidecar` already swallows missing/unreadable-sidecar errors
+        # and returns `{}` (its docstring guarantees graceful degradation), so a
+        # try/except here would be unreachable dead code (review #11).
+        sidecar = read_shard_sidecar(uri)
         for k, entry in sidecar.items():
             if k not in lookup and isinstance(entry, dict):
                 sid = entry.get("id")

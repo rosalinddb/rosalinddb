@@ -215,11 +215,118 @@ def _build_generation(
     return all_ids, np.vstack(all_vecs), all_metas, master
 
 
+def _build_overlap_generation(
+    storage, state_mod, tenant, dataset, indexes_prefix, *, tombstone_x=False,
+):
+    """Build base + ONE delta that SHARE id "x" with DIFFERENT vectors (re-upsert).
+
+    Base holds "x"=vA (metadata `{"v": "base"}`); a NEWER delta holds the SAME
+    "x"=vB (metadata `{"v": "delta"}`). Returns `(vA, vB)`. With `tombstone_x`
+    the delta ALSO tombstones "x" (re-upsert + delete composing).
+    """
+    train = _rng(60, seed=700)
+    master = _master_quantizer(train)
+
+    vA = _rng(1, seed=1)[0]
+    base_ids = ["x"] + [f"b{i}" for i in range(6)]
+    base_vecs = np.vstack([vA[None, :], _rng(6, seed=2)])
+    base_metas = [{"v": "base"}] + [{"src": "base"} for _ in range(6)]
+    base_uri = f"{indexes_prefix}/{dataset}/base.bin"
+    storage.write_bytes(base_uri, _bare_ivf_blob(master, base_ids, base_vecs))
+    storage.write_bytes(f"{base_uri}.meta.json", _sidecar(base_ids, base_metas))
+    base_id = state_mod.add_shard(
+        tenant, dataset, base_uri, checksum="x", vector_count=len(base_ids),
+        index_type="ivfflat", build_type="consolidate", consolidated_lsn=100,
+        quantizer_version=1, level=0, covered_lsn_lo=0, covered_lsn_hi=100,
+    )
+
+    vB = _rng(1, seed=50)[0]
+    delta_ids = ["x"] + [f"d{i}" for i in range(6)]
+    delta_vecs = np.vstack([vB[None, :], _rng(6, seed=3)])
+    delta_metas = [{"v": "delta"}] + [{"src": "delta"} for _ in range(6)]
+    delta_uri = f"{indexes_prefix}/{dataset}/delta0.bin"
+    storage.write_bytes(delta_uri, _bare_ivf_blob(master, delta_ids, delta_vecs))
+    storage.write_bytes(f"{delta_uri}.meta.json", _sidecar(delta_ids, delta_metas))
+    state_mod.add_shard(
+        tenant, dataset, delta_uri, checksum="x", vector_count=len(delta_ids),
+        index_type="ivfflat", build_type="consolidate-delta", consolidated_lsn=110,
+        quantizer_version=1, level=1, parent_shard_id=base_id,
+        covered_lsn_lo=101, covered_lsn_hi=110,
+        tombstone_int_ids=([id_to_int64("x")] if tombstone_x else None),
+    )
+    return vA, vB
+
+
 def _monolith(master, ids, vecs, metas):
     mono = faiss.clone_index(master)
     mono.add_with_ids(vecs, np.array([id_to_int64(i) for i in ids], dtype=np.int64))
     sidecar = {str(id_to_int64(i)): {"id": i, "metadata": m or {}} for i, m in zip(ids, metas)}
     return mono, sidecar
+
+
+# --- re-upsert / overlap dedup (delta-wins precedence) -----------------------
+
+
+def test_delta_reupsert_dedups_delta_wins_e2e(
+    monkeypatch, recall_url, s3_indexes_prefix, tmp_path
+):
+    """Re-upsert: base "x"=vA + newer delta "x"=vB → query returns "x" ONCE, delta-wins.
+
+    Querying AT vA (the stale base vector) a naive concat would return "x" twice
+    (stale base copy + new delta copy) and rank the stale base copy first. The
+    consolidated-vs-consolidated dedup must collapse them to one entry carrying
+    the DELTA's metadata.
+    """
+    _migrate_recall(recall_url)
+    _truncate_recall(recall_url)
+    client, state_mod, _v1q = _build_client(monkeypatch, s3_indexes_prefix, tmp_path, recall_url)
+    s = _signup(client, email="reupsert@example.com")
+    client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "ru", "dimension": DIM})
+    tenant = _tenant_of(client, s)
+
+    from adapters.storage import storage
+    vA, vB = _build_overlap_generation(storage, state_mod, tenant, "ru", s3_indexes_prefix)
+    r = client.post(
+        "/v1/query", headers=_auth(s["token"]),
+        json={"dataset": "ru", "vector": vA.tolist(), "top_k": 10},
+    )
+    assert r.status_code == 200, r.text
+    matches = r.json()["matches"]
+    ids = [m["id"] for m in matches]
+    assert ids.count("x") == 1, f"re-upserted id must appear exactly once, got {ids}"
+    x_match = next(m for m in matches if m["id"] == "x")
+    assert x_match["metadata"] == {"v": "delta"}, (
+        "newest-band (delta) copy must win the dedup, not the stale base copy"
+    )
+
+
+def test_delta_reupsert_then_delete_absent_e2e(
+    monkeypatch, recall_url, s3_indexes_prefix, tmp_path
+):
+    """Re-upsert + delete compose: a re-upserted-then-tombstoned id is ABSENT.
+
+    The delta both supersedes "x" (vB) AND tombstones it; dedup keeps the newest
+    copy, tombstone suppression then drops it — leaving no stale base duplicate.
+    """
+    _migrate_recall(recall_url)
+    _truncate_recall(recall_url)
+    client, state_mod, _v1q = _build_client(monkeypatch, s3_indexes_prefix, tmp_path, recall_url)
+    s = _signup(client, email="reupsertdel@example.com")
+    client.post("/v1/datasets", headers=_auth(s["token"]), json={"name": "rud", "dimension": DIM})
+    tenant = _tenant_of(client, s)
+
+    from adapters.storage import storage
+    vA, _vB = _build_overlap_generation(
+        storage, state_mod, tenant, "rud", s3_indexes_prefix, tombstone_x=True
+    )
+    r = client.post(
+        "/v1/query", headers=_auth(s["token"]),
+        json={"dataset": "rud", "vector": vA.tolist(), "top_k": 10},
+    )
+    assert r.status_code == 200, r.text
+    ids = [m["id"] for m in r.json()["matches"]]
+    assert "x" not in ids, f"re-upserted-then-deleted id must be absent, got {ids}"
+    assert len(ids) > 0
 
 
 # --- union recall parity ----------------------------------------------------
