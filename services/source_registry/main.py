@@ -645,18 +645,18 @@ async def post_vectors(
 # `.meta.json` sidecar).
 #
 # When the recall tier is ON (`RB_RECALL`, default OFF), these endpoints UNION
-# the cold sidecar with the recall tier, with RECALL AUTHORITATIVE for any id
+# the consolidated sidecar with the recall tier, with RECALL AUTHORITATIVE for any id
 # above the resolved shard's watermark — the same recall-wins / tombstone-
-# suppress rule the QUERY union uses (`recall_search` + `_merge_recall_and_cold`):
+# suppress rule the QUERY union uses (`recall_search` + `_merge_recall_and_consolidated`):
 #   - get: a live recall row (lsn > watermark) wins (recall metadata); a recall
-#     tombstone → 404 (deleted); otherwise fall back to the cold sidecar.
-#   - list: union recall live rows with the cold sidecar (recall-wins dedup),
+#     tombstone → 404 (deleted); otherwise fall back to the consolidated sidecar.
+#   - list: union recall live rows with the consolidated sidecar (recall-wins dedup),
 #     suppress any id with a recall tombstone above the watermark, then filter +
 #     sort + paginate as before.
 #   - delete: write an ABOVE-watermark TOMBSTONE into recall (fresh lsn) and
 #     return 200/204 synchronously (read-your-deletes); consolidation applies it
-#     to cold later. Does NOT publish DELETE_VECTORS in flag-on mode.
-# With the flag OFF every endpoint is byte-identical to the cold-only path and
+#     to the consolidated tier later. Does NOT publish DELETE_VECTORS in flag-on mode.
+# With the flag OFF every endpoint is byte-identical to the consolidated-only path and
 # NEVER opens a recall connection. See docs/architecture/recall-consolidate.md
 # (PR6) + docs/api/vectors.md.
 #
@@ -721,7 +721,7 @@ def _resolve_shard_sidecar_and_watermark(
 ) -> tuple[Optional[dict], int]:
     """Resolve the newest shard ONCE; return `(sidecar_or_None, watermark)`.
 
-    The recall-union CRUD paths need BOTH the cold sidecar and the recall
+    The recall-union CRUD paths need BOTH the consolidated sidecar and the recall
     watermark, and invariant I3 (watermark/shard pairing) requires they come from
     the SAME resolved shard — never a sidecar from one shard and a watermark read
     from an independent lookup. This resolves `get_latest_shard` once and derives
@@ -785,7 +785,7 @@ def get_vector_endpoint(
     `embedding` is a plain `vector` COLUMN on `recall_vectors`, so it is returned
     via a single SELECT (no FAISS). This backs the mem0 adapter's metadata-only
     `update`, which must re-upsert WITHOUT clobbering the real embedding. For a
-    CONSOLIDATED (cold-only) id, returning values would require a FAISS
+    CONSOLIDATED id, returning values would require a FAISS
     `reconstruct` against the shard — deferred — so `embedding` is OMITTED from
     the response (the caller treats the absence as "not recall-resident"). The
     metadata-only response shape is unchanged when `include_values` is unset.
@@ -794,8 +794,8 @@ def get_vector_endpoint(
     AUTHORITATIVE for any id above the resolved shard's watermark. A LIVE recall
     row (`lsn > watermark`) wins → its `{id, metadata}` is returned (recall-wins);
     a recall TOMBSTONE → `404 not_found` (the id was deleted, never fall back to
-    the stale cold copy); otherwise fall back to the cold sidecar lookup below.
-    Flag OFF → cold-only (byte-identical). See
+    the stale consolidated copy); otherwise fall back to the consolidated sidecar lookup below.
+    Flag OFF → consolidated-only (byte-identical). See
     docs/architecture/recall-consolidate.md (PR6).
     """
     if state_mod.get_dataset(tenant_id, name) is None:
@@ -803,7 +803,7 @@ def get_vector_endpoint(
 
     want_values = _is_truthy_query_flag(include_values)
 
-    # Recall union. Resolve the shard ONCE so the recall watermark and the cold
+    # Recall union. Resolve the shard ONCE so the recall watermark and the consolidated
     # sidecar come from the SAME shard (I3 pairing). With the flag off this whole
     # branch is skipped and no recall connection is ever opened.
     if recall_enabled():
@@ -820,7 +820,7 @@ def get_vector_endpoint(
                 return resp
             if status == "tombstone":
                 return _err(404, "not_found", f"Vector '{vector_id}' not found")
-            # status is None: not recall-resident — fall through to the cold lookup.
+            # status is None: not recall-resident — fall through to the consolidated lookup.
         else:
             status, metadata = recall_get_vector(tenant_id, name, vector_id, watermark)
             if status == "live":
@@ -828,10 +828,10 @@ def get_vector_endpoint(
                 # version, newer than any consolidated copy.
                 return {"id": vector_id, "metadata": metadata or {}}
             if status == "tombstone":
-                # Deleted in recall — authoritative; do NOT fall back to the cold copy.
+                # Deleted in recall — authoritative; do NOT fall back to the consolidated copy.
                 return _err(404, "not_found", f"Vector '{vector_id}' not found")
             # status is None: no recall row above the watermark — fall through to
-            # the cold sidecar (the id, if any, is consolidated below the watermark).
+            # the consolidated sidecar (the id, if any, is consolidated below the watermark).
     else:
         sidecar = _newest_sidecar(tenant_id, name)
 
@@ -840,7 +840,7 @@ def get_vector_endpoint(
     entry = sidecar.get(str(id_to_int64(vector_id)))
     if entry is None:
         return _err(404, "not_found", f"Vector '{vector_id}' not found")
-    # Cold-only hit. `?include_values` cannot reconstruct the embedding here (a
+    # Consolidated-only hit. `?include_values` cannot reconstruct the embedding here (a
     # FAISS `reconstruct` is deferred), so the response stays metadata-only — the
     # absent `embedding` signals "not recall-resident" to the caller.
     return {"id": entry.get("id", vector_id), "metadata": entry.get("metadata") or {}}
@@ -864,13 +864,13 @@ def list_vectors_endpoint(
     `cursor`. Returns `{vectors: [{id, metadata}], next_cursor}`; an empty list
     when no shard exists. Tenant-scoped via `get_dataset` / `get_latest_shard`.
 
-    Recall union (`RB_RECALL`, default OFF): when on, the cold sidecar entries are
+    Recall union (`RB_RECALL`, default OFF): when on, the consolidated sidecar entries are
     unioned with the recall tier's LIVE rows above the resolved shard's watermark,
-    RECALL-WINS on a shared id (recall metadata overrides the cold copy), and any
+    RECALL-WINS on a shared id (recall metadata overrides the consolidated copy), and any
     id with a recall TOMBSTONE above the watermark is SUPPRESSED from the list —
     the same recall-authoritative dedup the QUERY union uses. The union happens
     BEFORE the metadata `filter`, so the filter sees each id's authoritative
-    (recall-or-cold) metadata. Flag OFF → cold-only (byte-identical). See
+    (recall-or-consolidated) metadata. Flag OFF → consolidated-only (byte-identical). See
     docs/architecture/recall-consolidate.md (PR6) + docs/api/vectors.md.
 
     Pagination contract (offset cursor — read this before paging):
@@ -922,7 +922,7 @@ def list_vectors_endpoint(
         if not isinstance(flt, dict):
             return _err(400, "invalid_filter", "filter must be a JSON object")
 
-    # Resolve the cold sidecar and (under the union) the recall partition above
+    # Resolve the consolidated sidecar and (under the union) the recall partition above
     # the SAME resolved shard's watermark (I3 pairing). With the flag off this is
     # a plain sidecar read and no recall connection is ever opened.
     if recall_enabled():
@@ -933,16 +933,16 @@ def list_vectors_endpoint(
         sidecar = _newest_sidecar(tenant_id, name) or {}
         recall_live, recall_suppress_ids = [], set()
 
-    # Project the cold sidecar to {id, metadata}, DROPPING any id recall is
+    # Project the consolidated sidecar to {id, metadata}, DROPPING any id recall is
     # authoritative for (`recall_suppress_ids`) — a recall tombstone hides the
-    # cold id, and a recall live row replaces the cold copy with the recall
+    # consolidated id, and a recall live row replaces the consolidated copy with the recall
     # version appended below (recall-wins dedup, mirroring the query union).
     records = [
         {"id": e.get("id"), "metadata": e.get("metadata") or {}}
         for e in sidecar.values()
         if e.get("id") is not None and e.get("id") not in recall_suppress_ids
     ]
-    # Append the recall LIVE rows (their ids were suppressed from the cold set
+    # Append the recall LIVE rows (their ids were suppressed from the consolidated set
     # above, so this is the only copy of each — no duplicate). Empty when the
     # flag is off.
     records.extend(recall_live)
@@ -965,7 +965,7 @@ def list_vectors_endpoint(
     status_code=202,
     # The success code is FLAG-CONDITIONAL: 204 (No Content, synchronous
     # read-your-deletes) on the recall path (`RB_RECALL` on), 202 (`{job_id}`,
-    # eventually-consistent builder delete) on the default cold-only path. The
+    # eventually-consistent builder delete) on the default consolidated-only path. The
     # declared `status_code=202` is the default; the recall path returns an
     # explicit `Response(204)` at runtime. Document BOTH in the OpenAPI schema so
     # the generated contract reflects the real flag-conditional behaviour rather
@@ -1012,8 +1012,8 @@ def delete_vector_endpoint(
     TOMBSTONE into the recall tier with a FRESH lsn allocated ABOVE the watermark
     (`recall_delete_vector`), so the union immediately hides the id (an immediate
     GET → 404, a `POST /query` no longer returns it) and the next consolidation
-    removes it from cold. Returns `204` — there is no async job. It does NOT
-    publish `DELETE_VECTORS`: consolidation applies the tombstone to the cold tier
+    removes it from the consolidated tier. Returns `204` — there is no async job. It does NOT
+    publish `DELETE_VECTORS`: consolidation applies the tombstone to the consolidated tier
     later (that machinery already exists), so a builder delete-rebuild here would
     be redundant. THE ABOVE-WATERMARK LSN IS A HARD CONTRACT (a below-watermark
     tombstone would be excluded from the union AND trim-eligible-unapplied — the

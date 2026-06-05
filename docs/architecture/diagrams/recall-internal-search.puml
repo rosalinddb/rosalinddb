@@ -58,7 +58,7 @@ rs -> rs : suppress_ids = EVERY id above the watermark
 note over rs #FDF3E7
   Returns (suppress_ids, matches).
   Recall is authoritative for lsn > watermark, so
-  suppress_ids drops the stale cold twin of ANY such
+  suppress_ids drops the stale consolidated twin of ANY such
   id -- tombstoned, filtered-out, or past top_k.
 end note
 

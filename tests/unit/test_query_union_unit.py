@@ -1,7 +1,7 @@
 """Unit coverage for the Recall + Consolidated query union (PR4).
 
 Hermetic — no Docker, no pgvector, no network. Exercises the merge logic and the
-`run_query` union orchestration directly, with the recall connection / cold
+`run_query` union orchestration directly, with the recall connection / consolidated
 search faked. The integration suite (`tests/integration/test_query_union.py`)
 proves the same properties end-to-end against a real pgvector container.
 
@@ -12,20 +12,20 @@ Headline properties proven here:
     The squaring is monotonic, so this is really a "we square it, and squaring
     preserves order" proof on a deterministic example — the most likely silent
     ranking bug, per the spec.
-  - **Dedup recall-wins**: a recall LIVE row overrides a cold match for the same
+  - **Dedup recall-wins**: a recall LIVE row overrides a consolidated match for the same
     id.
-  - **Authoritative suppression**: recall suppresses the stale cold copy of EVERY
+  - **Authoritative suppression**: recall suppresses the stale consolidated copy of EVERY
     id above the watermark — tombstoned, filter-failing, OR ranked-past-`top_k` —
     keying on "any recall row for this id", not "a recall row that became a
     match". A live re-upsert that fails the query filter must not let a stale,
-    filter-matching cold copy leak.
+    filter-matching consolidated copy leak.
   - **Filter gates matches, not suppression**: the AND-of-equals predicate
     decides whether a live recall row is a MATCH; it never removes an id from the
     suppression set.
   - **Watermark partition (I1/I3)**: the recall scan filters `lsn > watermark`,
     and the watermark is the resolved shard's `consolidated_lsn` (0 when no
     shard).
-  - **Flag OFF (default)**: byte-identical to the cold-only path AND no recall
+  - **Flag OFF (default)**: byte-identical to the consolidated-only path AND no recall
     connection is ever opened (the `psycopg2.connect`-raises trick).
 """
 from __future__ import annotations
@@ -49,7 +49,7 @@ def test_pgvector_l2_squared_matches_faiss_l2_squared_ordering():
     returns the plain (sqrt) Euclidean distance; the recall scan squares it. On
     a deterministic, un-normalised example the two distance vectors are equal
     (to float tolerance) AND induce the identical ascending ranking — so a merge
-    that sorts by the recall score and the cold score interleaves correctly.
+    that sorts by the recall score and the consolidated score interleaves correctly.
     """
     import faiss  # type: ignore
 
@@ -110,82 +110,82 @@ def test_watermark_reads_consolidated_lsn_of_resolved_shard():
 
 
 def test_merge_recall_wins_on_dedup():
-    """A recall LIVE row overrides a cold match for the same id (recall is newer)."""
+    """A recall LIVE row overrides a consolidated match for the same id (recall is newer)."""
     suppress = {"x"}
     recall_matches = [
         {"id": "x", "score": 5.0, "metadata": {"v": "new"}, "deleted": False},
     ]
-    cold = [
+    consolidated = [
         {"id": "x", "score": 1.0, "metadata": {"v": "old"}},  # closer, but stale
         {"id": "y", "score": 2.0, "metadata": {}},
     ]
-    merged = v1q._merge_recall_and_cold(suppress, recall_matches, cold, top_k=10)
+    merged = v1q._merge_recall_and_consolidated(suppress, recall_matches, consolidated, top_k=10)
     by_id = {m["id"]: m for m in merged}
-    # `x` is the RECALL version (metadata "new", score 5.0) — NOT the cold one,
-    # even though the cold one ranked closer.
+    # `x` is the RECALL version (metadata "new", score 5.0) — NOT the consolidated one,
+    # even though the consolidated one ranked closer.
     assert by_id["x"]["metadata"] == {"v": "new"}
     assert by_id["x"]["score"] == 5.0
-    # `y` (cold-only) survives.
+    # `y` (consolidated-only) survives.
     assert by_id["y"]["metadata"] == {}
     # Sorted ascending by score: y (2.0) before x (5.0).
     assert [m["id"] for m in merged] == ["y", "x"]
 
 
-def test_merge_recall_only_rows_when_no_cold():
-    """Recall rows alone form the result when there is no cold shard."""
+def test_merge_recall_only_rows_when_no_consolidated():
+    """Recall rows alone form the result when there is no consolidated shard."""
     recall_matches = [
         {"id": "a", "score": 3.0, "metadata": {}, "deleted": False},
         {"id": "b", "score": 1.0, "metadata": {}, "deleted": False},
     ]
-    merged = v1q._merge_recall_and_cold({"a", "b"}, recall_matches, [], top_k=10)
+    merged = v1q._merge_recall_and_consolidated({"a", "b"}, recall_matches, [], top_k=10)
     assert [m["id"] for m in merged] == ["b", "a"]
 
 
 # --- merge: tombstone / authoritative suppression -------------------------
 
 
-def test_merge_recall_tombstone_suppresses_cold_id():
-    """A recall tombstone drops the cold match for that id and yields no match.
+def test_merge_recall_tombstone_suppresses_consolidated_id():
+    """A recall tombstone drops the consolidated match for that id and yields no match.
 
     A tombstone is in `suppress_ids` but NOT in `recall_matches`.
     """
-    cold = [
+    consolidated = [
         {"id": "gone", "score": 0.5, "metadata": {"stale": True}},
         {"id": "keep", "score": 1.0, "metadata": {}},
     ]
-    merged = v1q._merge_recall_and_cold({"gone"}, [], cold, top_k=10)
+    merged = v1q._merge_recall_and_consolidated({"gone"}, [], consolidated, top_k=10)
     ids = [m["id"] for m in merged]
-    assert "gone" not in ids, "tombstone must suppress the cold id"
+    assert "gone" not in ids, "tombstone must suppress the consolidated id"
     assert ids == ["keep"], merged
 
 
-def test_merge_filtered_out_live_recall_suppresses_cold_id():
-    """A live recall row that FAILS the filter still suppresses its stale cold id.
+def test_merge_filtered_out_live_recall_suppresses_consolidated_id():
+    """A live recall row that FAILS the filter still suppresses its stale consolidated id.
 
     The P1 fix: the live row is in `suppress_ids` (every recall id above the
     watermark) but NOT in `recall_matches` (it failed the filter), so the stale
-    cold copy whose older metadata DOES match the filter must not leak.
+    consolidated copy whose older metadata DOES match the filter must not leak.
     """
-    cold = [
+    consolidated = [
         {"id": "x", "score": 0.1, "metadata": {"color": "red"}},  # stale, matches
         {"id": "y", "score": 1.0, "metadata": {}},
     ]
     # `x` was re-upserted into recall with {color: blue} (fails {color: red}) →
     # it is in suppress_ids but contributes no match.
-    merged = v1q._merge_recall_and_cold({"x"}, [], cold, top_k=10)
+    merged = v1q._merge_recall_and_consolidated({"x"}, [], consolidated, top_k=10)
     ids = [m["id"] for m in merged]
-    assert "x" not in ids, "a filter-failing live recall row must suppress its cold copy"
+    assert "x" not in ids, "a filter-failing live recall row must suppress its consolidated copy"
     assert ids == ["y"], merged
 
 
-def test_merge_suppresses_cold_for_recall_id_past_top_k():
-    """A recall id whose live row ranked past top_k still suppresses the cold copy.
+def test_merge_suppresses_consolidated_for_recall_id_past_top_k():
+    """A recall id whose live row ranked past top_k still suppresses the consolidated copy.
 
     `suppress_ids` carries the id even though no corresponding row is in
-    `recall_matches` (it was capped out), so the stale cold copy is dropped.
+    `recall_matches` (it was capped out), so the stale consolidated copy is dropped.
     """
-    cold = [{"id": "x", "score": 0.1, "metadata": {"stale": True}}]
-    merged = v1q._merge_recall_and_cold({"x"}, [], cold, top_k=10)
+    consolidated = [{"id": "x", "score": 0.1, "metadata": {"stale": True}}]
+    merged = v1q._merge_recall_and_consolidated({"x"}, [], consolidated, top_k=10)
     assert [m["id"] for m in merged] == [], merged
 
 
@@ -195,32 +195,32 @@ def test_merge_tombstone_and_live_mix():
     recall_matches = [
         {"id": "upd", "score": 4.0, "metadata": {"v": 2}, "deleted": False},
     ]
-    cold = [
+    consolidated = [
         {"id": "del", "score": 0.1, "metadata": {}},   # suppressed (tombstone)
         {"id": "upd", "score": 0.2, "metadata": {"v": 1}},  # overridden (live)
-        {"id": "cold_only", "score": 3.0, "metadata": {}},
+        {"id": "consolidated_only", "score": 3.0, "metadata": {}},
     ]
-    merged = v1q._merge_recall_and_cold(suppress, recall_matches, cold, top_k=10)
+    merged = v1q._merge_recall_and_consolidated(suppress, recall_matches, consolidated, top_k=10)
     by_id = {m["id"]: m for m in merged}
     assert "del" not in by_id
     assert by_id["upd"]["metadata"] == {"v": 2} and by_id["upd"]["score"] == 4.0
-    assert by_id["cold_only"]["score"] == 3.0
-    assert [m["id"] for m in merged] == ["cold_only", "upd"]
+    assert by_id["consolidated_only"]["score"] == 3.0
+    assert [m["id"] for m in merged] == ["consolidated_only", "upd"]
 
 
 def test_merge_truncates_to_top_k():
     """The union is sorted ascending and truncated to top_k."""
     recall_matches = [{"id": "r", "score": 2.5, "metadata": {}, "deleted": False}]
-    cold = [
+    consolidated = [
         {"id": "c1", "score": 1.0, "metadata": {}},
         {"id": "c2", "score": 2.0, "metadata": {}},
         {"id": "c3", "score": 3.0, "metadata": {}},
     ]
-    merged = v1q._merge_recall_and_cold({"r"}, recall_matches, cold, top_k=2)
+    merged = v1q._merge_recall_and_consolidated({"r"}, recall_matches, consolidated, top_k=2)
     assert [m["id"] for m in merged] == ["c1", "c2"]
 
 
-# --- run_query union orchestration (faked recall + cold) ------------------
+# --- run_query union orchestration (faked recall + consolidated) ----------
 
 
 @pytest.fixture
@@ -233,25 +233,25 @@ def _parsed(top_k=10, flt=None):
     return v1q._ParsedQuery("ds", [0.0, 0.0, 0.0, 0.0], top_k, None, flt or {})
 
 
-def test_run_query_union_merges_recall_and_cold(union_on, monkeypatch):
-    """Flag on: `run_query` unions the cold matches with the recall rows.
+def test_run_query_union_merges_recall_and_consolidated(union_on, monkeypatch):
+    """Flag on: `run_query` unions the consolidated matches with the recall rows.
 
-    The cold search resolves a shard (watermark 11) and returns one match; the
+    The consolidated search resolves a shard (watermark 11) and returns one match; the
     recall scan (faked) returns a live override + a fresh id. The response merges
-    them with recall-wins and the cold `mode`.
+    them with recall-wins and the consolidated shard's cache-state `mode`.
     """
     def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
         resolved["shard"] = {"id": 1, "consolidated_lsn": 11}
-        return ([{"id": "cold", "score": 9.0, "metadata": {"c": 1}}], "hot")
+        return ([{"id": "shared", "score": 9.0, "metadata": {"c": 1}}], "hot")
 
     captured = {}
 
     def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
         captured["watermark"] = watermark
         return (
-            {"cold", "fresh"},
+            {"shared", "fresh"},
             [
-                {"id": "cold", "score": 2.0, "metadata": {"c": 2}, "deleted": False},
+                {"id": "shared", "score": 2.0, "metadata": {"c": 2}, "deleted": False},
                 {"id": "fresh", "score": 1.0, "metadata": {}, "deleted": False},
             ],
         )
@@ -263,24 +263,24 @@ def test_run_query_union_merges_recall_and_cold(union_on, monkeypatch):
     assert captured["watermark"] == 11, "recall must be scoped to the shard watermark"
     assert out["mode"] == "hot"
     by_id = {m["id"]: m for m in out["matches"]}
-    # recall-wins on `cold`: the recall version (metadata c=2, score 2.0).
-    assert by_id["cold"]["metadata"] == {"c": 2}
-    assert [m["id"] for m in out["matches"]] == ["fresh", "cold"]
+    # recall-wins on `shared`: the recall version (metadata c=2, score 2.0).
+    assert by_id["shared"]["metadata"] == {"c": 2}
+    assert [m["id"] for m in out["matches"]] == ["fresh", "shared"]
 
 
-def test_run_query_union_filter_failing_live_recall_suppresses_stale_cold(
+def test_run_query_union_filter_failing_live_recall_suppresses_stale_consolidated(
     union_on, monkeypatch
 ):
-    """P1 regression: a live re-upsert that fails the filter hides its stale cold copy.
+    """P1 regression: a live re-upsert that fails the filter hides its stale consolidated copy.
 
-    cold X `{color: red}` (passes filter `{color: red}`); recall live X
+    consolidated X `{color: red}` (passes filter `{color: red}`); recall live X
     `{color: blue}` (fails the filter), `lsn > watermark`. A query `{color: red}`
     must NOT return X — recall is authoritative and X's current version no longer
-    matches the filter, so the stale, filter-matching cold copy must not leak.
+    matches the filter, so the stale, filter-matching consolidated copy must not leak.
     """
     def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
         resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
-        # Cold shard still holds the OLD X (color=red), which DOES pass the filter.
+        # Consolidated shard still holds the OLD X (color=red), which DOES pass the filter.
         return (
             [
                 {"id": "X", "score": 0.1, "metadata": {"color": "red"}},
@@ -291,7 +291,7 @@ def test_run_query_union_filter_failing_live_recall_suppresses_stale_cold(
 
     def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
         # X re-upserted as color=blue → fails {color: red} → NOT a match, but it
-        # IS above the watermark so it suppresses the stale cold X.
+        # IS above the watermark so it suppresses the stale consolidated X.
         return ({"X"}, [])
 
     monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
@@ -299,22 +299,22 @@ def test_run_query_union_filter_failing_live_recall_suppresses_stale_cold(
 
     out = v1q.run_query("t1", _parsed(flt={"color": "red"}))
     ids = [m["id"] for m in out["matches"]]
-    assert "X" not in ids, "stale cold X must be suppressed by the live recall re-upsert"
+    assert "X" not in ids, "stale consolidated X must be suppressed by the live recall re-upsert"
     assert ids == ["Y"], out
 
 
-def test_run_query_union_live_recall_past_top_k_suppresses_stale_cold(
+def test_run_query_union_live_recall_past_top_k_suppresses_stale_consolidated(
     union_on, monkeypatch
 ):
-    """A filter-passing live recall row ranked past `top_k` still hides stale cold X.
+    """A filter-passing live recall row ranked past `top_k` still hides stale consolidated X.
 
     The recall row for X is above the watermark (so it suppresses) but ranked past
-    `top_k` within recall, so it is not in the returned matches. The stale cold X
+    `top_k` within recall, so it is not in the returned matches. The stale consolidated X
     must not surface in its place.
     """
     def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
         resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
-        # Stale cold X ranks well within the final top_k by COLD distance.
+        # Stale consolidated X ranks well within the final top_k by consolidated distance.
         return ([{"id": "X", "score": 0.05, "metadata": {}}], "cold")
 
     def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
@@ -330,9 +330,9 @@ def test_run_query_union_live_recall_past_top_k_suppresses_stale_cold(
 
 
 def test_run_query_union_no_shard_returns_recall_synchronously(union_on, monkeypatch):
-    """No cold shard + recall has data → SYNCHRONOUS recall result, NOT ephemeral.
+    """No consolidated shard + recall has data → SYNCHRONOUS recall result, NOT ephemeral.
 
-    `mode` is `recall` (the cold cache contributed nothing) and there is no
+    `mode` is `recall` (the consolidated tier contributed nothing) and there is no
     `job_id` — the read-your-writes property.
     """
     def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
@@ -355,7 +355,7 @@ def test_run_query_union_no_shard_returns_recall_synchronously(union_on, monkeyp
 
 
 def test_run_query_union_no_shard_no_recall_falls_back_to_ephemeral(union_on, monkeypatch):
-    """No cold shard AND no recall row → the ephemeral enqueue path (unchanged)."""
+    """No consolidated shard AND no recall row → the ephemeral enqueue path (unchanged)."""
     monkeypatch.setattr(
         v1q, "_hot_search",
         lambda *a, **k: None,
@@ -420,8 +420,8 @@ def test_run_query_union_recall_unavailable_maps_to_503_recall_unavailable(
     RecallUnavailable = v1q.RecallUnavailable
 
     def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
-        # A healthy cold shard WITH a stale match for X — if the code silently
-        # degraded to cold-only, this would leak as a 200 instead of a 503.
+        # A healthy consolidated shard WITH a stale match for X — if the code silently
+        # degraded to consolidated-only, this would leak as a 200 instead of a 503.
         resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
         return ([{"id": "stale", "score": 0.1, "metadata": {}}], "cold")
 
@@ -439,13 +439,13 @@ def test_run_query_union_recall_unavailable_maps_to_503_recall_unavailable(
     assert _envelope_code(out) == "recall_unavailable"
 
 
-def test_run_query_recall_down_does_not_silently_serve_cold(union_on, monkeypatch):
-    """No silent degrade: a recall outage never returns the stale cold matches.
+def test_run_query_recall_down_does_not_silently_serve_consolidated(union_on, monkeypatch):
+    """No silent degrade: a recall outage never returns the stale consolidated matches.
 
-    The cold path resolves a shard and returns a match; recall is down. The
+    The consolidated path resolves a shard and returns a match; recall is down. The
     response must be the 503 error envelope, never a `{matches: [...]}` body
-    carrying the stale cold copy — the whole point of the recall tier is
-    read-your-writes, and a silent cold-only answer would lie about it.
+    carrying the stale consolidated copy — the whole point of the recall tier is
+    read-your-writes, and a silent consolidated-only answer would lie about it.
     """
     from fastapi.responses import JSONResponse
 
@@ -453,7 +453,7 @@ def test_run_query_recall_down_does_not_silently_serve_cold(union_on, monkeypatc
 
     def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
         resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
-        return ([{"id": "stale-cold", "score": 0.01, "metadata": {}}], "hot")
+        return ([{"id": "stale-consolidated", "score": 0.01, "metadata": {}}], "hot")
 
     monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
     monkeypatch.setattr(
@@ -464,30 +464,30 @@ def test_run_query_recall_down_does_not_silently_serve_cold(union_on, monkeypatc
     out = v1q.run_query("t1", _parsed())
     assert isinstance(out, JSONResponse)
     assert out.status_code == 503
-    # No `matches` body — the stale cold copy never reaches the client.
-    assert b"stale-cold" not in bytes(out.body)
+    # No `matches` body — the stale consolidated copy never reaches the client.
+    assert b"stale-consolidated" not in bytes(out.body)
 
 
 def test_run_query_non_recall_operationalerror_is_not_recall_unavailable(
     union_on, monkeypatch
 ):
-    """A non-recall OperationalError (e.g. cold/control path) is NOT misclassified.
+    """A non-recall OperationalError (e.g. consolidated/control path) is NOT misclassified.
 
-    The cold search itself raises a bare `psycopg2.OperationalError` (a
+    The consolidated search itself raises a bare `psycopg2.OperationalError` (a
     control-plane / catalog failure, NOT the recall tier). Because the recall
     wrapper is typed and only raised at the recall boundary, this unwrapped error
     must NOT be classified as `recall_unavailable` — it falls to the generic
     `ephemeral_error` 500, the pre-existing behaviour for an unexpected error on
-    the cold path.
+    the consolidated path.
     """
     import psycopg2
     from fastapi.responses import JSONResponse
 
-    def _cold_down(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+    def _consolidated_down(tenant, dataset, vec, top_k, flt, nprobe, resolved):
         raise psycopg2.OperationalError("control-plane catalog unreachable")
 
-    monkeypatch.setattr(v1q, "_hot_search", _cold_down)
-    # recall_search must never be reached — the cold search failed first.
+    monkeypatch.setattr(v1q, "_hot_search", _consolidated_down)
+    # recall_search must never be reached — the consolidated search failed first.
     monkeypatch.setattr(
         v1q, "recall_search",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreached")),
@@ -503,8 +503,8 @@ def test_run_query_non_recall_operationalerror_is_not_recall_unavailable(
 # --- flag OFF: byte-identical, no recall connection -----------------------
 
 
-def test_run_query_flag_off_is_cold_only_no_recall_call(monkeypatch):
-    """Flag off (default): the cold result is returned verbatim and
+def test_run_query_flag_off_is_consolidated_only_no_recall_call(monkeypatch):
+    """Flag off (default): the consolidated result is returned verbatim and
     `recall_search` is NEVER called."""
     monkeypatch.setattr(v1q, "recall_enabled", lambda: False)
 
@@ -680,7 +680,7 @@ def test_recall_search_filter_gates_matches_not_suppression(monkeypatch):
     assert "tomb" not in by_id, "a tombstone is never a match"
     # SUPPRESSION: EVERY id above the watermark, regardless of filter/deleted.
     assert suppress_ids == {"match", "nomatch", "tomb"}, (
-        "a filtered-out live row AND a tombstone must both suppress their cold id"
+        "a filtered-out live row AND a tombstone must both suppress their consolidated id"
     )
     # The watermark + partition are bound into the SQL.
     sql, params = cur.executed
@@ -730,7 +730,7 @@ def test_recall_search_truncates_live_matches_to_top_k(monkeypatch):
     _wire_recall(state_mod, monkeypatch, cur)
     suppress_ids, matches = state_mod.recall_search("t", "d", [0.0], top_k=2, watermark=0)
     assert [r["id"] for r in matches] == ["a", "b"]
-    # `c` ranked past top_k → not a match, but STILL suppresses its stale cold id.
+    # `c` ranked past top_k → not a match, but STILL suppresses its stale consolidated id.
     assert suppress_ids == {"a", "b", "c"}
 
 
@@ -738,8 +738,8 @@ def test_recall_search_returns_match_and_suppresses_past_top_k_and_tombstones(mo
     """Matches are capped at `top_k` live rows; suppression covers EVERYTHING.
 
     Correctness: a live row past `top_k` or a far-out tombstone has a recall
-    embedding that can differ from the cold shard's consolidated embedding for the
-    same id, so its stale cold copy could rank within the final `top_k` by COLD
+    embedding that can differ from the consolidated shard's consolidated embedding for the
+    same id, so its stale consolidated copy could rank within the final `top_k` by consolidated
     distance — it must be suppressed. The scan never stops early; `suppress_ids`
     holds every id above the watermark.
     """
