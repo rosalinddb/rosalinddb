@@ -56,6 +56,7 @@ from adapters.state.state import (
     update_dataset_status,
     get_dataset,
     superseded_shards,
+    grace_watermark,
     delete_shards,
     list_import_jobs,
     recall_enabled,
@@ -1307,36 +1308,13 @@ def run_consolidate_once(dataset: str, tenant: str) -> int:
         return _run_consolidate_locked(dataset, tenant)
 
 
-def _grace_watermark(tenant: str, dataset: str) -> int:
-    """Return the 2nd-newest shard's `consolidated_lsn` — the grace-bounded trim
-    watermark (I4).
-
-    The recall trim deletes rows only up to the watermark of the shard that is
-    now ≥ 2 generations old, i.e. the **2nd-newest** shard — symmetric to the
-    `SHARD_KEEP=2` sweep that retains the newest shard plus one grace buffer. An
-    in-flight query that resolved the (now second-newest) shard moments before
-    this consolidation wrote the newest one still filters recall with that older
-    shard's smaller watermark, so its rows must remain in recall until that
-    shard itself is superseded. Trimming only up to the 2nd-newest watermark
-    guarantees that.
-
-    Returns `0` when there is no 2nd-newest shard yet (the dataset has 0 or 1
-    shards) — the first consolidation trims nothing, which is correct: its new
-    shard is the only one, so an in-flight query can only have resolved it (or
-    no shard) and every recall row is still needed.
-
-    Called AFTER the new shard is committed, so `list_shards` already includes
-    it: index `[1]` is the shard immediately before the just-written newest.
-    """
-    shards = list_shards(tenant, dataset)
-    if len(shards) < 2:
-        return 0
-    second_newest = shards[1]
-    raw = second_newest.get("consolidated_lsn", 0)
-    try:
-        return int(raw or 0)
-    except (TypeError, ValueError):
-        return 0
+# The grace-bounded trim watermark (I4) is `state.grace_watermark`: the
+# oldest-still-live GENERATION's frontier, kept symmetric with the
+# `_sweep_superseded_shards` sweep (both keyed on `_SHARDS_TO_KEEP` generations).
+# It MUST match the sweep's notion of "live": a generation-aware sweep next to a
+# list-position trim would trim recall rows the prior generation still needs
+# (data loss). For a base-only dataset this is identical to the legacy
+# 2nd-newest-shard watermark (each base is a single-shard generation).
 
 
 def _run_consolidate_locked(dataset: str, tenant: str) -> int:
@@ -1416,12 +1394,13 @@ def _run_consolidate_locked(dataset: str, tenant: str) -> int:
             print(f"builder: shard sweep failed for {tenant}/{dataset}: {exc}")
 
         # 4. GRACE-BOUNDED, IDEMPOTENT TRIM (I4). Delete recall rows only up to
-        #    the 2nd-newest shard's watermark, so an in-flight query that
-        #    resolved an older shard still finds its recall rows. Best-effort —
+        #    the oldest-still-live generation's frontier (symmetric with the
+        #    sweep above), so an in-flight query that resolved an older
+        #    generation still finds its recall rows. Best-effort —
         #    a trim failure leaves rows the union harmlessly excludes
         #    (`lsn > consolidated_lsn`) and the next consolidation GCs them
         #    (cross-DB crash safety). The trim must run AFTER the commit above.
-        grace = _grace_watermark(tenant, dataset)
+        grace = grace_watermark(tenant, dataset, keep=_SHARDS_TO_KEEP)
         try:
             trimmed = recall_trim(tenant, dataset, grace)
         except Exception as exc:  # noqa: BLE001
