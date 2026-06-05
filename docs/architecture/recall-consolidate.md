@@ -279,16 +279,16 @@ pgvector `<->` returns plain L2. Square pgvector's distance before merging, over
 un-normalised** vectors, or the union ranks wrong. This is the most likely silent bug — it
 gets a dedicated test. *Implemented* as `power(embedding <-> q, 2)` in the recall scan
 (`adapters.state.state.recall_search`), so the recall `score` is L2² and merges directly with
-the cold shard's FAISS L2² distances.
+the consolidated shard's FAISS L2² distances.
 
 **Dedup:** a re-upserted id can be in both tiers during the consolidation grace window;
 **recall is authoritative** for any id above the watermark (its version is newer). The merge
-(`services.query_api.v1_query._merge_recall_and_cold`) keys suppression on the FULL set of recall
+(`services.query_api.v1_query._merge_recall_and_consolidated`) keys suppression on the FULL set of recall
 ids above the watermark: a recall row for id X — **live, tombstoned, filtered-out, or
-ranked-past-`top_k`** — always drops the stale cold copy of X. Only a **filter-passing live**
+ranked-past-`top_k`** — always drops the stale consolidated copy of X. Only a **filter-passing live**
 recall row contributes an actual match; a tombstone, or a live row that fails the query filter,
-suppresses its cold twin but adds nothing (so an authoritative re-upsert that no longer matches
-the filter cannot let a stale, filter-matching cold copy leak). The survivors are sorted ascending
+suppresses its consolidated twin but adds nothing (so an authoritative re-upsert that no longer matches
+the filter cannot let a stale, filter-matching consolidated copy leak). The survivors are sorted ascending
 by L2² and truncated to `top_k`.
 
 **No consolidated shard + recall has data → synchronous recall answer.** When the dataset has
@@ -297,10 +297,10 @@ the query is answered **synchronously from recall** — it does **not** fall thr
 `ephemeral` empty+`job_id` path (that path is reserved for "nothing can answer": no shard AND no
 recall row). This is the read-your-writes property for a brand-new dataset.
 
-**`mode` semantics under the union.** The response `mode` always reflects the **cold-shard cache
+**`mode` semantics under the union.** The response `mode` always reflects the **consolidated-shard cache
 state**, never the recall contribution:
 
-| Cold shard | Recall contributed | `mode` | `job_id`? |
+| Consolidated shard | Recall contributed | `mode` | `job_id`? |
 |---|---|---|---|
 | resolved (warm cache) | maybe | `hot` | no |
 | resolved (cold load) | maybe | `cold` | no |
@@ -308,11 +308,11 @@ state**, never the recall contribution:
 | none | no | `ephemeral` | yes |
 
 So a `hot`/`cold` mode does **not** imply the recall tier was idle — recall may have overridden
-or added matches; the label only describes the cold cache. `recall` is the dedicated value for
-"no cold shard, recall answered." This is documented for callers in
+or added matches; the label only describes the consolidated-shard cache state. `recall` is the dedicated value for
+"no consolidated shard, recall answered." This is documented for callers in
 [`docs/api/query.md`](../api/query.md).
 
-**Watermark/shard pairing (I3) in code.** The cold search (`_hot_search`) reports the exact
+**Watermark/shard pairing (I3) in code.** The consolidated search (`_hot_search`) reports the exact
 shard row it resolved back to `run_query` (via an out-dict), and the recall scan is filtered with
 *that* shard's `consolidated_lsn` — never a watermark resolved by an independent
 `list_shards` lookup — so a stale cached shard version can never open a partition gap.
@@ -475,7 +475,7 @@ Integration (real PG/MinIO/Redis):
   in `docs/api/v1.md`.
 - **Sequencing (PR plan):** PR1 consolidated get/list/delete-by-id (flag-off correct) → PR2
   migrations + separate pgvector container → PR3 sync recall write + flag → PR4 query
-  union/merge *(implemented — `recall_search` + `_merge_recall_and_cold`; see §Read path)* → PR5
+  union/merge *(implemented — `recall_search` + `_merge_recall_and_consolidated`; see §Read path)* → PR5
   consolidation/compaction + consolidate-on-idle + caps *(implemented — `run_consolidate_once` +
   the `CONSOLIDATE` topic + the cap/idle triggers; see §Consolidation / flush)* → PR6 recall +
   consolidated union for get/list/delete + mem0 adapter + docs. Each flag-gated so `main` stays

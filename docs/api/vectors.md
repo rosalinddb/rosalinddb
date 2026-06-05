@@ -29,12 +29,12 @@ vector visible to get/list, and adds a **synchronous recall-delete** (below).
 
 | Operation | Flag OFF | Flag ON (recall) |
 |---|---|---|
-| **get** | cold sidecar lookup | live recall row (`lsn > watermark`) **wins**; a recall **tombstone** → `404`; else fall back to the cold sidecar |
-| **list** | cold sidecar, filtered + paginated | union cold + recall live rows (recall-wins dedup), **suppress** any id with a recall tombstone above the watermark, then filter + sort + paginate |
+| **get** | consolidated sidecar lookup | live recall row (`lsn > watermark`) **wins**; a recall **tombstone** → `404`; else fall back to the consolidated sidecar |
+| **list** | consolidated sidecar, filtered + paginated | union consolidated + recall live rows (recall-wins dedup), **suppress** any id with a recall tombstone above the watermark, then filter + sort + paginate |
 | **delete** | publish `DELETE_VECTORS`, `202 {job_id}` (async) | write an **above-watermark tombstone**, `204` (synchronous, read-your-deletes); **no** `DELETE_VECTORS` |
 
 The watermark used for the union is the `consolidated_lsn` of the **same** shard
-the cold sidecar was read from (invariant I3 — never an independently-resolved
+the consolidated sidecar was read from (invariant I3 — never an independently-resolved
 watermark). When the dataset has **no shard yet**, the watermark is `0`, so every
 recall row qualifies — a brand-new dataset's writes are visible to get/list
 straight from recall.
@@ -55,12 +55,12 @@ its metadata live in the shard's `{shard_uri}.meta.json` **sidecar**:
   entry. Missing shard or missing key → `404 not_found`. With the recall union
   on, the recall point-lookup (`recall_get_vector`) runs first against the same
   resolved shard's watermark and wins (live) / 404s (tombstone) / defers (absent)
-  before this cold lookup.
+  before this consolidated lookup.
 - **list** reads the whole sidecar, applies the optional `filter`
   (`metadata_matches_filter`, the same AND-of-equals predicate as
   `POST /v1/query`), stably sorts by original id, and paginates. With the recall
-  union on, the cold sidecar is first deduped against the recall partition
-  (`recall_list_rows`): ids recall is authoritative for are dropped from the cold
+  union on, the consolidated sidecar is first deduped against the recall partition
+  (`recall_list_rows`): ids recall is authoritative for are dropped from the consolidated
   set, recall live rows are appended (recall-wins), and the filter is applied to
   the **merged** records so it sees each id's authoritative metadata.
 
@@ -73,7 +73,7 @@ shard's watermark. There the embedding is a plain `vector` COLUMN on
 `recall_vectors`, so it is read back with a single SELECT (no FAISS). The
 response is then `{ "id", "metadata", "embedding" }`.
 
-For a **consolidated (cold-only)** id, returning the values would require a FAISS
+For a **consolidated-only** id, returning the values would require a FAISS
 `reconstruct` against the shard (the sidecar holds only id + metadata) — that is
 a deferred follow-up — so `embedding` is **OMITTED** from the response rather
 than fabricated. Clients (e.g. the mem0 adapter's metadata-only `update`) treat
@@ -185,7 +185,7 @@ This is load-bearing for correctness:
   from every union** (`lsn > consolidated_lsn` is false) — the id would never
   delete.
 - It is also **trim-eligible but unapplied**: the grace-bounded trim could GC the
-  recall row before a consolidation folds the delete into cold — the id would
+  recall row before a consolidation folds the delete into the consolidated tier — the id would
   **resurrect** from the consolidated shard.
 
 Allocating fresh, strictly above `max(lsn) >= consolidated_lsn`, guarantees the
@@ -195,7 +195,7 @@ the next consolidation. See
 (Delete) + invariants I1/I2, and the regression test
 `tests/.../test_*crud_union*::*above_watermark*`.
 
-A cold-only delete (an id with no prior recall row) writes a brand-new tombstone
+A consolidated-only delete (an id with no prior recall row) writes a brand-new tombstone
 with a zero-vector placeholder embedding of the dataset's dimension — never read
 (tombstones are not search candidates) but dimension-matched so the recall
 search scan's distance computation over the partition does not hit a
@@ -238,5 +238,5 @@ the auth dependency). A missing or cross-tenant dataset returns
   above-watermark tombstone write).
 - Builder consumers (flag-off delete + consolidation): `services/index_builder/run.py`
   (`run_delete_once`, `_handle_delete_vectors`; `run_consolidate_once` applies
-  recall tombstones to cold).
+  recall tombstones to the consolidated tier).
 - Shared id hash + sidecar reader: `adapters/landing/parquet_reader.py`.

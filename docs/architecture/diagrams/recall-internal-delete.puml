@@ -45,7 +45,7 @@ activate rv
 note right of rv #E9F7E9
   Last-write-wins on (tenant,dataset,id): an
   existing live/deleted row is overwritten with
-  deleted=true + the fresh higher lsn. A cold-only
+  deleted=true + the fresh higher lsn. A consolidated-only
   delete (no prior recall row) gets a dimension-
   matched zero placeholder for the NOT NULL column
   (never ranked -- the search excludes tombstones).
