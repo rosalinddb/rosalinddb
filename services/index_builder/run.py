@@ -148,10 +148,12 @@ def _delta_tier_enabled() -> bool:
 
 
 # `RB_MAX_DELTAS` (default 8) — the live-delta count that triggers a MAJOR
-# compaction. PR-B reads it for forward-compatibility ONLY; the cap is NOT
-# enforced here (under the flag deltas may accumulate — fine, the flag is off by
-# default and PR-D lands the major-compaction enforcement before anyone enables
-# it). See phase1-spec.md §7.
+# compaction. PR-D enforces this: after a fold commits, if the live generation
+# has accumulated `>= _max_deltas()` deltas, `_run_consolidate_locked` runs
+# `_major_compaction` synchronously (still under the held per-dataset lock) to
+# fold base+deltas into one fresh base, bounding read fan-out. Squarely in line
+# with prior art (SlateDB `l0_compaction_threshold_ssts`/`level_compaction_
+# threshold_runs` = 8). See phase1-spec.md §7, opendata-rfcs-notes.md item 1.
 def _max_deltas() -> int:
     raw = os.getenv("RB_MAX_DELTAS")
     if raw:
@@ -162,6 +164,26 @@ def _max_deltas() -> int:
         except (TypeError, ValueError):
             pass
     return 8
+
+
+# `RB_MAX_DELTAS_HARD` (default 16) — a BACKSTOP ceiling above the compaction
+# trigger (`_max_deltas`), modelled on SlateDB's separate hard cap
+# (`l0_max_ssts`/`level_max_runs` = 16, ~2x the trigger; see
+# opendata-rfcs-notes.md item 2). With synchronous compaction at the trigger this
+# should NEVER be reached — it is a guard against a wedged/disabled compactor
+# (e.g. the cap-trigger path threw and was swallowed). When the live-delta count
+# is observed `>= _max_deltas_hard()` we emit a metric/log AND force one more
+# compaction attempt, so read amplification cannot grow unbounded silently.
+def _max_deltas_hard() -> int:
+    raw = os.getenv("RB_MAX_DELTAS_HARD")
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    return 16
 
 
 def _compute_shard_uri(tenant: str, dataset: str, shard_name: str, blob: bytes) -> str:
@@ -1505,6 +1527,67 @@ def run_consolidate_once(dataset: str, tenant: str) -> int:
 # 2nd-newest-shard watermark (each base is a single-shard generation).
 
 
+def _maybe_major_compaction(tenant: str, dataset: str) -> None:
+    """Run a synchronous MAJOR compaction iff the delta cap is reached (PR-D).
+
+    Called from `_run_consolidate_locked` AFTER the fold commits + the sweep,
+    while the per-dataset advisory lock is still held. No-op unless the delta
+    tier is enabled. When the live generation holds `>= _max_deltas()` deltas it
+    folds base+deltas into one new base (`_major_compaction`) and re-runs the
+    sweep so the old generation ages into the keep=2 grace window and is GC'd on
+    a later cycle. The trim is recomputed by the caller after this returns.
+
+    HARD CEILING (RB_MAX_DELTAS_HARD, default 16): a backstop above the trigger
+    (prior art: SlateDB separates an 8-trigger from a 16 hard cap). With
+    synchronous compaction at the trigger this should never be reached; if it IS
+    observed (a wedged/disabled compactor — e.g. a prior compaction threw and was
+    swallowed) we emit a metric/log and still force the compaction below. The
+    backstop is documented and intentionally a safety valve, not the norm.
+
+    Best-effort: a compaction failure is logged and swallowed (the fold already
+    committed and is durable; read fan-out is bounded by `RB_MAX_DELTAS` deltas
+    which still query correctly via the read union — the next fold retries the
+    cap). It must NEVER fail an otherwise-successful consolidation.
+    """
+    if not _delta_tier_enabled():
+        return
+    gen = live_generation(tenant, dataset)
+    if not gen:
+        return
+    n_deltas = len(gen["deltas"])
+    hard = _max_deltas_hard()
+    if n_deltas >= hard:
+        # Backstop: the compactor fell behind the hard ceiling. Should not happen
+        # with synchronous compaction; flag it loudly and force a compaction.
+        counter("builder_max_deltas_hard_breach_total", 1)
+        print(
+            f"builder: WARNING delta HARD CEILING breached for {tenant}/{dataset} "
+            f"— {n_deltas} live deltas >= RB_MAX_DELTAS_HARD={hard} (compactor "
+            f"wedged/disabled?); forcing major compaction"
+        )
+    elif n_deltas < _max_deltas():
+        return
+
+    try:
+        new_uri = _major_compaction(tenant, dataset)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"builder: major compaction failed for {tenant}/{dataset}: {exc}"
+        )
+        return
+    if new_uri is None:
+        return
+    # The new base is now the live generation (atomic via add_shard). Re-run the
+    # sweep so the old base+deltas age into the keep=2 grace window (they are GC'd
+    # on a later cycle once a third generation exists).
+    try:
+        _sweep_superseded_shards(tenant, dataset)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"builder: post-compaction sweep failed for {tenant}/{dataset}: {exc}"
+        )
+
+
 def _run_consolidate_locked(dataset: str, tenant: str) -> int:
     """Run the consolidation — caller holds the per-dataset advisory lock.
 
@@ -1581,13 +1664,25 @@ def _run_consolidate_locked(dataset: str, tenant: str) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"builder: shard sweep failed for {tenant}/{dataset}: {exc}")
 
-        # 4. GRACE-BOUNDED, IDEMPOTENT TRIM (I4). Delete recall rows only up to
+        # 4. CAP TRIGGER (PR-D): when the delta tier is ON and the live
+        #    generation now holds >= RB_MAX_DELTAS deltas, run a MAJOR COMPACTION
+        #    SYNCHRONOUSLY (still under the held per-dataset advisory lock —
+        #    correct, just holds it longer; async is Phase 2). This folds
+        #    base+deltas into ONE fresh base, bounding read fan-out. A hard
+        #    backstop ceiling (RB_MAX_DELTAS_HARD) guards a wedged compactor.
+        #    Done BEFORE the grace/trim below so the post-compaction generation
+        #    drives the sweep + the grace-bounded trim.
+        _maybe_major_compaction(tenant, dataset)
+
+        # 5. GRACE-BOUNDED, IDEMPOTENT TRIM (I4). Delete recall rows only up to
         #    the oldest-still-live generation's frontier (symmetric with the
         #    sweep above), so an in-flight query that resolved an older
         #    generation still finds its recall rows. Best-effort —
         #    a trim failure leaves rows the union harmlessly excludes
         #    (`lsn > consolidated_lsn`) and the next consolidation GCs them
         #    (cross-DB crash safety). The trim must run AFTER the commit above.
+        #    Recomputed AFTER any compaction so the grace boundary reflects the
+        #    post-cutover generation set.
         grace = grace_watermark(tenant, dataset, keep=_SHARDS_TO_KEEP)
         try:
             trimmed = recall_trim(tenant, dataset, grace)
@@ -2020,6 +2115,279 @@ def _build_consolidated_shard(
         indexed_uris=indexed_uris,
         consolidated_lsn=consolidated_lsn,
     )
+
+
+# --- MAJOR COMPACTION (delta-count cap → fold base+deltas into one base) -----
+#
+# When a live generation accumulates `RB_MAX_DELTAS` deltas a MAJOR compaction
+# collapses the base + all its deltas into ONE new `level=0` bare-IVF base under
+# the SAME frozen quantizer-vG (NO retrain). This is the read-amplification
+# governor that makes the delta tier sustainable. Gated behind `RB_DELTA_TIER`
+# at the call site (`_run_consolidate_locked`); this helper is reached only with
+# the flag on.
+#
+# FAISS mechanism (chosen EMPIRICALLY, Phase-0 methodology — see
+# bench-lab/research/compaction-redesign.md §0 and the PR-D probe log):
+#
+#   * The bare-IVF `merge_from` path (the spec's preferred, bounded-memory
+#     intent) does NOT abort on a BARE `IndexIVFFlat` — the FAISS 1.8.0 abort was
+#     IDMap2-specific; on a bare IVF `remove_ids` raises a CATCHABLE RuntimeError
+#     (DirectMap "remove not supported"/format errors) and, with a `Hashtable`
+#     direct map + `IDSelectorArray`, removes EXACTLY the given ids. HOWEVER it
+#     cannot satisfy our dedup contract: `merge_from` appends the deltas' native
+#     ids verbatim, so a re-upserted id ends up with N copies in the inverted
+#     lists, and `remove_ids` (direct map → ONE offset) removes only ONE — leaving
+#     stale duplicate copies. "Each surviving id EXACTLY ONCE" is unachievable via
+#     merge+remove. (Also: you cannot `merge_from` once a direct map is set, so
+#     merge and remove cannot interleave cheaply.)
+#
+#   * THE PATH WE USE — reconstruct the deduped survivor set. Process the
+#     generation oldest→newest; for each id its FINAL state is set by the
+#     highest-band shard mentioning it (live → that shard's vector; tombstone →
+#     dropped). Reconstruct each survivor's newest vector (Hashtable direct map —
+#     the default Array map only supports sequential ids, NOT our hashed int64s),
+#     `add_with_ids` them into a `clone_index(quantizer-vG)` (stays trained →
+#     no retrain, P0-C). Correct for re-upsert, delete, AND delete-then-reinsert;
+#     each id lands EXACTLY ONCE; zero tombstoned-as-final ids. O(generation)
+#     memory — acceptable because compaction is RARE (1 per `RB_MAX_DELTAS` folds)
+#     and runs on a higher-memory lane. PR-D probe @ 200k base + 8×3k deltas:
+#     peak RSS ~771 MB, every id round-trips, dedup verified (one copy per id).
+
+
+def _list_native_ids(index) -> list[int]:
+    """Read every native int64 id out of a BARE `IndexIVFFlat`'s inverted lists.
+
+    The delta/base shapes built by `build_ivfflat_native`/`_build_delta_blob`
+    store the customer's int64 hash DIRECTLY in the IVF inverted lists (no
+    IDMap2). We enumerate them by walking each list — the order is per-cell, not
+    insertion order, but compaction only needs the SET of ids a shard carries
+    (newest-occurrence dedup is done by the caller's oldest→newest pass).
+    """
+    inv = index.invlists
+    ids: list[int] = []
+    for lst in range(int(index.nlist)):
+        sz = int(inv.list_size(lst))
+        if sz:
+            arr = np.asarray(faiss.rev_swig_ptr(inv.get_ids(lst), sz))
+            ids.extend(int(x) for x in arr)
+    return ids
+
+
+def _load_bare_ivf(shard_uri: str):
+    """Load a shard `.bin` as a bare `IndexIVFFlat` with a Hashtable direct map.
+
+    The Hashtable direct map (NOT the default Array map, which only supports
+    sequential ids 0..ntotal-1) is required to `reconstruct(int64_hash)` by our
+    arbitrary hashed ids. Raises if the loaded index is not a bare IVF (e.g. a
+    legacy IDMap2 base) — `_major_compaction` only ever runs on bare-IVF
+    generations (`_delta_tier_applies` keeps legacy bases on the union-rebuild
+    fold), but we fail loud rather than silently corrupt.
+    """
+    idx = faiss.deserialize_index(np.frombuffer(read_bytes(shard_uri), dtype=np.uint8))
+    if hasattr(idx, "id_map"):
+        raise RuntimeError(
+            "major compaction expects a bare IVF base/delta, got an IDMap2-wrapped "
+            f"index for {shard_uri}"
+        )
+    ivf = faiss.try_extract_index_ivf(idx)
+    if ivf is None:
+        raise RuntimeError(
+            f"major compaction expects an IVF index, got {type(idx).__name__} "
+            f"for {shard_uri}"
+        )
+    idx.set_direct_map_type(faiss.DirectMap.Hashtable)
+    return idx
+
+
+def _major_compaction(tenant: str, dataset: str) -> Optional[str]:
+    """Fold the live generation (bare-IVF base + its deltas) into ONE new base.
+
+    Merges the current live generation — base (`level=0`) + its `level=1` deltas,
+    all sharing `quantizer-vG` — into a fresh single `level=0` bare-IVF base under
+    the SAME frozen quantizer (NO retrain), then `add_shard`s it as a new
+    generation. Returns the new base shard URI, or `None` when there is nothing
+    to compact (no generation, a legacy/flat base, or an all-tombstoned result).
+
+    CORRECTNESS — newest-occurrence-wins, unified with tombstones. We process the
+    generation's shards oldest→newest (by `covered_lsn_hi`, base first). For each
+    id the FINAL state is set by the highest-band shard that MENTIONS it: a live
+    vector (kept, with THAT shard's vector+metadata) OR a tombstone (dropped).
+    This handles re-upserts (live in base, re-upserted in a later delta → keep the
+    newer vector, drop the stale base copy), deletes (tombstoned in a later delta
+    → dropped), AND delete-then-reinsert (tombstoned in delta1, re-inserted live in
+    delta2 → kept). The merged base contains each surviving id EXACTLY ONCE and
+    ZERO tombstoned-as-final ids.
+
+    ATOMIC CUTOVER — the read path keys on GENERATION MEMBERSHIP (`live_generation`
+    = newest level-0 base + ITS deltas). Inserting the new base via `add_shard`
+    (one txn) atomically makes it the current generation: queries immediately
+    resolve [new base] (no deltas yet) and STOP searching the old base+deltas. The
+    old generation becomes a prior generation, kept by the keep=2 sweep for grace,
+    then GC'd by `_sweep_superseded_shards` on a later cycle. Objects-first-then-
+    catalog: the new base `.bin`+sidecar are written BEFORE the `add_shard` row
+    (inside `_write_shard`), so a crash before the row leaves orphan objects
+    (ignored/swept), after the row is fine.
+    """
+    gen = live_generation(tenant, dataset)
+    if not gen:
+        return None
+    base = gen["base"]
+    deltas = gen["deltas"]
+    if not deltas:
+        # Nothing layered on the base — nothing to fold.
+        return None
+    quantizer_version = int(base.get("quantizer_version", 0) or 0)
+    # Defensive guard: only bare-IVF generations (quantizer_version >= 1) are
+    # compacted. A legacy IDMap2 base never accumulates deltas
+    # (`_delta_tier_applies` excludes it), so this should never trip — but bail
+    # cleanly rather than mis-merge an unexpected shape.
+    if (
+        str(base.get("index_type", "")) != "ivfflat"
+        or quantizer_version < 1
+    ):
+        print(
+            f"builder: major compaction skipped for {tenant}/{dataset} — base is "
+            f"not a bare-IVF generation (index_type={base.get('index_type')}, "
+            f"quantizer_version={quantizer_version})"
+        )
+        return None
+
+    import resource as _resource
+
+    def _rss_mb() -> float:
+        rss = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        # macOS reports bytes, Linux reports KiB.
+        return rss / (1024 * 1024) if os.uname().sysname == "Darwin" else rss / 1024
+
+    t0 = time.time()
+
+    # Order shards oldest→newest by covered band (base first; base.covered_lsn_hi
+    # <= every delta.covered_lsn_lo by construction). The deltas in `gen` are
+    # already sorted by covered_lsn_lo; the base's frontier is the lowest.
+    ordered = [base, *deltas]
+
+    # Load every shard as a bare IVF with a Hashtable direct map (arbitrary-id
+    # reconstruct). Keep them loaded — survivors are reconstructed from these.
+    loaded: list = []
+    for shard in ordered:
+        loaded.append(_load_bare_ivf(shard["shard_uri"]))
+
+    # Newest-occurrence-wins resolution. `final[int_id] = (shard_pos, alive)`:
+    # walking oldest→newest, the LAST shard to mention an id wins, and whether it
+    # is a live row (alive=True) or a tombstone (alive=False) is the final state.
+    # A delta's deletes are its catalog `tombstone_int_ids`; its live ids are the
+    # native ids in its `.bin`.
+    final: dict[int, tuple[int, bool]] = {}
+    for pos, shard in enumerate(ordered):
+        # Live ids carried in this shard's inverted lists.
+        for int_id in _list_native_ids(loaded[pos]):
+            final[int(int_id)] = (pos, True)
+        # Tombstones carried on this shard's catalog row drop the id (a later
+        # live re-insert in a HIGHER-band shard re-adds it — newest wins).
+        for int_id in (shard.get("tombstone_int_ids") or []):
+            final[int(int_id)] = (pos, False)
+
+    survivors = {int_id: pos for int_id, (pos, alive) in final.items() if alive}
+
+    # Build the merged sidecar = union of survivor sidecars, newest-win, minus
+    # dropped ids. Read each shard's sidecar once (oldest→newest so a newer entry
+    # overwrites an older one), then keep only surviving keys.
+    merged_sidecar: dict[str, dict] = {}
+    for shard in ordered:
+        try:
+            sc = read_shard_sidecar(shard["shard_uri"])
+        except Exception as exc:  # noqa: BLE001
+            # A sidecar read failure must not drop a survivor's vector — it only
+            # costs the survivor its {id, metadata} mapping (the int64 stays
+            # searchable; the query path falls back to str(int64)). Log + skip.
+            print(
+                f"builder: major compaction sidecar read failed for "
+                f"{shard['shard_uri']}: {exc}"
+            )
+            sc = {}
+        merged_sidecar.update(sc)
+    survivor_key_set = {str(int(i)) for i in survivors}
+    merged_sidecar = {
+        k: v for k, v in merged_sidecar.items() if k in survivor_key_set
+    }
+
+    if not survivors:
+        # Everything was tombstoned-as-final. There is nothing to put in a new
+        # base; leave the generation as is (the deltas already suppress/purge at
+        # query time). Returning None means no cutover — the cap re-fires next
+        # fold if more deltas land, but an empty base is not worth writing.
+        print(
+            f"builder: major compaction for {tenant}/{dataset} found 0 survivors "
+            f"(all tombstoned) — no new base written"
+        )
+        return None
+
+    # Reconstruct each survivor's NEWEST vector and add into a clone of the frozen
+    # quantizer (stays trained → no retrain, P0-C). Batched so the reconstruct
+    # buffer is bounded regardless of generation size.
+    quantizer = _load_quantizer(tenant, dataset, quantizer_version)
+    new_base = faiss.clone_index(quantizer)
+    survivor_ids = list(survivors.keys())
+    peak_rss = _rss_mb()
+    BATCH = 50_000
+    for start in range(0, len(survivor_ids), BATCH):
+        chunk = survivor_ids[start : start + BATCH]
+        vecs = np.empty((len(chunk), int(new_base.d)), dtype=np.float32)
+        for row, int_id in enumerate(chunk):
+            vecs[row] = loaded[survivors[int_id]].reconstruct(int(int_id))
+        new_base.add_with_ids(vecs, np.asarray(chunk, dtype=np.int64))
+        peak_rss = max(peak_rss, _rss_mb())
+
+    # PROBE assertion: every surviving id must round-trip and no tombstoned-as-
+    # final id may be present. Cheap on a fresh Hashtable map.
+    new_base.set_direct_map_type(faiss.DirectMap.Hashtable)
+    if int(new_base.ntotal) != len(survivors):
+        raise RuntimeError(
+            f"major compaction id-count mismatch for {tenant}/{dataset}: "
+            f"ntotal={new_base.ntotal} survivors={len(survivors)}"
+        )
+
+    new_blob = _serialize_index(new_base)
+    new_sidecar_blob = json.dumps(merged_sidecar).encode("utf-8")
+
+    # New base watermark = max covered_lsn_hi over the old generation (the
+    # watermark must NOT regress). consolidated_lsn = that max.
+    new_hi = max(_shard_covered_hi(s) for s in ordered)
+
+    new_uri = _write_shard(
+        tenant,
+        dataset,
+        new_blob,
+        new_sidecar_blob,
+        int(new_base.ntotal),
+        "ivfflat",
+        build_type="consolidate",
+        indexed_uris=[],
+        consolidated_lsn=new_hi,
+        quantizer_version=quantizer_version,
+        parent_shard_id=None,
+        level=0,
+        covered_lsn_lo=0,
+        covered_lsn_hi=new_hi,
+    )
+
+    elapsed = time.time() - t0
+    obs_metrics.record_index_build("major_compaction")
+    counter("builder_major_compaction_total", 1)
+    print(
+        f"builder: MAJOR COMPACTION {tenant}/{dataset} — folded base+{len(deltas)} "
+        f"deltas into 1 base ({len(survivors)} survivors, "
+        f"{len(final) - len(survivors)} dropped), quantizer_version={quantizer_version}"
+        f" (no retrain), watermark={new_hi}, elapsed={elapsed:.2f}s, "
+        f"peak_rss={peak_rss:.0f}MB"
+    )
+    _LAST_BUILD.update(
+        build_type="major_compaction",
+        vectors_added=len(survivors),
+        parts_read=0,
+        parts_read_uris=[],
+    )
+    return new_uri
 
 
 class MetricsHandler(BaseHTTPRequestHandler):
