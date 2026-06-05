@@ -649,6 +649,46 @@ def test_run_query_overlaps_consolidated_and_recall(union_on, monkeypatch):
     )
 
 
+def test_run_query_joins_recall_future_even_on_baseexception(union_on, monkeypatch):
+    """P2: the in-flight recall worker is NEVER abandoned, even if the inline
+    consolidated branch raises a `BaseException` (KeyboardInterrupt/SystemExit).
+
+    The inline FAISS branch is wrapped in `except Exception`, so a `BaseException`
+    propagates straight out — but the recall future is joined in a `finally`, so
+    the worker is retrieved before the `BaseException` escapes `run_query`. We use
+    a worker that flips a flag once joined, raise a `KeyboardInterrupt` from the
+    inline consolidated branch, and assert the worker WAS joined (flag set) and the
+    `BaseException` still propagated (not swallowed).
+    """
+    import threading
+
+    joined = threading.Event()
+
+    def _fake_resolve(tenant, dataset, resolved=None):
+        if resolved is None:
+            resolved = {}
+        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+        return resolved
+
+    def _consolidated_baseexc(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        raise KeyboardInterrupt("inline FAISS hit a BaseException")
+
+    def _recall_marks_joined(tenant, dataset, vec, top_k, watermark, flt):
+        joined.set()
+        return (set(), [])
+
+    monkeypatch.setattr(v1q, "_resolve_shard", _fake_resolve)
+    monkeypatch.setattr(v1q, "_search_consolidated_shard", _consolidated_baseexc)
+    monkeypatch.setattr(v1q, "recall_search", _recall_marks_joined)
+
+    with pytest.raises(KeyboardInterrupt):
+        v1q.run_query("t1", _parsed())
+
+    # The recall worker actually ran (it was submitted before FAISS), and the
+    # `finally` join retrieved its result rather than abandoning it.
+    assert joined.is_set(), "recall future was abandoned on a BaseException"
+
+
 # --- flag OFF: byte-identical, no recall connection -----------------------
 
 

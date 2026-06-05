@@ -1558,6 +1558,20 @@ def _classify_hot_path_error(exc: BaseException) -> Tuple[str, str]:
 # anyway (no correctness impact, graceful degradation under saturation). The
 # default tracks a modest data-plane fan-out and is overridable via
 # `RB_RECALL_OVERLAP_WORKERS` for high-concurrency deployments.
+#
+# RELATION TO `RB_RECALL_POOL_MAX` (state.py, default 10): this executor bound is
+# INDEPENDENT of the recall connection pool, and it is the pool — NOT this
+# executor — that is the recall-concurrency limiter. The default (32) is
+# deliberately wider than the default pool (10): once more than `RB_RECALL_POOL_MAX`
+# recall tasks are in flight, the excess block on `recall_pooled_conn()` and, on
+# sustained exhaustion, raise `PoolCheckoutTimeout` → the typed `RecallUnavailable`
+# → a 503 `recall_unavailable`. So this bound provides NO real backpressure; sizing
+# it generously just avoids the executor itself serializing the submit step. It
+# should TRACK `RB_RECALL_POOL_MAX` (keep it >= the pool) — a value below the pool
+# would cap recall concurrency at the executor instead, leaving pool capacity idle.
+# This is not a regression vs the serial path: concurrent recall load equals the
+# number of in-flight requests in BOTH the serial and overlap designs, so the pool
+# enforces the same ceiling either way.
 _RECALL_OVERLAP_WORKERS = max(1, int(os.getenv("RB_RECALL_OVERLAP_WORKERS", "32")))
 _RECALL_EXECUTOR = ThreadPoolExecutor(
     max_workers=_RECALL_OVERLAP_WORKERS,
@@ -1725,75 +1739,106 @@ def run_query(tenant_id: str, parsed: _ParsedQuery) -> Union[JSONResponse, dict]
     # — the union"). A recall-store failure maps to the same v1 503 envelope as a
     # consolidated-path storage failure — the union must not 500.
     #
-    # Both spans (`recall.search` and the consolidated children) must nest under
-    # the request span, so the whole union runs inside ONE `query.hot_search`
-    # span; the worker thread re-attaches the request's OTel context so the
-    # `recall.search` span it opens stays a CHILD of the request span instead of
-    # becoming an orphaned trace root (OTel current-context does NOT auto-propagate
-    # across threads). The span literal stays `query.hot_search` (bench/attribution
-    # key on it; rename tracked as #33).
-    with hot_search_span(tenant=tenant_id, dataset=dataset_name):
-        # I3 watermark pairing: resolve WHICH shard the consolidated search will
-        # read so the recall scan filters with that exact shard's
-        # `consolidated_lsn` — never a watermark resolved independently. Resolution
-        # is the cheap catalog lookup; a raised exception here is a consolidated-path
-        # failure and maps to the consolidated error envelope.
-        resolved: Optional[Dict[str, Any]] = {}
-        try:
-            resolved = _resolve_shard(tenant_id, dataset_name, resolved)
-        except Exception as exc:  # noqa: BLE001
-            return _consolidated_error_response(tenant_id, dataset_name, exc)
+    # SPAN SHAPE (independent siblings, both timed in wall-clock overlap):
+    #     request span
+    #       ├─ query.hot_search   (resolve + inline FAISS — CONSOLIDATED ONLY)
+    #       └─ recall.search      (the parallel recall scan, on the worker)
+    # `query.hot_search` must measure the CONSOLIDATED search ALONE — bench
+    # dashboards + latency attribution read it as the consolidated-search latency —
+    # so its `with` block wraps ONLY the resolve + inline FAISS and the recall
+    # future is joined AFTER the block closes; the join (the `max(...)` wait) is
+    # NEVER inside `query.hot_search`. `recall.search` is a SIBLING of
+    # `query.hot_search` under the request span, not a child: recall is a parallel,
+    # independent operation, not part of the consolidated search. To get that
+    # parentage the worker re-attaches the context captured BEFORE entering
+    # `hot_search_span` (the request-span context) — OTel current-context is
+    # thread-local and does NOT auto-propagate to a freshly-scheduled worker, so
+    # without this the `recall.search` span would become an orphaned trace root.
+    # The overlap (latency win) is preserved regardless: FAISS runs inline while
+    # recall runs on the worker; only the JOIN moved out of the span. The span
+    # literal stays `query.hot_search` (bench/attribution key on it; rename #33).
+    #
+    # Capture the request-span context BEFORE opening `hot_search_span` so the
+    # recall worker parents `recall.search` to the REQUEST span (sibling of
+    # `query.hot_search`), never to `query.hot_search`.
+    parent_ctx = otel_context.get_current()
 
-        # `resolved` is None when no shard exists yet; `.get("shard")` is then
-        # never reached. A no-shard query gets watermark 0 → all recall rows qualify.
-        watermark = _watermark_for_shard(resolved.get("shard") if resolved else None)
-
-        # Capture the CURRENT OTel context so the recall worker thread can attach
-        # it: OpenTelemetry's current-context is thread-local and does NOT
-        # propagate to a freshly-scheduled worker, so without this the
-        # `recall.search` span opened inside `recall_search` would become an
-        # orphaned root instead of a child of `query.hot_search`.
-        parent_ctx = otel_context.get_current()
-
-        def _recall_worker():
-            # Re-attach the request context inside the worker so spans opened here
-            # parent correctly; detach in a finally so the worker thread's context
-            # is left clean for its next pool task.
-            token = otel_context.attach(parent_ctx)
+    # Bound BEFORE the try so the `finally` join can always assign them, even if a
+    # `BaseException` propagates straight out of the inline consolidated branch.
+    recall_future = None
+    consolidated_exc: Optional[BaseException] = None
+    hot = None
+    recall_exc: Optional[BaseException] = None
+    recall_suppress_ids: set = set()
+    recall_matches: List[dict] = []
+    try:
+        with hot_search_span(tenant=tenant_id, dataset=dataset_name):
+            # I3 watermark pairing: resolve WHICH shard the consolidated search will
+            # read so the recall scan filters with that exact shard's
+            # `consolidated_lsn` — never a watermark resolved independently.
+            # Resolution is the cheap catalog lookup; a raised exception here is a
+            # consolidated-path failure and maps to the consolidated error envelope.
+            # The recall future has not been submitted yet at this point, so there
+            # is nothing to join when we return early here.
+            resolved: Optional[Dict[str, Any]] = {}
             try:
-                # `recall_search` returns (suppress_ids, matches): the FULL set of
-                # recall ids above the watermark (for authoritative suppression of
-                # the stale consolidated copy) AND only the filter-passing live rows.
-                return recall_search(
-                    tenant_id, dataset_name, vector_f, top_k, watermark, flt
-                )
-            finally:
-                otel_context.detach(token)
+                resolved = _resolve_shard(tenant_id, dataset_name, resolved)
+            except Exception as exc:  # noqa: BLE001
+                return _consolidated_error_response(tenant_id, dataset_name, exc)
 
-        # Submit recall to the worker, run the FAISS search INLINE — they overlap.
-        recall_future = _RECALL_EXECUTOR.submit(_recall_worker)
-
-        # Run the consolidated FAISS search inline on the already-resolved shard.
-        # Its exception is captured (not raised here) so the recall future is
-        # ALWAYS joined — never leaked — before any error is returned.
-        consolidated_exc: Optional[BaseException] = None
-        hot = None
-        try:
-            hot = _search_consolidated_shard(
-                tenant_id, dataset_name, vector_f, top_k, flt, nprobe_override,
-                resolved,
+            # `resolved` is None when no shard exists yet; `.get("shard")` is then
+            # never reached. A no-shard query gets watermark 0 → all recall rows qualify.
+            watermark = _watermark_for_shard(
+                resolved.get("shard") if resolved else None
             )
-        except Exception as exc:  # noqa: BLE001
-            consolidated_exc = exc
 
-        # Join the recall future — surfaces any worker exception here.
-        recall_exc: Optional[BaseException] = None
-        recall_suppress_ids: set = set()
-        recall_matches: List[dict] = []
-        try:
-            recall_suppress_ids, recall_matches = recall_future.result()
-        except Exception as exc:  # noqa: BLE001
-            recall_exc = exc
+            def _recall_worker():
+                # Re-attach the REQUEST context (captured above, before
+                # `hot_search_span` opened) inside the worker so `recall.search`
+                # parents to the request span as a sibling of `query.hot_search`;
+                # detach in a finally so the worker thread's context is left clean
+                # for its next pool task.
+                token = otel_context.attach(parent_ctx)
+                try:
+                    # `recall_search` returns (suppress_ids, matches): the FULL set
+                    # of recall ids above the watermark (for authoritative
+                    # suppression of the stale consolidated copy) AND only the
+                    # filter-passing live rows.
+                    return recall_search(
+                        tenant_id, dataset_name, vector_f, top_k, watermark, flt
+                    )
+                finally:
+                    otel_context.detach(token)
+
+            # Submit recall to the worker, run the FAISS search INLINE — they
+            # overlap. The FAISS search runs UNDER `query.hot_search`; recall runs
+            # on the worker under the request span (sibling).
+            recall_future = _RECALL_EXECUTOR.submit(_recall_worker)
+
+            # Run the consolidated FAISS search inline on the already-resolved
+            # shard. Its exception is captured (not raised here) so the recall
+            # future is ALWAYS joined — never leaked — before any error is returned.
+            try:
+                hot = _search_consolidated_shard(
+                    tenant_id, dataset_name, vector_f, top_k, flt, nprobe_override,
+                    resolved,
+                )
+            except Exception as exc:  # noqa: BLE001
+                consolidated_exc = exc
+        # `query.hot_search` is now CLOSED — its duration covers only resolve +
+        # inline FAISS, NOT the recall wait below.
+    finally:
+        # Join the recall future OUTSIDE `query.hot_search` so the wait does not
+        # inflate the consolidated-search span. The join lives in `finally` so the
+        # in-flight recall worker is NEVER abandoned regardless of how the inline
+        # consolidated branch exits — including a `BaseException`
+        # (KeyboardInterrupt/SystemExit) the `except Exception` above does not
+        # catch, which would otherwise propagate out and skip the join.
+        if recall_future is not None:
+            try:
+                recall_suppress_ids, recall_matches = recall_future.result()
+            except Exception as exc:  # noqa: BLE001
+                recall_exc = exc
 
     # BOTH-ERROR PRECEDENCE (documented, deterministic): if both branches failed,
     # report the CONSOLIDATED error first. This is the pre-overlap behaviour's
