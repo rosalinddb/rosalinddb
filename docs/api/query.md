@@ -37,8 +37,9 @@ Implementation:
   verified `X-RB-Tenant-Id` header, re-validates the body, and runs the
   search via `execute_v1_query`.
 - `services/query_api/v1_query.py` — the validate-quota-search core
-  (`validate_query_body`, `run_query`, `execute_v1_query`, `_hot_search`),
-  plus the in-memory shard cache and result-store consumer.
+  (`validate_query_body`, `run_query`, `execute_v1_query`, `_resolve_shard` +
+  `_search_consolidated_shard`), plus the in-memory shard cache and
+  result-store consumer.
 
 The CP→DP hop is internal to the deployment — externally `/v1/query` looks
 like a single request against the Control Plane. The CP injects a verified
@@ -66,7 +67,7 @@ shard:
   }
   ```
 
-The query path (`v1_query._hot_search`) and the ephemeral runner
+The query path (`v1_query._search_consolidated_shard`) and the ephemeral runner
 (`ephemeral_runner.handle`) load this sidecar via
 `adapters.landing.parquet_reader.read_shard_sidecar` and translate every
 FAISS hit back to `{id, score, metadata}`.
@@ -220,11 +221,14 @@ envelope, never as 200 with an empty list.
 
 These codes apply to BOTH paths:
 
-- **Hot path** — `_hot_search` in `services/query_api/v1_query.py:run_query`
+- **Hot path** — the consolidated search (`_resolve_shard` +
+  `_search_consolidated_shard`) in `services/query_api/v1_query.py:run_query`
   catches the exception, classifies it, and returns the envelope directly.
   It does **not** silently fall through to the ephemeral runner — the
   ephemeral fallback is reserved for its actual semantics (the dataset has
-  no shard yet, so `list_shards` returned empty).
+  no shard yet, so `list_shards` returned empty). With the recall union on,
+  the consolidated search and the recall scan run concurrently; if both fail
+  the consolidated error takes precedence.
 - **Ephemeral path** — the worker publishes the same envelope shape on the
   `RESULT_READY` queue (`{ok: false, error: {code, message}}`); the status
   poll surfaces it as 503. The queue message is still NACKed so the

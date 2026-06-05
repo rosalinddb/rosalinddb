@@ -312,10 +312,20 @@ or added matches; the label only describes the consolidated-shard cache state. `
 "no consolidated shard, recall answered." This is documented for callers in
 [`docs/api/query.md`](../api/query.md).
 
-**Watermark/shard pairing (I3) in code.** The consolidated search (`_hot_search`) reports the exact
-shard row it resolved back to `run_query` (via an out-dict), and the recall scan is filtered with
+**Watermark/shard pairing (I3) in code.** Shard resolution (`_resolve_shard`) reports the exact
+shard row it resolved back to `run_query` (via an out-dict), the consolidated FAISS search
+(`_search_consolidated_shard`) reads *that same* shard, and the recall scan is filtered with
 *that* shard's `consolidated_lsn` — never a watermark resolved by an independent
 `list_shards` lookup — so a stale cached shard version can never open a partition gap.
+
+**Overlap (#31).** Resolution and the FAISS search are split so `run_query` resolves the shard
+once, then runs the consolidated FAISS search and the recall scan **concurrently** (recall needs
+only the watermark, not the FAISS result): the recall scan is submitted to a bounded worker pool
+while the FAISS search runs inline, so the union latency is ~`max(consolidated, recall)` instead of
+their sum. The worker re-attaches the request's OpenTelemetry context so the `recall.search` span
+stays a child of the request span. If both branches fail, the consolidated error takes precedence
+(preserving the pre-overlap serial ordering); a recall failure is never masked and a consolidated
+failure is never reported as a recall error.
 
 ## Consolidation / flush
 
