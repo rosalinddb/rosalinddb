@@ -741,6 +741,7 @@ _MIGRATION_VERSIONS = (
     "006_tenants_dp_pool",
     "007_dp_shard_residency",
     "008_shard_consolidated_lsn",
+    "009_delta_tier",
 )
 
 
@@ -3341,8 +3342,33 @@ def add_shard(
     build_type: str = "full",
     indexed_landing_uris: Optional[List[str]] = None,
     consolidated_lsn: int = 0,
+    quantizer_version: int = 0,
+    parent_shard_id: Optional[int] = None,
+    level: int = 0,
+    covered_lsn_lo: int = 0,
+    covered_lsn_hi: int = 0,
+    tombstone_int_ids: Optional[List[int]] = None,
 ) -> int:
     """Insert a new shard record and return its ID.
+
+    The six delta-tier columns (migration 009) describe a shard's place in the
+    base+delta LSM generation (see docs/architecture/recall-consolidate.md and
+    bench-lab compaction redesign). They default to a `level=0` base with no
+    parent so every existing caller is unchanged:
+      - `quantizer_version`: the frozen-coarse-quantizer generation this shard's
+        IVF cells share. Only same-version shards may MERGE (search across
+        versions is fine — each shard is searched independently).
+      - `parent_shard_id`: for a `level=1` delta, the base shard it layers on
+        (NULL for a base). Liveness/sweep is by generation membership via this
+        pointer, never by list position.
+      - `level`: `0` = base, `1` = delta.
+      - `covered_lsn_lo`/`covered_lsn_hi`: the recall-LSN band this shard covers,
+        used to build the query's contiguous-frontier watermark (I1). A base
+        covers `[0, consolidated_lsn]`; a consolidate-delta covers
+        `[prev_hi+1, its consolidated_lsn]`.
+      - `tombstone_int_ids`: int64 ids (hash of the string id) deleted from the
+        cold tier by this fold, suppressed at query time and physically purged
+        at major compaction (no S3 tombstone object, no IVF `remove_ids`).
 
     Two columns support incremental indexing:
       - `build_type`: `'full'` (trained-from-scratch), `'incremental'`
@@ -3374,6 +3400,12 @@ def add_shard(
     """
     uris = list(indexed_landing_uris or [])
     consolidated_lsn = int(consolidated_lsn or 0)
+    tombstones = [int(x) for x in (tombstone_int_ids or [])]
+    parent_shard_id = int(parent_shard_id) if parent_shard_id is not None else None
+    quantizer_version = int(quantizer_version or 0)
+    level = int(level or 0)
+    covered_lsn_lo = int(covered_lsn_lo or 0)
+    covered_lsn_hi = int(covered_lsn_hi or 0)
     # The payload format is shared across the memory hook and the `pg_notify`
     # channel so the DP's catalog-cache invalidator can use one parser. Keep
     # keys minimal — `pg_notify`'s payload is capped at 8000 bytes by
@@ -3402,6 +3434,12 @@ def add_shard(
             "sealed": True,
             "supersedes": [],
             "created_at": time.time(),
+            "quantizer_version": quantizer_version,
+            "parent_shard_id": parent_shard_id,
+            "level": level,
+            "covered_lsn_lo": covered_lsn_lo,
+            "covered_lsn_hi": covered_lsn_hi,
+            "tombstone_int_ids": tombstones,
         }
         _MEM_SHARDS.append(record)
         # Fire AFTER the row is appended so any subscriber that immediately
@@ -3414,12 +3452,16 @@ def add_shard(
             """
 INSERT INTO shard_catalog(
   tenant_id, dataset_name, shard_uri, checksum, vector_count, index_type,
-  build_type, indexed_landing_uris, consolidated_lsn)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+  build_type, indexed_landing_uris, consolidated_lsn,
+  quantizer_version, parent_shard_id, level, covered_lsn_lo, covered_lsn_hi,
+  tombstone_int_ids)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
             """,
             (
                 tenant_id, dataset_name, shard_uri, checksum, vector_count,
                 index_type, build_type, uris, consolidated_lsn,
+                quantizer_version, parent_shard_id, level, covered_lsn_lo,
+                covered_lsn_hi, tombstones,
             ),
         )
         shard_id = cur.fetchone()[0]
@@ -3448,10 +3490,11 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
 def list_shards(tenant_id: str, dataset_name: str) -> List[dict]:
     """Return shards for a `(tenant_id, dataset_name)` sorted newest-first.
 
-    The ordering must be a TOTAL order: `_grace_watermark` selects `shards[1]`
-    (the 2nd-newest) and `get_latest_shard` selects `shards[0]`, so a tie would
-    make those selections nondeterministic and could mis-bound the grace-trim.
-    Memory mode orders by the monotonic insertion `id` (already total). The
+    The ordering must be a TOTAL order: `get_latest_shard` selects `shards[0]`
+    and `_generations` walks the list to assign each base/delta to a generation,
+    so a tie would make those selections nondeterministic and could mis-bound the
+    sweep/grace-trim. Memory mode orders by the monotonic insertion `id` (already
+    total). The
     Postgres path orders by `created_at DESC` but `created_at` is
     `TIMESTAMPTZ DEFAULT now()` (transaction-start time), so two shards built in
     the same transaction window could share it; the `id DESC` tiebreaker (the
@@ -3489,21 +3532,125 @@ def get_latest_shard(tenant_id: str, dataset_name: str) -> Optional[dict]:
     return shards[0] if shards else None
 
 
+def _shard_level(shard: dict) -> int:
+    return int(shard.get("level", 0) or 0)
+
+
+def _shard_frontier(shard: dict) -> int:
+    """The recall-LSN this shard covers up to (its `covered_lsn_hi`).
+
+    Falls back to `consolidated_lsn` for legacy/base-only rows written before
+    migration 009 (where `covered_lsn_hi` is its `0` default but the shard still
+    carries a real watermark in `consolidated_lsn`).
+    """
+    hi = int(shard.get("covered_lsn_hi", 0) or 0)
+    return hi if hi > 0 else int(shard.get("consolidated_lsn", 0) or 0)
+
+
+def _generations(shards: List[dict]) -> List[List[dict]]:
+    """Group a newest-first shard list into generations, newest generation first.
+
+    A generation = one base (`level=0`) plus the deltas (`level=1`) whose
+    `parent_shard_id` is that base AND whose `quantizer_version` matches it. Each
+    base defines its own generation in `list_shards` order (newest base first);
+    deltas attach to their base. Orphan deltas (parent already swept, or a
+    quantizer-version mismatch) attach to NO generation, so they fall out of every
+    live set and are swept — the desired behaviour.
+
+    For a base-only dataset every shard is its own single-shard generation in
+    newest-first order, so `_generations(shards)[:keep]` flattens back to
+    `shards[:keep]` — preserving the pre-delta sweep/grace semantics exactly.
+    """
+    deltas_by_parent: dict = {}
+    for s in shards:
+        if _shard_level(s) != 0:
+            deltas_by_parent.setdefault(s.get("parent_shard_id"), []).append(s)
+    generations: List[List[dict]] = []
+    for base in shards:
+        if _shard_level(base) != 0:
+            continue
+        kids = [
+            d for d in deltas_by_parent.get(base["id"], [])
+            if int(d.get("quantizer_version", 0) or 0)
+            == int(base.get("quantizer_version", 0) or 0)
+        ]
+        generations.append([base, *kids])
+    return generations
+
+
+def live_generation(tenant_id: str, dataset_name: str) -> Optional[dict]:
+    """Return the CURRENT generation as `{"base": row, "deltas": [rows]}` or None.
+
+    The base is the newest `level=0` shard; the deltas are its same-version
+    children, ordered by `covered_lsn_lo` (oldest LSN band first) so the query
+    path can verify a contiguous frontier. This REPLACES the `shards[0]` notion
+    of "the current shard" for the delta-tier read/union path.
+    """
+    shards = list_shards(tenant_id, dataset_name)
+    generations = _generations(shards)
+    if not generations:
+        return None
+    base, *deltas = generations[0]
+    deltas.sort(key=lambda s: (int(s.get("covered_lsn_lo", 0) or 0), s["id"]))
+    return {"base": base, "deltas": deltas}
+
+
+def dataset_watermark(tenant_id: str, dataset_name: str) -> int:
+    """Highest `consolidated_lsn` over the live generation (0 if no shard).
+
+    The per-dataset high-water mark for carry-forward and recall-cap decisions.
+    `get_latest_shard()["consolidated_lsn"]` is no longer safe to read directly:
+    with deltas, `shards[0]` may be a delta and the max-over-generation is the
+    correct frontier.
+    """
+    gen = live_generation(tenant_id, dataset_name)
+    if not gen:
+        return 0
+    rows = [gen["base"], *gen["deltas"]]
+    return max(int(r.get("consolidated_lsn", 0) or 0) for r in rows)
+
+
+def grace_watermark(tenant_id: str, dataset_name: str, keep: int = 2) -> int:
+    """The trim boundary: the oldest STILL-LIVE generation's frontier (I4).
+
+    `recall_trim` may delete recall rows with `lsn <= grace_watermark`. The
+    oldest live generation is the one a slow in-flight query might still resolve;
+    its frontier is the highest recall LSN already folded into its shards, so
+    rows at or below it are safely in the cold tier for that query. Returns 0
+    until at least `keep` generations exist (nothing has aged into the grace
+    window — e.g. the first consolidation), matching the legacy
+    `list_shards()[1].consolidated_lsn` behaviour for base-only datasets.
+    """
+    keep = max(1, keep)
+    generations = _generations(list_shards(tenant_id, dataset_name))
+    if len(generations) < keep:
+        return 0
+    oldest_live = generations[keep - 1]
+    return max(_shard_frontier(s) for s in oldest_live)
+
+
 def superseded_shards(
     tenant_id: str, dataset_name: str, keep: int = 2
 ) -> List[dict]:
-    """Return shards eligible for sweeping — every shard older than the newest `keep`.
+    """Return shards eligible for sweeping — everything outside the newest `keep` generations.
 
-    `list_shards` is newest-first, so the first `keep` rows are retained and the
-    rest are superseded. `keep=2` retains the newest shard plus the one
-    immediately before it: that previous shard is the grace buffer for an
-    in-flight query that resolved it as `get_latest_shard` just before the
-    newest shard was written, and is still faulting its `.bin`/`.meta.json` into
-    the local cache. Anything older than that can never be the target of a
-    query that started after it was superseded.
+    LIVENESS IS BY GENERATION MEMBERSHIP, not list position. A generation is a
+    base plus its same-version deltas (`_generations`); the newest `keep`
+    generations are retained (current + grace), everything else is swept. A live
+    delta is NEVER swept even though it sorts to the HEAD of `list_shards` by
+    `created_at` (deltas are written after their base) — the old
+    `list_shards[keep:]` would have GC'd the live base out from under it.
+
+    `keep=2` retains the current generation plus the immediately prior one (the
+    grace buffer for an in-flight query that resolved the previous generation).
+    For a base-only dataset this is identical to the legacy newest-`keep`-shards
+    behaviour (each base is a single-shard generation).
     """
     keep = max(1, keep)
-    return list_shards(tenant_id, dataset_name)[keep:]
+    shards = list_shards(tenant_id, dataset_name)
+    generations = _generations(shards)
+    live_ids = {s["id"] for gen in generations[:keep] for s in gen}
+    return [s for s in shards if s["id"] not in live_ids]
 
 
 def delete_shards(tenant_id: str, dataset_name: str, shard_ids: List[int]) -> int:
