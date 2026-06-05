@@ -52,6 +52,7 @@ from adapters.state.state import (
     dataset_build_lock,
     get_latest_shard,
     list_shards,
+    live_generation,
     set_row_count,
     update_dataset_status,
     get_dataset,
@@ -126,6 +127,41 @@ def _truthy(value: Optional[str]) -> bool:
     duplicated to keep this module's import graph slim (one line of parsing
     is not worth a cross-package import)."""
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _delta_tier_enabled() -> bool:
+    """`RB_DELTA_TIER` (default OFF) — the delta-shard LSM fold (PR-B).
+
+    Read live (per call) so a test can flip it without a module reload. With the
+    flag OFF EVERY consolidate/build path is byte-identical to today: the base is
+    an `IndexIDMap2`-wrapped IVF, folds rewrite the union, no quantizer object is
+    written, and no delta rows are produced. With the flag ON a dataset's first
+    IVF consolidation writes a BARE-IVF base (native ids, mergeable) plus a frozen
+    `quantizer-vG.index` object, and every later fold becomes a cheap O(rows)
+    `consolidate-delta` shard layered on that base (no base load, no retrain).
+
+    Dark-launchable + revertible by env until the bench gates pass (the whole
+    tier is OFF by default; PR-D lands the delta-count cap before anyone enables
+    it). See bench-lab/research/phase1-spec.md §9 (rollback).
+    """
+    return _truthy(os.getenv("RB_DELTA_TIER"))
+
+
+# `RB_MAX_DELTAS` (default 8) — the live-delta count that triggers a MAJOR
+# compaction. PR-B reads it for forward-compatibility ONLY; the cap is NOT
+# enforced here (under the flag deltas may accumulate — fine, the flag is off by
+# default and PR-D lands the major-compaction enforcement before anyone enables
+# it). See phase1-spec.md §7.
+def _max_deltas() -> int:
+    raw = os.getenv("RB_MAX_DELTAS")
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    return 8
 
 
 def _compute_shard_uri(tenant: str, dataset: str, shard_name: str, blob: bytes) -> str:
@@ -279,6 +315,31 @@ def build_ivfflat(vectors: np.ndarray, ids: np.ndarray | None = None) -> bytes:
     if isinstance(blob, np.ndarray):
         return blob.tobytes()
     return blob
+
+
+def build_ivfflat_native(vectors: np.ndarray, ids: np.ndarray) -> bytes:
+    """Build a BARE `IndexIVFFlat` with the IVF's NATIVE `add_with_ids` (PR-B).
+
+    The mergeable base shape for the delta tier. Unlike `build_ivfflat` (which
+    ALWAYS wraps the inner IVF in an `IndexIDMap2`), this stores the int64 ids
+    DIRECTLY in the IVF inverted lists via the IVF's own `add_with_ids` and does
+    NOT wrap in `IndexIDMap2`. This matters because (Phase-0 P0-A) an
+    `IndexIDMap2(IVFFlat).merge_from` SILENTLY CORRUPTS ids, whereas (P0-B) a bare
+    `IndexIVFFlat` built this way round-trips ids correctly through `merge_from` —
+    the shape PR-D's major compaction merges.
+
+    Same nlist/metric sizing as `build_ivfflat` (`IndexFlatL2` coarse quantizer,
+    `METRIC_L2`, `nlist` via `_choose_nlist`). `ids` is REQUIRED and must be int64
+    and the same length as `vectors`. Search returns the original int64 ids
+    directly (the inverted lists carry them), so the read path needs no IDMap.
+    """
+    dim = int(vectors.shape[1])
+    nlist = _choose_nlist(int(vectors.shape[0]))
+    quantizer = faiss.IndexFlatL2(dim)
+    inner = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_L2)
+    inner.train(vectors)
+    inner.add_with_ids(vectors, np.asarray(ids, dtype=np.int64))
+    return _serialize_index(inner)
 
 
 def build_flat(vectors: np.ndarray, ids: np.ndarray | None = None) -> bytes:
@@ -455,6 +516,117 @@ def _is_ivf_index(index) -> bool:
     the actual loaded index, not a possibly-stale sidecar/catalog label.
     """
     return faiss.try_extract_index_ivf(index) is not None
+
+
+# --- Delta tier: frozen per-generation quantizer + cheap delta blobs (PR-B) --
+#
+# A "generation" is one base (level=0) + its deltas (level=1) that share ONE
+# frozen coarse quantizer (`quantizer-vG.index`). A delta clones that quantizer
+# (`faiss.clone_index`, stays `is_trained=True` → no retrain, P0-C) and only
+# `add_with_ids`'s the few-thousand live fold rows — O(rows), no base load, no
+# retrain. All of this is gated behind `_delta_tier_enabled()` at the call sites;
+# these helpers are pure and never read the flag themselves.
+
+# In-process cache of loaded trained-empty quantizers, keyed by
+# (tenant, dataset, version). The objects are immutable (we always
+# `clone_index` before adding), so caching the deserialized index is safe and
+# saves a read+deserialize per fold.
+_QUANTIZER_CACHE: dict[tuple, object] = {}
+
+
+def _quantizer_uri(tenant: str, dataset: str, version: int) -> str:
+    """Object key for a generation's frozen quantizer (alongside its shards).
+
+    Derived from the SAME prefix logic `_compute_shard_uri` uses for the legacy
+    (default) URI shape, so the quantizer lands next to the dataset's shards:
+    `{INDEXES_PREFIX}/{tenant}/{dataset}/indexes/quantizer-v{version}.index`.
+    Unlike a shard URI it is NOT date-stamped or content-addressed — it is a
+    stable, immutable per-generation key the base row stamps via
+    `quantizer_version` and every delta of that generation reads back.
+    """
+    return (
+        f"{INDEXES_PREFIX}/{tenant}/{dataset}/indexes/quantizer-v{version}.index"
+    )
+
+
+def _save_quantizer(tenant: str, dataset: str, inner_ivf, version: int) -> str:
+    """Serialize a TRAINED-EMPTY clone of `inner_ivf` to `quantizer-v{version}`.
+
+    Clones the trained inner IVF (so the source is untouched), `.reset()`s it to
+    empty (trained-but-empty — `is_trained` stays True so a later clone+add never
+    retrains, P0-C), serializes, and `write_bytes`'s it to `_quantizer_uri`.
+    Returns the URI. The clone is also cached for immediate reuse by this fold.
+    """
+    clone = faiss.clone_index(inner_ivf)
+    clone.reset()
+    uri = _quantizer_uri(tenant, dataset, version)
+    write_bytes(uri, _serialize_index(clone))
+    _QUANTIZER_CACHE[(tenant, dataset, int(version))] = clone
+    return uri
+
+
+def _load_quantizer(tenant: str, dataset: str, version: int):
+    """Read+deserialize a generation's trained-empty quantizer (cached).
+
+    Returns an `IndexIVFFlat` that is trained-but-empty (`is_trained=True`,
+    `ntotal=0`). Cached by (tenant, dataset, version) so repeated folds in one
+    process do not re-read the object. The returned index must NOT be mutated by
+    the caller — `_build_delta_blob` always `clone_index`'s it first.
+    """
+    key = (tenant, dataset, int(version))
+    cached = _QUANTIZER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    blob = read_bytes(_quantizer_uri(tenant, dataset, version))
+    idx = faiss.deserialize_index(np.frombuffer(blob, dtype=np.uint8))
+    _QUANTIZER_CACHE[key] = idx
+    return idx
+
+
+def _build_delta_blob(
+    quantizer,
+    ids: np.ndarray,
+    vectors: np.ndarray,
+    metas: list[dict],
+    raw_ids: Optional[list[str]] = None,
+) -> tuple[bytes, bytes, str, int]:
+    """Build a cheap delta shard from a frozen quantizer + fold rows (PR-B).
+
+    `idx = faiss.clone_index(quantizer)` stays trained (P0-C), so
+    `idx.add_with_ids(vectors, ids)` adds WITHOUT retraining — O(rows), no base
+    load. The result is a BARE `IndexIVFFlat` (native ids in the inverted lists,
+    NO `IndexIDMap2`), the mergeable shape PR-D folds. The sidecar is the SAME
+    `{str(int64): {"id":..., "metadata":...}}` format `_sidecar_dict` produces, so
+    the query path inverts the int64 hits exactly as it does for a base shard.
+
+    `ids` is the int64 array stored in the inverted lists (required). `raw_ids`,
+    when provided, supplies the ORIGINAL string id for each row's sidecar `"id"`
+    field (index-aligned with `ids`); the real fold path passes the recall rows'
+    string ids so the query path maps an int64 hit back to the customer's id.
+    When `raw_ids` is None (e.g. a direct call in tests) the sidecar id falls
+    back to `str(int64)` — consistent with the from-scratch builder's behaviour
+    for a survivor missing from the sidecar.
+
+    `metas` is index-aligned with `ids`/`vectors`; an empty delta (zero rows,
+    e.g. a tombstone-only fold) yields an empty (but trained) bare IVF and an
+    empty sidecar. Returns `(blob, sidecar_blob, "ivfflat", n)`.
+    """
+    idx = faiss.clone_index(quantizer)
+    int_ids = np.asarray(ids, dtype=np.int64)
+    n = int(int_ids.shape[0])
+    if n:
+        idx.add_with_ids(np.asarray(vectors, dtype=np.float32), int_ids)
+    int_list = int_ids.tolist()
+    raws = list(raw_ids) if raw_ids is not None else [str(int(i)) for i in int_list]
+    sidecar = {
+        str(int(int64_id)): {
+            "id": raw,
+            "metadata": meta if isinstance(meta, dict) else {},
+        }
+        for int64_id, raw, meta in zip(int_list, raws, metas)
+    }
+    sidecar_blob = json.dumps(sidecar).encode("utf-8")
+    return _serialize_index(idx), sidecar_blob, "ivfflat", n
 
 
 def _union_rebuild_blob(
@@ -757,6 +929,12 @@ def _write_shard(
     build_type: str,
     indexed_uris: List[str],
     consolidated_lsn: int = 0,
+    quantizer_version: int = 0,
+    parent_shard_id: Optional[int] = None,
+    level: int = 0,
+    covered_lsn_lo: int = 0,
+    covered_lsn_hi: int = 0,
+    tombstone_int_ids: Optional[List[int]] = None,
 ) -> str:
     """Write a freshly-built shard + sidecar, catalog it, reconcile, prewarm.
 
@@ -815,6 +993,16 @@ def _write_shard(
         build_type=build_type,
         indexed_landing_uris=indexed_uris,
         consolidated_lsn=consolidated_lsn,
+        # Delta-tier columns (migration 009). The defaults reproduce a legacy
+        # `level=0` base with no parent/quantizer, so every existing caller (which
+        # omits these) is byte-identical to today; only the flag-on consolidate
+        # path threads real values through.
+        quantizer_version=quantizer_version,
+        parent_shard_id=parent_shard_id,
+        level=level,
+        covered_lsn_lo=covered_lsn_lo,
+        covered_lsn_hi=covered_lsn_hi,
+        tombstone_int_ids=tombstone_int_ids,
     )
     # Reconcile dataset.row_count to the just-built shard's true unique-vector
     # count. The validator's `increment_row_count` runs per-batch without
@@ -1424,6 +1612,191 @@ def _run_consolidate_locked(dataset: str, tenant: str) -> int:
         return len(live_rows)
 
 
+def _shard_covered_hi(shard: dict) -> int:
+    """The recall-LSN this shard covers up to (its `covered_lsn_hi`).
+
+    Falls back to `consolidated_lsn` for legacy/base-only rows written before the
+    delta tier (where `covered_lsn_hi` is its `0` default but the shard still
+    carries a real watermark in `consolidated_lsn`). Mirrors state's
+    `_shard_frontier` without importing a private helper.
+    """
+    hi = int(shard.get("covered_lsn_hi", 0) or 0)
+    return hi if hi > 0 else int(shard.get("consolidated_lsn", 0) or 0)
+
+
+def _delta_tier_applies(latest_shard: Optional[dict]) -> bool:
+    """True iff the delta-tier path should run for this consolidation.
+
+    Gated on `_delta_tier_enabled()` AND (for a subsequent fold) the current
+    generation's BASE being an IVF index — flat datasets and the flag-off case
+    keep the EXISTING path entirely. The first build is decided separately (a
+    fresh dataset has no base yet; the sub-IVF-floor test there picks flat and
+    skips the quantizer machinery).
+    """
+    if not _delta_tier_enabled():
+        return False
+    if latest_shard is None:
+        return True  # first build — the IVF-vs-flat gate is applied at build time
+    gen = live_generation(latest_shard["tenant_id"], latest_shard["dataset_name"])
+    if not gen:
+        return True
+    base = gen["base"]
+    # Only fold as a delta when the current generation's base is an IVF shard
+    # built WITH a frozen quantizer (`quantizer_version >= 1`). A flat base or a
+    # legacy IDMap2 base written flag-OFF (no `quantizer-vG.index` object) falls
+    # back to the existing union-rebuild path — so flipping the flag ON for a
+    # dataset that already has a legacy base does not try to load a quantizer that
+    # was never written. (A legacy base is converted to bare-IVF once, in PR-D's
+    # major compaction; until then it keeps the legacy fold path.)
+    return (
+        str(base.get("index_type", "")) == "ivfflat"
+        and int(base.get("level", 0) or 0) == 0
+        and int(base.get("quantizer_version", 0) or 0) >= 1
+    )
+
+
+def _build_delta_fold(
+    tenant: str,
+    dataset: str,
+    live_rows: List[dict],
+    tombstone_ids: List[str],
+    consolidated_lsn: int,
+) -> Optional[str]:
+    """Delta-tier consolidation (flag ON, IVF dataset). See `_build_consolidated_shard`.
+
+    First build (no prior generation): a BARE-IVF base via `build_ivfflat_native`
+    + a saved `quantizer-v1.index`, `level=0, quantizer_version=1,
+    covered_lsn_lo=0, covered_lsn_hi=N`, `build_type='consolidate'`. Sub-IVF-floor
+    datasets fall back to `build_flat` (level=0, no quantizer) exactly as the
+    legacy from-scratch path.
+
+    Subsequent fold (a base generation exists): write the live rows as a cheap
+    `consolidate-delta`, `level=1` shard via `_build_delta_blob(clone of
+    quantizer-vG, ...)`. No base load, no survivor reconstruct, no retrain, base
+    untouched. EVERY deleted id's int64 is carried on the delta row
+    UNCONDITIONALLY — no cold-tier membership probe (which read sidecars and could
+    silently drop a delete on a failed read); a tombstone for an id absent from
+    cold is harmless (suppresses/purges nothing). A tombstone-only fold with a
+    prior base writes a zero-vector delta advancing the watermark so deletes
+    drain; with NO prior shard it returns None (unchanged).
+    """
+    live_ids = [r["id"] for r in live_rows]
+    live_metas = [r["metadata"] for r in live_rows]
+    if live_rows:
+        vectors = np.array([r["values"] for r in live_rows], dtype=np.float32)
+        live_int_ids = np.array([_id_to_int64(i) for i in live_ids], dtype=np.int64)
+    else:
+        vectors = np.empty((0, 0), dtype=np.float32)
+        live_int_ids = np.array([], dtype=np.int64)
+
+    gen = live_generation(tenant, dataset)
+
+    if gen is None:
+        # --- FIRST BUILD: a fresh base (no prior generation) ----------------
+        if not live_rows:
+            # Tombstone-only first consolidation — nothing to write (unchanged).
+            return None
+        nlist_target = _choose_nlist(int(vectors.shape[0]))
+        if (
+            INDEX_TYPE == "ivfflat"
+            and nlist_target >= 4
+            and vectors.shape[0] >= IVF_TRAINING_FLOOR
+        ):
+            # Bare-IVF base (native ids), then save the frozen quantizer-v1 from
+            # its trained inner IVF so every later delta clones it (P0-C).
+            blob = build_ivfflat_native(vectors, live_int_ids)
+            index_type_str = "ivfflat"
+            inner = faiss.deserialize_index(np.frombuffer(blob, dtype=np.uint8))
+            _save_quantizer(tenant, dataset, inner, version=1)
+            quantizer_version = 1
+        else:
+            # Sub-IVF-floor: flat fallback, no quantizer (delta machinery is
+            # IVF-only) — identical to the legacy from-scratch flat base.
+            blob = build_flat(vectors, live_int_ids)
+            index_type_str = "flat"
+            quantizer_version = 0
+        sidecar_blob = _build_sidecar(live_ids, live_metas)
+        total_vectors = int(vectors.shape[0])
+        return _write_shard(
+            tenant,
+            dataset,
+            blob,
+            sidecar_blob,
+            total_vectors,
+            index_type_str,
+            build_type="consolidate",
+            indexed_uris=[],
+            consolidated_lsn=consolidated_lsn,
+            quantizer_version=quantizer_version,
+            level=0,
+            covered_lsn_lo=0,
+            covered_lsn_hi=consolidated_lsn,
+        )
+
+    # --- SUBSEQUENT FOLD: a delta layered on the current generation's base ---
+    base = gen["base"]
+    quantizer_version = int(base.get("quantizer_version", 0) or 0)
+    base_watermark = max(_shard_covered_hi(s) for s in [base, *gen["deltas"]])
+    # covered_lsn_lo is the first LSN not yet covered by the generation — a
+    # contiguous frontier from the base (I1). covered_lsn_hi advances to N.
+    covered_lo = base_watermark + 1
+
+    # Record EVERY deleted id's int64 UNCONDITIONALLY — no cold-membership check.
+    #
+    # We do NOT probe whether the deleted id actually exists in the cold tier
+    # (base + deltas) before carrying its tombstone. The previous version read the
+    # generation's shard SIDECARS to build a "cold id set" and dropped any
+    # tombstone whose int64 wasn't in it — but a failed/empty sidecar read was
+    # swallowed (`except Exception: sc = {}`), which could SILENTLY DROP a real
+    # delete (its stale cold copy would survive un-suppressed). That fragility is
+    # unacceptable for the read path (PR-C) and physical purge (PR-D), which rely
+    # on `tombstone_int_ids` being complete.
+    #
+    # Carrying a tombstone for an id that happens NOT to live in any cold shard is
+    # harmless: at query time it suppresses nothing; at major compaction (PR-D) it
+    # purges nothing. Carrying one for an id that DOES live in cold is exactly
+    # correct. So recording all of them can never drop a delete and removes the
+    # sidecar dependency entirely. (Re-upsert/overlap dedup of LIVE ids is PR-C's
+    # job — newest-delta-wins in the read union — so tombstones = DELETES only and
+    # we never add re-upserted live base ids here.)
+    tombstone_int_ids = [_id_to_int64(i) for i in tombstone_ids]
+
+    if not live_rows and not tombstone_int_ids:
+        # Nothing to fold and nothing to delete — leave the catalog unchanged and
+        # return None so the caller skips the watermark advance + trim, matching
+        # the legacy "nothing to write" semantics.
+        return None
+    # A tombstone-only fold (no live rows, but deletes present) still advances the
+    # watermark: it writes a ZERO-VECTOR delta carrying `tombstone_int_ids` and
+    # covering [covered_lo, N] so the deleted recall rows drain. (Deletes must
+    # drain.)
+
+    # Build the delta blob from a CLONE of the frozen quantizer (P0-C): no base
+    # load, no retrain. A tombstone-only fold yields an empty (but trained) bare
+    # IVF that still advances the watermark.
+    quantizer = _load_quantizer(tenant, dataset, quantizer_version)
+    blob, sidecar_blob, index_type_str, n = _build_delta_blob(
+        quantizer, live_int_ids, vectors, live_metas, raw_ids=live_ids
+    )
+    return _write_shard(
+        tenant,
+        dataset,
+        blob,
+        sidecar_blob,
+        n,
+        index_type_str,
+        build_type="consolidate-delta",
+        indexed_uris=[],
+        consolidated_lsn=consolidated_lsn,
+        quantizer_version=quantizer_version,
+        parent_shard_id=int(base["id"]),
+        level=1,
+        covered_lsn_lo=covered_lo,
+        covered_lsn_hi=consolidated_lsn,
+        tombstone_int_ids=tombstone_int_ids or None,
+    )
+
+
 def _build_consolidated_shard(
     tenant: str,
     dataset: str,
@@ -1446,7 +1819,19 @@ def _build_consolidated_shard(
     write (no prior shard AND no live rows — a tombstone-only first
     consolidation): there is no index to remove from and nothing to add, so the
     catalog is left unchanged and the caller skips the watermark advance + trim.
+
+    DELTA TIER (PR-B): when `_delta_tier_applies(latest_shard)` (the flag is ON
+    AND the dataset's current generation base is IVF / it is the first build) the
+    fold is delegated to `_build_delta_fold`, which writes a cheap O(rows) delta
+    (or a fresh bare-IVF base on the first build) instead of the full union
+    rewrite below. The flag-OFF branch and the flat branch use the EXISTING
+    append-only / union-rebuild / from-scratch code unchanged.
     """
+    if _delta_tier_applies(latest_shard):
+        return _build_delta_fold(
+            tenant, dataset, live_rows, tombstone_ids, consolidated_lsn
+        )
+
     live_ids = [r["id"] for r in live_rows]
     live_metas = [r["metadata"] for r in live_rows]
     if live_rows:
