@@ -50,6 +50,7 @@ from adapters.observability.tracing import (
 )
 from adapters.queue.queue import consume, publish, ack, nack
 from adapters.queue.shutdown import should_stop
+from adapters.state import state as _state
 from adapters.state.state import (
     RecallUnavailable,
     get_dataset,
@@ -105,6 +106,18 @@ def query_nprobe() -> int:
     """
     raw = max(1, int(os.getenv("RB_QUERY_NPROBE", str(DEFAULT_NPROBE))))
     return min(raw, MAX_NPROBE)
+
+
+def _delta_tier_enabled() -> bool:
+    """Return True when the delta-tier read union (`RB_DELTA_TIER`) is on.
+
+    DEFAULT OFF. Read LIVE (not captured at import) so a test or an operator can
+    flip it without re-importing the module — and, crucially, so with the flag OFF
+    every resolve/watermark/search path is byte-identical to today (single-shard
+    resolution + `_watermark_for_shard`). The whole tier is dark-launchable and
+    revertible by env until the bench gates pass (spec §9, rollback contract).
+    """
+    return _truthy(os.getenv("RB_DELTA_TIER"))
 
 
 def _ivf_search_params(index, override: Optional[int] = None, full_coverage: bool = False):
@@ -1099,14 +1112,45 @@ def _resolve_shard(
         # No shard for this dataset yet — the same signal `_hot_search`
         # returned. `resolved` carries no `"shard"` key so the watermark is 0
         # and (with recall on) all recall rows qualify; with recall off the
-        # caller falls through to the ephemeral path.
+        # caller falls through to the ephemeral path. Byte-identical in BOTH
+        # the flag-off and flag-on paths (the spec's preserved no-shard signal).
         return None
-    latest = shards[0]
-    # I3 watermark pairing: record WHICH shard the consolidated search will read,
-    # so the recall-tier union filters with this exact shard's consolidated_lsn
-    # (never a watermark resolved independently). `latest` is the head of the
-    # newest-first catalog list — the same row `_search_consolidated_shard` loads.
-    resolved["shard"] = latest
+
+    if not _delta_tier_enabled():
+        # --- Flag OFF: single-shard resolution, byte-identical to today -----
+        # I3 watermark pairing: record WHICH shard the consolidated search will
+        # read, so the recall-tier union filters with this exact shard's
+        # consolidated_lsn (never a watermark resolved independently). `latest`
+        # is the head of the newest-first catalog list — the same row
+        # `_search_consolidated_shard` loads.
+        resolved["shard"] = shards[0]
+        return resolved
+
+    # --- Flag ON: resolve the live generation (base + live deltas) ----------
+    # Single-snapshot resolution (I3): membership, watermark, AND tombstones all
+    # derive from the SAME `shards` snapshot taken above. We compute the live
+    # generation from THAT list via `state._generations` (rather than calling
+    # `state.live_generation`, which would issue a SECOND catalog read and could
+    # tear the (set, watermark) pair against a concurrent compaction/cutover).
+    generations = _state._generations(shards)
+    if not generations:
+        # The snapshot has rows but none form a generation (e.g. only orphan
+        # deltas whose base was swept) — treat as no resolvable shard, the same
+        # no-shard signal so the caller falls through to recall/ephemeral.
+        return None
+    base, *deltas = generations[0]
+    # Order deltas by their LSN band so the frontier-watermark walk and the
+    # contiguity proof (§5.1) see them oldest-band-first. `id` breaks ties
+    # deterministically (matches state.live_generation's ordering).
+    deltas.sort(key=lambda s: (int(s.get("covered_lsn_lo", 0) or 0), s["id"]))
+    resolved["shards"] = [base, *deltas]
+    # Stash the resolved deltas' catalog tombstones (int64) for cold-vs-cold
+    # delete suppression. They are read from the SAME resolved rows the watermark
+    # derives from → version-atomic with the frontier (§3.3, §5.2).
+    tombstones: List[int] = []
+    for d in deltas:
+        tombstones.extend(int(x) for x in (d.get("tombstone_int_ids") or []))
+    resolved["delta_tombstone_int_ids"] = tombstones
     return resolved
 
 
@@ -1119,7 +1163,7 @@ def _search_consolidated_shard(
     nprobe: Optional[int] = None,
     resolved: Optional[Dict[str, Any]] = None,
 ):
-    """Run the FAISS search on the already-resolved shard — phase 2 only.
+    """Run the FAISS search on the already-resolved shard(s) — phase 2 only.
 
     Returns `(matches, mode)` where `mode` is the cache-state `"hot"` (cache
     hit) or `"cold"` (a shard that had to be faulted into the local cache for
@@ -1127,9 +1171,19 @@ def _search_consolidated_shard(
     `resolved` carries no shard (the no-shard signal — so the caller still
     falls through to the ephemeral path exactly as before).
 
-    `resolved` is the out-dict produced by `_resolve_shard(...)`: this function
-    reads `resolved["shard"]` and never re-resolves, so the FAISS search reads
-    exactly the shard the recall watermark was paired to (invariant I3).
+    `resolved` is the out-dict produced by `_resolve_shard(...)`. With the delta
+    tier OFF it reads `resolved["shard"]` (the single newest shard) and never
+    re-resolves, so the FAISS search reads exactly the shard the recall watermark
+    was paired to (invariant I3) — byte-identical to today. With the delta tier
+    ON it reads `resolved["shards"]` (base + live deltas), loads+searches EACH,
+    and CONCATENATES the matches: a global top-k vector is in its own shard's
+    top-k (a shard is a subset of the generation), so over-fetching `top_k`
+    per shard and letting the caller's merge sort+truncate is lossless (P0-C).
+    The per-shard nprobe is delivered via `faiss.SearchParametersIVF` per call
+    (never a cached-index mutation), so searching N shards is concurrency-safe.
+    If any frontier shard is UNREADABLE the load/search raises and propagates,
+    so `run_query` returns the consolidated 503 rather than silently narrowing
+    the cold set below what was actually read (§5.1).
 
     `nprobe`, when supplied, overrides the server-default IVF `nprobe` for
     this query only — used by the recall benchmark to sweep `nprobe` across
@@ -1154,11 +1208,75 @@ def _search_consolidated_shard(
     Runs UNDER the caller's open `query.hot_search` span so the `shard.download`,
     `faiss.load_index` and `faiss.search` children stay attributable to it.
     """
-    latest = resolved.get("shard") if resolved else None
+    if not resolved:
+        return None
+
+    shards = resolved.get("shards")
+    if shards is not None:
+        # --- Flag ON: loop-search the base + live deltas, concatenate -------
+        if not shards:
+            return None
+        # DELTA-WINS DEDUP (review #11 BLOCKER): when an id is RE-UPSERTED, PR-B
+        # folds the NEW copy into a delta but the OLD copy stays in the base, so
+        # the concatenated union would return that id TWICE (stale base copy +
+        # new delta copy), consuming two top_k slots and pushing a real result
+        # out. The frontier-tombstone path only suppresses DELETES, not
+        # re-upsert duplicates. So dedup the concatenated consolidated matches by
+        # id, keeping the copy from the NEWEST band (greatest `covered_lsn_hi`).
+        # `resolved["shards"]` is ordered by `covered_lsn_lo` ASCENDING (base
+        # oldest → deltas newest), so writing each shard's matches into an
+        # `id -> match` dict in that order lets the later/newer copy overwrite
+        # the earlier/older one — newest-wins. The deduped matches are that
+        # dict's values; the UNCHANGED `_merge_recall_and_consolidated` still
+        # sorts by score + truncates top_k. This is consolidated-vs-consolidated
+        # ONLY — recall stays authoritative and is merged separately. It COMPOSES
+        # with tombstone suppression: a deleted id is suppressed entirely; a
+        # re-upserted id keeps exactly its newest copy.
+        deduped: Dict[str, dict] = {}
+        # `mode` is the WEAKEST cache state across the fan-out: if ANY shard was
+        # a cold load the query paid a cold tax, so the customer-facing mode is
+        # "cold"; only when EVERY shard was a warm cache hit is it "hot".
+        any_cold = False
+        for shard in shards:
+            shard_matches, is_cold = _search_one_shard(
+                tenant, dataset, vector, top_k, flt, nprobe, shard
+            )
+            for m in shard_matches:
+                # Later iterations are newer bands → overwrite to keep newest.
+                deduped[m["id"]] = m
+            any_cold = any_cold or is_cold
+        return list(deduped.values()), ("cold" if any_cold else "hot")
+
+    # --- Flag OFF: single-shard search, byte-identical to today -------------
+    latest = resolved.get("shard")
     if latest is None:
         return None
+    matches, is_cold = _search_one_shard(
+        tenant, dataset, vector, top_k, flt, nprobe, latest
+    )
+    return matches, ("cold" if is_cold else "hot")
+
+
+def _search_one_shard(
+    tenant: str,
+    dataset: str,
+    vector: List[float],
+    top_k: int,
+    flt: Optional[Dict[str, Any]],
+    nprobe: Optional[int],
+    shard: Dict[str, Any],
+) -> Tuple[List[dict], bool]:
+    """Load (cache-first) and FAISS-search ONE shard. Returns `(matches, is_cold)`.
+
+    The body the single-shard path always ran, extracted so the multi-shard
+    loop can reuse it per-shard. The per-`shard_id` byte-budgeted LRU cache,
+    the `_ivf_search_params` per-call `SearchParametersIVF` nprobe (no cached-
+    index mutation), and the oversize-bypass / mmap accounting are ALL unchanged.
+    Raises on an unreadable shard (download/deserialise failure) so the caller
+    surfaces the consolidated error rather than silently dropping the shard.
+    """
     has_filter = bool(flt)
-    shard_id = latest.get("id")
+    shard_id = shard.get("id")
 
     # In-memory cache lookup. A hit reuses the already-deserialised FAISS
     # index + parsed sidecar (the query is then just the search); a miss
@@ -1171,16 +1289,16 @@ def _search_consolidated_shard(
         is_cold = False
         obs_metrics.record_shard_cache("hit")
     else:
-        with shard_download_span(uri=latest["shard_uri"]):
+        with shard_download_span(uri=shard["shard_uri"]):
             # `_ensure_cached` internally checks `RB_SHARD_TIER_BYTES`
             # to decide between the SSD tier and the legacy in-process
             # single-flight. The URI is the cache key in either path —
             # no separate shard id needed at this layer.
-            local_path = _ensure_cached(latest["shard_uri"])
+            local_path = _ensure_cached(shard["shard_uri"])
         # `mmap=_MMAP_ENABLED` stamps `rosalinddb.mmap` on the span so a
         # trace makes the cold-load strategy (mmap vs full deserialise)
         # obvious without an out-of-band lookup of the deployment's env.
-        with faiss_load_index_span(uri=latest["shard_uri"], mmap=_MMAP_ENABLED):
+        with faiss_load_index_span(uri=shard["shard_uri"], mmap=_MMAP_ENABLED):
             # mmap path: FAISS keeps the index file open and serves reads
             # from the page cache instead of copying the whole serialised
             # blob into RSS. `IO_FLAG_READ_ONLY` pairs with the mmap flag
@@ -1192,7 +1310,7 @@ def _search_consolidated_shard(
                 )
             else:
                 index = faiss.read_index(local_path)
-        sidecar = read_shard_sidecar(latest["shard_uri"])
+        sidecar = read_shard_sidecar(shard["shard_uri"])
         _cache_put(shard_id, index, sidecar)
         is_cold = True
         obs_metrics.record_shard_cache("miss")
@@ -1219,7 +1337,7 @@ def _search_consolidated_shard(
     maj_after = _read_major_faults()
     if maj_before is not None and maj_after is not None:
         obs_metrics.record_shard_page_faults(max(0, maj_after - maj_before))
-    return matches, ("cold" if is_cold else "hot")
+    return matches, is_cold
 
 
 def _consolidated_search(
@@ -1599,6 +1717,97 @@ def _watermark_for_shard(shard: Optional[Dict[str, Any]]) -> int:
         return 0
 
 
+def _frontier_watermark(resolved: Optional[Dict[str, Any]]) -> int:
+    """Recall watermark from the resolved base+delta SET — the contiguous frontier.
+
+    Replaces `_watermark_for_shard` for the multi-shard (flag-on) case. The base
+    anchors at its `covered_lsn_hi` (falling back to `consolidated_lsn` when
+    `hi == 0`, for legacy/base-only rows written before migration 009). Each delta,
+    ordered by `covered_lsn_lo`, must CONTIGUOUSLY extend the cover:
+    `lo[i] == prev_hi + 1`. The watermark is the LAST contiguous `hi`.
+
+    If there is a GAP (a delta missing from a stale catalog cache, so the resolved
+    set's bands do not abut), the frontier is CLAMPED to the contiguous max BEFORE
+    the gap (the conservative MIN). Recall then re-serves the uncovered band —
+    over-serving is safe (suppression dedups); under-serving (the `max()` bug)
+    would silently drop the (clamped, gap] vectors into neither tier (§5.1, I1).
+
+    This NEVER returns `max(consolidated_lsn)` over the set: a `max()` watermark
+    with an unreadable/omitted delta is a silent partition hole. When the resolved
+    dict carries no `"shards"` (no shard, or the flag-off path slipping through),
+    the watermark is 0 so ALL recall rows qualify.
+    """
+    if not resolved:
+        return 0
+    shards = resolved.get("shards")
+    if not shards:
+        return 0
+    ordered = sorted(shards, key=lambda s: (int(s.get("covered_lsn_lo", 0) or 0), s.get("id", 0)))
+    base = ordered[0]
+    # Base anchor: its covered_lsn_hi, or consolidated_lsn for a legacy row.
+    hi = int(base.get("covered_lsn_hi", 0) or 0)
+    if hi <= 0:
+        hi = int(base.get("consolidated_lsn", 0) or 0)
+    frontier = hi
+    for delta in ordered[1:]:
+        lo = int(delta.get("covered_lsn_lo", 0) or 0)
+        d_hi = int(delta.get("covered_lsn_hi", 0) or 0)
+        if lo == frontier + 1:
+            # Contiguous: extend the frontier to this delta's hi.
+            frontier = d_hi
+        else:
+            # GAP (lo skips ahead) or an out-of-order/overlapping band — clamp to
+            # the contiguous max so far. Do NOT advance past the hole.
+            break
+    return frontier
+
+
+def _tombstone_suppress_ids(resolved: Optional[Dict[str, Any]]) -> set:
+    """Map the resolved deltas' int64 catalog tombstones back to STRING ids.
+
+    A fold whose lsn is already `<= watermark` carries the deleted cold ids as
+    `tombstone_int_ids` (int64 hashes) on its delta row. Those ids are below the
+    frontier, so recall does NOT cover them (recall only owns `lsn > frontier`) —
+    the cold-vs-cold delete must be applied at the read by suppressing the matching
+    cold id. We invert each int64 to its string id via the per-shard `.meta.json`
+    sidecars (the sidecar maps `str(int64) -> {id, metadata}`) and return the set
+    to extend `recall_suppress_ids` with. The merge then drops those cold ids.
+
+    Best-effort per int64: a tombstone whose sidecar entry is missing (an
+    unreadable sidecar, or an id not present in any resolved shard's sidecar) is
+    skipped — over-suppression would drop a live id, so we only suppress an id we
+    can positively resolve. The cold id is then physically purged at the next
+    major compaction regardless (PR-D).
+    """
+    if not resolved:
+        return set()
+    tombstones = resolved.get("delta_tombstone_int_ids") or []
+    if not tombstones:
+        return set()
+    shards = resolved.get("shards") or []
+    # Build a single int64(str) -> string-id lookup across all resolved sidecars.
+    lookup: Dict[str, str] = {}
+    for shard in shards:
+        uri = shard.get("shard_uri")
+        if not uri:
+            continue
+        # `read_shard_sidecar` already swallows missing/unreadable-sidecar errors
+        # and returns `{}` (its docstring guarantees graceful degradation), so a
+        # try/except here would be unreachable dead code (review #11).
+        sidecar = read_shard_sidecar(uri)
+        for k, entry in sidecar.items():
+            if k not in lookup and isinstance(entry, dict):
+                sid = entry.get("id")
+                if sid is not None:
+                    lookup[k] = sid
+    suppress: set = set()
+    for t in tombstones:
+        sid = lookup.get(str(int(t)))
+        if sid is not None:
+            suppress.add(sid)
+    return suppress
+
+
 def _merge_recall_and_consolidated(
     recall_suppress_ids: set,
     recall_matches: List[dict],
@@ -1786,11 +1995,20 @@ def run_query(tenant_id: str, parsed: _ParsedQuery) -> Union[JSONResponse, dict]
             except Exception as exc:  # noqa: BLE001
                 return _consolidated_error_response(tenant_id, dataset_name, exc)
 
-            # `resolved` is None when no shard exists yet; `.get("shard")` is then
-            # never reached. A no-shard query gets watermark 0 → all recall rows qualify.
-            watermark = _watermark_for_shard(
-                resolved.get("shard") if resolved else None
-            )
+            # `resolved` is None when no shard exists yet → watermark 0, all
+            # recall rows qualify. With the delta tier ON, `resolved` carries a
+            # base+delta SET under `"shards"` and the watermark is the contiguous
+            # FRONTIER over that set (gap-clamped, never `max()` — §5.1). With it
+            # OFF, `resolved` carries a single `"shard"` and the watermark is its
+            # `consolidated_lsn` exactly as today (I3). One function picks the
+            # right reader off the resolved shape so both paths pair the watermark
+            # to exactly the shard(s) the consolidated search read.
+            if resolved and resolved.get("shards") is not None:
+                watermark = _frontier_watermark(resolved)
+            else:
+                watermark = _watermark_for_shard(
+                    resolved.get("shard") if resolved else None
+                )
 
             def _recall_worker():
                 # Re-attach the REQUEST context (captured above, before
@@ -1870,6 +2088,22 @@ def run_query(tenant_id: str, parsed: _ParsedQuery) -> Union[JSONResponse, dict]
         consolidated_matches, cold_mode = hot
     else:
         consolidated_matches, cold_mode = [], None
+
+    # Delta-tier cold-vs-cold delete suppression (flag on): extend the recall
+    # suppress set with the resolved deltas' catalog tombstones, mapped from int64
+    # back to STRING ids via the per-shard sidecars. These ids were deleted by a
+    # fold whose lsn is already `<= frontier`, so recall does NOT cover them — the
+    # delete must be applied at the read by suppressing the matching cold id. The
+    # tombstones are read from the SAME resolved rows the frontier derived from, so
+    # they are version-atomic with the watermark (§3.3). `_merge_recall_and_consolidated`
+    # itself is UNCHANGED — only its `recall_suppress_ids` input grows. When the flag
+    # is off `resolved` has no `delta_tombstone_int_ids`, so this is a no-op.
+    if resolved and resolved.get("delta_tombstone_int_ids"):
+        cold_tombstones = _tombstone_suppress_ids(resolved)
+        if cold_tombstones:
+            # Do not mutate the recall worker's returned set in place; the merge
+            # reads the union of recall ids + cold tombstones.
+            recall_suppress_ids = set(recall_suppress_ids) | cold_tombstones
 
     # If there is neither a consolidated shard NOR any recall row, fall through to
     # the ephemeral path exactly as the consolidated-only path would (the dataset is
