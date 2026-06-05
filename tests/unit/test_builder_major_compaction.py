@@ -147,20 +147,23 @@ def test_cap_trigger_folds_to_one_base(delta_on, monkeypatch):
 
     # Drive max_deltas-1 folds (no compaction yet): the generation reaches
     # max_deltas-1 deltas; on the FINAL allowed fold the count hits the cap.
+    # Each fold's rows sit at the TOP of a fresh LSN band (strictly ABOVE the
+    # prior generation frontier) with max_lsn == the band max — mirroring a real
+    # recall snapshot, where a fold writes only rows with lsn > the frontier.
     lsn = 200
     for k in range(max_deltas - 1):
-        new = _vectors(3, _DIM, seed=100 + k)
-        rows = [_recall_row(f"d{k}-{j}", new[j].tolist(), lsn + j) for j in range(3)]
         lsn += 50
+        new = _vectors(3, _DIM, seed=100 + k)
+        rows = [_recall_row(f"d{k}-{j}", new[j].tolist(), lsn - 2 + j) for j in range(3)]
         assert _fold(builder_mod, monkeypatch, rows, max_lsn=lsn) == 3
         gen = state_mod.live_generation("t1", "ds")
         assert len(gen["deltas"]) == k + 1, "no compaction before the cap"
         assert int(gen["base"]["id"]) == old_base_id
 
     # The fold that brings the live-delta count TO the cap triggers compaction.
-    new = _vectors(3, _DIM, seed=999)
-    rows = [_recall_row(f"cap-{j}", new[j].tolist(), lsn + j) for j in range(3)]
     lsn += 50
+    new = _vectors(3, _DIM, seed=999)
+    rows = [_recall_row(f"cap-{j}", new[j].tolist(), lsn - 2 + j) for j in range(3)]
     assert _fold(builder_mod, monkeypatch, rows, max_lsn=lsn) == 3
 
     gen = state_mod.live_generation("t1", "ds")
@@ -376,11 +379,11 @@ def test_major_compaction_recall_parity(delta_on, monkeypatch):
     fold_vecs = {}
     lsn = 200
     for k in range(3):
+        lsn += 50  # rows at the top of a fresh band, strictly above the frontier
         fv = _vectors(4, _DIM, seed=300 + k)
-        rows = [_recall_row(f"f{k}-{j}", fv[j].tolist(), lsn + j) for j in range(4)]
+        rows = [_recall_row(f"f{k}-{j}", fv[j].tolist(), lsn - 3 + j) for j in range(4)]
         for j in range(4):
             fold_vecs[f"f{k}-{j}"] = fv[j]
-        lsn += 50
         assert _fold(builder_mod, monkeypatch, rows, max_lsn=lsn) == 4
 
     gen_before = state_mod.live_generation("t1", "ds")
@@ -452,20 +455,62 @@ def test_hard_ceiling_backstop_forces_compaction(monkeypatch):
 
     lsn = 200
     # First two folds: 1 then 2 deltas (< hard ceiling 3) — no compaction.
+    # Rows at the top of a fresh band, strictly above the prior frontier.
     for k in range(2):
-        new = _vectors(2, _DIM, seed=500 + k)
-        rows = [_recall_row(f"h{k}-{j}", new[j].tolist(), lsn + j) for j in range(2)]
         lsn += 50
+        new = _vectors(2, _DIM, seed=500 + k)
+        rows = [_recall_row(f"h{k}-{j}", new[j].tolist(), lsn - 1 + j) for j in range(2)]
         assert _fold(builder_mod, monkeypatch, rows, max_lsn=lsn) == 2
         assert len(state_mod.live_generation("t1", "ds")["deltas"]) == k + 1
 
     # Third fold brings the live-delta count to 3 == hard ceiling → backstop
     # forces a major compaction even though the trigger (999) is not reached.
-    new = _vectors(2, _DIM, seed=599)
-    rows = [_recall_row(f"h2-{j}", new[j].tolist(), lsn + j) for j in range(2)]
     lsn += 50
+    new = _vectors(2, _DIM, seed=599)
+    rows = [_recall_row(f"h2-{j}", new[j].tolist(), lsn - 1 + j) for j in range(2)]
     assert _fold(builder_mod, monkeypatch, rows, max_lsn=lsn) == 2
     gen = state_mod.live_generation("t1", "ds")
     assert len(gen["deltas"]) == 0, "hard-ceiling backstop must force a compaction"
     assert int(gen["base"]["level"]) == 0
     assert int(gen["base"]["covered_lsn_hi"]) == lsn
+
+
+# --------------------------------------------------------------------------- #
+# 9. Regression (bench-found): a fold writes ONLY rows above the frontier.     #
+# --------------------------------------------------------------------------- #
+
+
+def test_fold_skips_already_folded_rows_when_recall_untrimmed(delta_on, monkeypatch):
+    """A fold must write only NEW rows (lsn > generation frontier) into the delta.
+
+    Bench-found bug: until the first MAJOR compaction creates a 2nd generation,
+    `grace_watermark` is 0 so `recall_trim` is a no-op, so the recall snapshot
+    keeps returning rows that were ALREADY folded into the base/prior deltas.
+    Without a frontier filter every fold re-folds the whole snapshot — the delta
+    bloats to O(recall) and stamps a degenerate `[frontier+1, N]` band over rows
+    with lsn <= frontier. This asserts the fold folds ONLY the band above the
+    frontier even when the snapshot still contains the already-folded base rows.
+    """
+    builder_mod, state_mod, storage_mod = delta_on
+    ids = [f"id-{i}" for i in range(_N_COLD)]
+    vecs = _vectors(_N_COLD, _DIM, seed=5)
+    _seed_base(builder_mod, state_mod, monkeypatch, ids, vecs, max_lsn=_N_COLD)
+    # The base rows (lsn 1.._N_COLD) — still present in recall (untrimmed).
+    base_rows = [_recall_row(rid, vecs[i].tolist(), i + 1) for i, rid in enumerate(ids)]
+
+    # 5 brand-new rows above the frontier; the UNTRIMMED snapshot returns the base
+    # rows AGAIN plus the new ones (max_lsn = the new max).
+    nv = _vectors(5, _DIM, seed=77)
+    new_rows = [_recall_row(f"new-{j}", nv[j].tolist(), _N_COLD + 1 + j) for j in range(5)]
+    n = _fold(builder_mod, monkeypatch, base_rows + new_rows, max_lsn=_N_COLD + 5)
+
+    assert n == 5, "fold must process only the NEW rows above the frontier, not re-fold the base"
+    gen = state_mod.live_generation("t1", "ds")
+    assert len(gen["deltas"]) == 1
+    delta = gen["deltas"][0]
+    assert int(delta["vector_count"]) == 5, "delta must hold ONLY the 5 new rows (not re-fold the base)"
+    assert int(delta["covered_lsn_lo"]) == _N_COLD + 1
+    assert int(delta["covered_lsn_hi"]) == _N_COLD + 5
+    assert int(delta["covered_lsn_lo"]) <= int(delta["covered_lsn_hi"]), "band must not be degenerate"
+    didx = _deser(storage_mod.read_bytes(delta["shard_uri"]))
+    assert int(didx.ntotal) == 5

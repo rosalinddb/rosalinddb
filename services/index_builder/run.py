@@ -1626,6 +1626,30 @@ def _run_consolidate_locked(dataset: str, tenant: str) -> int:
         latest_shard = get_latest_shard(tenant, dataset)
         is_incremental = latest_shard is not None
 
+        # DELTA TIER: a fold writes ONLY the rows ABOVE the current generation's
+        # frontier into a new delta — the base + prior deltas already cover
+        # `lsn <= frontier`. This is the minor-compaction invariant that makes a
+        # fold O(new rows), not O(recall). It MUST be applied here (not left to the
+        # snapshot) because until the first MAJOR compaction creates a 2nd
+        # generation, `grace_watermark` is 0 → `recall_trim` is a no-op → the
+        # snapshot keeps returning already-folded rows; without this filter every
+        # fold re-folds the whole recall partition (deltas bloat to O(recall) and
+        # carry degenerate `[frontier+1, N]` bands over rows ≤ frontier). The first
+        # build (no generation yet) has frontier 0 → folds everything into the base.
+        if _delta_tier_applies(latest_shard):
+            _gen = live_generation(tenant, dataset)
+            _frontier = (
+                max((_shard_covered_hi(s) for s in [_gen["base"], *_gen["deltas"]]),
+                    default=0)
+                if _gen else 0
+            )
+            if _frontier > 0:
+                live_rows = [r for r in live_rows if int(r["lsn"]) > _frontier]
+                tombstone_ids = [
+                    r["id"] for r in recall_rows
+                    if r["deleted"] and int(r["lsn"]) > _frontier
+                ]
+
         try:
             shard_uri = _build_consolidated_shard(
                 tenant, dataset, latest_shard, live_rows, tombstone_ids, max_lsn
