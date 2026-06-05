@@ -17,8 +17,10 @@ The delta tier is gated behind `RB_DELTA_TIER` (default OFF). These tests cover:
     native int64 ids.
   - `_build_delta_blob`: clone-not-retrain (adding to a clone leaves the
     quantizer/centroids untouched), and the blob searches back its native ids.
-  - Tombstone fold with a prior base: the delta carries `tombstone_int_ids`
-    (only the int64s present in the cold tier) and advances the watermark.
+  - Tombstone fold with a prior base: the delta carries `tombstone_int_ids` for
+    EVERY deleted id (no cold-membership probe) and advances the watermark.
+  - Hardening: a delete is recorded even when the shard sidecar is unreadable
+    (the fold no longer depends on sidecar reads for tombstone detection).
   - Tombstone-only fold with NO prior shard: returns None (unchanged).
   - Sub-IVF-floor first build under the flag: falls back to flat, level=0, no
     quantizer object.
@@ -391,7 +393,9 @@ def test_flag_on_tombstone_fold_carries_int_ids_and_advances_watermark(
     base_bytes_before = bytes(storage_mod.read_bytes(base["shard_uri"]))
 
     # FOLD: one live new id + a tombstone for a cold id (id-3, in the base)
-    # AND a tombstone for an id never in cold (ghost) — only the cold one is carried.
+    # AND a tombstone for an id never in cold (ghost). EVERY deleted id is now
+    # carried UNCONDITIONALLY — no cold-membership probe. The ghost tombstone is
+    # harmless (suppresses/purges nothing at query time) but MUST NOT be dropped.
     live = _vectors(1, _DIM, seed=8)
     rows = [
         _recall_row("live-1", live[0].tolist(), 130),
@@ -406,10 +410,55 @@ def test_flag_on_tombstone_fold_carries_int_ids_and_advances_watermark(
     delta = gen["deltas"][0]
     assert delta["build_type"] == "consolidate-delta"
     assert int(delta["covered_lsn_hi"]) == 140
-    # Only the cold id's int64 is carried (ghost was never in the base watermark).
+    # BOTH deleted ids' int64s are carried (cold id-3 AND recall-only ghost).
     tombs = [int(x) for x in (delta.get("tombstone_int_ids") or [])]
     assert builder_mod._id_to_int64("id-3") in tombs
-    assert builder_mod._id_to_int64("ghost") not in tombs
+    assert builder_mod._id_to_int64("ghost") in tombs
+    # Base untouched.
+    assert storage_mod.read_bytes(base["shard_uri"]) == base_bytes_before
+
+
+def test_flag_on_delete_recorded_even_when_sidecar_unreadable(delta_on, monkeypatch):
+    """Hardening (adversarial review): a delete must NEVER be silently dropped.
+
+    The fold no longer probes cold-tier membership via shard sidecars when
+    deciding which tombstones to carry — it records EVERY deleted id's int64
+    unconditionally. To prove the delete can't be dropped by a sidecar failure we
+    monkeypatch `read_shard_sidecar` to RAISE on every call; the cold id's
+    tombstone must still be carried and the watermark must still advance.
+    """
+    builder_mod, state_mod, storage_mod = delta_on
+    ids = [f"id-{i}" for i in range(_N_COLD)]
+    vecs = _vectors(_N_COLD, _DIM, seed=5)
+    base = _seed_cold_via_consolidate(
+        builder_mod, state_mod, monkeypatch, ids, vecs, max_lsn=_N_COLD
+    )
+    base_bytes_before = bytes(storage_mod.read_bytes(base["shard_uri"]))
+
+    # Make ANY sidecar read explode. Under the OLD cold-membership logic this
+    # would swallow the error, treat cold as empty, and DROP the delete.
+    def _boom(*_a, **_k):
+        raise RuntimeError("sidecar read failed")
+
+    monkeypatch.setattr(builder_mod, "read_shard_sidecar", _boom)
+
+    # Tombstone-only fold for a cold id (id-7, present in the base).
+    rows = [_recall_row("id-7", vecs[7].tolist(), 150, deleted=True)]
+    _patch_snapshot(monkeypatch, builder_mod, max_lsn=160, rows=rows)
+    n = builder_mod.run_consolidate_once("ds", "t1")
+    assert n == 0  # no live rows folded
+
+    gen = state_mod.live_generation("t1", "ds")
+    assert len(gen["deltas"]) == 1
+    delta = gen["deltas"][0]
+    assert delta["build_type"] == "consolidate-delta"
+    # The delete was recorded despite the unreadable sidecar — NOT dropped.
+    tombs = [int(x) for x in (delta.get("tombstone_int_ids") or [])]
+    assert builder_mod._id_to_int64("id-7") in tombs
+    # The watermark advanced so the deleted recall row drains.
+    assert int(delta["covered_lsn_hi"]) == 160
+    assert int(delta["consolidated_lsn"]) == 160
+    assert int(delta["vector_count"]) == 0
     # Base untouched.
     assert storage_mod.read_bytes(base["shard_uri"]) == base_bytes_before
 

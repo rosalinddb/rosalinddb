@@ -1673,10 +1673,12 @@ def _build_delta_fold(
     Subsequent fold (a base generation exists): write the live rows as a cheap
     `consolidate-delta`, `level=1` shard via `_build_delta_blob(clone of
     quantizer-vG, ...)`. No base load, no survivor reconstruct, no retrain, base
-    untouched. Tombstones for ids present in the cold tier (<= base watermark) are
-    carried on the delta row. A tombstone-only fold with a prior base writes a
-    zero-vector delta advancing the watermark so deletes drain; with NO prior
-    shard it returns None (unchanged).
+    untouched. EVERY deleted id's int64 is carried on the delta row
+    UNCONDITIONALLY — no cold-tier membership probe (which read sidecars and could
+    silently drop a delete on a failed read); a tombstone for an id absent from
+    cold is harmless (suppresses/purges nothing). A tombstone-only fold with a
+    prior base writes a zero-vector delta advancing the watermark so deletes
+    drain; with NO prior shard it returns None (unchanged).
     """
     live_ids = [r["id"] for r in live_rows]
     live_metas = [r["metadata"] for r in live_rows]
@@ -1739,41 +1741,35 @@ def _build_delta_fold(
     # contiguous frontier from the base (I1). covered_lsn_hi advances to N.
     covered_lo = base_watermark + 1
 
-    # Tombstones for ids ALREADY in the cold tier are carried on the delta row so
-    # the query path suppresses the stale cold copy and major compaction (PR-D)
-    # physically purges it. "In the cold tier" = the int64 appears in the current
-    # generation's shard sidecars (the base + its live deltas). A tombstone for an
-    # id that was never consolidated is recall-only and needs no catalog tombstone
-    # — it is simply trimmed from recall. Reading the (small JSON) sidecars keeps
-    # this O(rows folded), not O(1M): no base index load, no reconstruct.
-    cold_int_ids: set[int] = set()
-    for s in [base, *gen["deltas"]]:
-        try:
-            sc = read_shard_sidecar(s["shard_uri"])
-        except Exception:  # noqa: BLE001 — a missing sidecar just narrows the set
-            sc = {}
-        for k in sc.keys():
-            try:
-                cold_int_ids.add(int(k))
-            except (TypeError, ValueError):
-                continue
-    tombstone_int_ids = [
-        _id_to_int64(i)
-        for i in tombstone_ids
-        if _id_to_int64(i) in cold_int_ids
-    ]
+    # Record EVERY deleted id's int64 UNCONDITIONALLY — no cold-membership check.
+    #
+    # We do NOT probe whether the deleted id actually exists in the cold tier
+    # (base + deltas) before carrying its tombstone. The previous version read the
+    # generation's shard SIDECARS to build a "cold id set" and dropped any
+    # tombstone whose int64 wasn't in it — but a failed/empty sidecar read was
+    # swallowed (`except Exception: sc = {}`), which could SILENTLY DROP a real
+    # delete (its stale cold copy would survive un-suppressed). That fragility is
+    # unacceptable for the read path (PR-C) and physical purge (PR-D), which rely
+    # on `tombstone_int_ids` being complete.
+    #
+    # Carrying a tombstone for an id that happens NOT to live in any cold shard is
+    # harmless: at query time it suppresses nothing; at major compaction (PR-D) it
+    # purges nothing. Carrying one for an id that DOES live in cold is exactly
+    # correct. So recording all of them can never drop a delete and removes the
+    # sidecar dependency entirely. (Re-upsert/overlap dedup of LIVE ids is PR-C's
+    # job — newest-delta-wins in the read union — so tombstones = DELETES only and
+    # we never add re-upserted live base ids here.)
+    tombstone_int_ids = [_id_to_int64(i) for i in tombstone_ids]
 
     if not live_rows and not tombstone_int_ids:
-        # Tombstone-only fold whose tombstones hit NO cold id (all recall-only):
-        # there is nothing to suppress in cold and no live rows to fold. Leave the
-        # catalog unchanged (the recall trim still drains the tombstones via the
-        # next pass / grace). Return None so the caller skips the watermark
-        # advance — matching the legacy "nothing to write" semantics.
-        if not tombstone_ids:
-            return None
-        # There ARE tombstones, but none hit cold. Still advance the watermark so
-        # the recall tombstone rows can drain — write a zero-vector delta carrying
-        # no catalog tombstones but covering [covered_lo, N]. (Deletes must drain.)
+        # Nothing to fold and nothing to delete — leave the catalog unchanged and
+        # return None so the caller skips the watermark advance + trim, matching
+        # the legacy "nothing to write" semantics.
+        return None
+    # A tombstone-only fold (no live rows, but deletes present) still advances the
+    # watermark: it writes a ZERO-VECTOR delta carrying `tombstone_int_ids` and
+    # covering [covered_lo, N] so the deleted recall rows drain. (Deletes must
+    # drain.)
 
     # Build the delta blob from a CLONE of the frozen quantizer (P0-C): no base
     # load, no retrain. A tombstone-only fold yields an empty (but trained) bare
