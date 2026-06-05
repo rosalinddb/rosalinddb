@@ -77,11 +77,18 @@ def _truncate_recall(dsn: str) -> None:
         conn.close()
 
 
-def _migrate_recall(recall_url):
-    import os
+def _migrate_recall(monkeypatch, recall_url):
+    # CRITICAL: set RB_RECALL_DSN via monkeypatch, NOT a bare `os.environ[...]`.
+    # `_migrate_recall` runs BEFORE `_build_client`'s `monkeypatch.setenv`; a bare
+    # write here makes monkeypatch later record the (test-local, soon-torn-down)
+    # container DSN as the var's "original" value and RESTORE it on teardown
+    # instead of removing it — leaking a dead DSN into later modules (e.g.
+    # test_query_filter), whose writes then fail with recall_write_failed
+    # (connection refused). Routing every recall-env write through monkeypatch
+    # keeps the suite order-independent (matches test_query_union's discipline).
+    monkeypatch.setenv("RB_RECALL_DSN", recall_url)
     import adapters.state.state as state_mod
     importlib.reload(state_mod)
-    os.environ["RB_RECALL_DSN"] = recall_url
     state_mod._RECALL_MIGRATED = False
     state_mod.migrate_recall(force=True)
 
@@ -113,7 +120,6 @@ def _rng(n, seed):
 
 def _build_client(monkeypatch, indexes_prefix, tmp_path, recall_url):
     """Reload the pipeline with recall + delta tier ON, MinIO storage, fresh state."""
-    import os
     monkeypatch.setenv("RB_RECALL", "true")
     monkeypatch.setenv("RB_RECALL_DSN", recall_url)
     monkeypatch.setenv("RB_DELTA_TIER", "1")
@@ -125,7 +131,6 @@ def _build_client(monkeypatch, indexes_prefix, tmp_path, recall_url):
     import adapters.state.state as state_mod
     importlib.reload(state_mod)
     state_mod._RECALL_MIGRATED = False
-    os.environ["RB_RECALL_DSN"] = recall_url
     state_mod.migrate_recall(force=True)
     for attr in ("_MEM_TENANTS", "_MEM_TENANTS_BY_EMAIL", "_MEM_API_KEYS", "_MEM_DATASETS"):
         obj = getattr(state_mod, attr, None)
@@ -277,7 +282,7 @@ def test_delta_reupsert_dedups_delta_wins_e2e(
     consolidated-vs-consolidated dedup must collapse them to one entry carrying
     the DELTA's metadata.
     """
-    _migrate_recall(recall_url)
+    _migrate_recall(monkeypatch, recall_url)
     _truncate_recall(recall_url)
     client, state_mod, _v1q = _build_client(monkeypatch, s3_indexes_prefix, tmp_path, recall_url)
     s = _signup(client, email="reupsert@example.com")
@@ -308,7 +313,7 @@ def test_delta_reupsert_then_delete_absent_e2e(
     The delta both supersedes "x" (vB) AND tombstones it; dedup keeps the newest
     copy, tombstone suppression then drops it — leaving no stale base duplicate.
     """
-    _migrate_recall(recall_url)
+    _migrate_recall(monkeypatch, recall_url)
     _truncate_recall(recall_url)
     client, state_mod, _v1q = _build_client(monkeypatch, s3_indexes_prefix, tmp_path, recall_url)
     s = _signup(client, email="reupsertdel@example.com")
@@ -336,7 +341,7 @@ def test_delta_union_recall_parity_vs_monolith(
     monkeypatch, recall_url, s3_indexes_prefix, tmp_path
 ):
     """The base+delta union over MinIO shards == a single monolithic index."""
-    _migrate_recall(recall_url)
+    _migrate_recall(monkeypatch, recall_url)
     _truncate_recall(recall_url)
     client, state_mod, v1q = _build_client(monkeypatch, s3_indexes_prefix, tmp_path, recall_url)
     s = _signup(client, email="parity@example.com")
@@ -374,7 +379,7 @@ def test_delta_tombstone_suppresses_cold_id_e2e(
     monkeypatch, recall_url, s3_indexes_prefix, tmp_path
 ):
     """A delta's catalog tombstone hides the cold (base) id from the union."""
-    _migrate_recall(recall_url)
+    _migrate_recall(monkeypatch, recall_url)
     _truncate_recall(recall_url)
     client, state_mod, _v1q = _build_client(monkeypatch, s3_indexes_prefix, tmp_path, recall_url)
     s = _signup(client, email="tomb@example.com")
@@ -403,7 +408,7 @@ def test_delta_gap_clamps_frontier(
     monkeypatch, recall_url, s3_indexes_prefix, tmp_path
 ):
     """A non-contiguous delta band clamps the frontier (recall re-serves the band)."""
-    _migrate_recall(recall_url)
+    _migrate_recall(monkeypatch, recall_url)
     _truncate_recall(recall_url)
     client, state_mod, v1q = _build_client(monkeypatch, s3_indexes_prefix, tmp_path, recall_url)
     s = _signup(client, email="gap@example.com")
@@ -433,7 +438,7 @@ def test_unreadable_frontier_delta_returns_503(
     monkeypatch, recall_url, s3_indexes_prefix, tmp_path
 ):
     """A deleted delta `.bin` fails the query (no silent narrowing of the cold set)."""
-    _migrate_recall(recall_url)
+    _migrate_recall(monkeypatch, recall_url)
     _truncate_recall(recall_url)
     client, state_mod, _v1q = _build_client(monkeypatch, s3_indexes_prefix, tmp_path, recall_url)
     s = _signup(client, email="503@example.com")
