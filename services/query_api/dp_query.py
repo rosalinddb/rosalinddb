@@ -96,8 +96,8 @@ async def dp_v1_query(
     authenticated route.
 
     DP I/O offload (query-latency fix): ``execute_v1_query`` calls into the
-    synchronous hot path (``run_query`` → ``_hot_search``).  On a shard *cache
-    miss* that path performs three blocking operations inline:
+    synchronous hot path (``run_query`` → ``_search_consolidated_shard``).  On a
+    shard *cache miss* that path performs three blocking operations inline:
 
       1. ``_ensure_cached`` → ``read_bytes(shard_uri)`` — a boto3 ``GetObject``
          (~80-134 ms cold on S3/R2).

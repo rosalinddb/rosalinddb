@@ -233,6 +233,32 @@ def _parsed(top_k=10, flt=None):
     return v1q._ParsedQuery("ds", [0.0, 0.0, 0.0, 0.0], top_k, None, flt or {})
 
 
+def _wire_consolidated(monkeypatch, *, shard, result):
+    """Fake the split consolidated path: `_resolve_shard` + `_search_consolidated_shard`.
+
+    `shard` is the shard dict to record under `resolved["shard"]` (or None for a
+    no-shard dataset); `result` is the `(matches, mode)` tuple the FAISS search
+    returns (or None when there is no shard). Mirrors what the retired `_hot_search`
+    did in one call — resolution populated `resolved["shard"]`, the search returned
+    `(matches, mode)` — now split across the two functions `run_query` overlaps.
+    """
+    def _fake_resolve(tenant, dataset, resolved=None):
+        if resolved is None:
+            resolved = {}
+        if shard is None:
+            return None
+        resolved["shard"] = shard
+        return resolved
+
+    def _fake_search(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        if shard is None or resolved is None or resolved.get("shard") is None:
+            return None
+        return result
+
+    monkeypatch.setattr(v1q, "_resolve_shard", _fake_resolve)
+    monkeypatch.setattr(v1q, "_search_consolidated_shard", _fake_search)
+
+
 def test_run_query_union_merges_recall_and_consolidated(union_on, monkeypatch):
     """Flag on: `run_query` unions the consolidated matches with the recall rows.
 
@@ -240,9 +266,11 @@ def test_run_query_union_merges_recall_and_consolidated(union_on, monkeypatch):
     recall scan (faked) returns a live override + a fresh id. The response merges
     them with recall-wins and the consolidated shard's cache-state `mode`.
     """
-    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
-        resolved["shard"] = {"id": 1, "consolidated_lsn": 11}
-        return ([{"id": "shared", "score": 9.0, "metadata": {"c": 1}}], "hot")
+    _wire_consolidated(
+        monkeypatch,
+        shard={"id": 1, "consolidated_lsn": 11},
+        result=([{"id": "shared", "score": 9.0, "metadata": {"c": 1}}], "hot"),
+    )
 
     captured = {}
 
@@ -256,7 +284,6 @@ def test_run_query_union_merges_recall_and_consolidated(union_on, monkeypatch):
             ],
         )
 
-    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
     monkeypatch.setattr(v1q, "recall_search", _fake_recall)
 
     out = v1q.run_query("t1", _parsed())
@@ -278,23 +305,24 @@ def test_run_query_union_filter_failing_live_recall_suppresses_stale_consolidate
     must NOT return X — recall is authoritative and X's current version no longer
     matches the filter, so the stale, filter-matching consolidated copy must not leak.
     """
-    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
-        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+    _wire_consolidated(
+        monkeypatch,
+        shard={"id": 1, "consolidated_lsn": 0},
         # Consolidated shard still holds the OLD X (color=red), which DOES pass the filter.
-        return (
+        result=(
             [
                 {"id": "X", "score": 0.1, "metadata": {"color": "red"}},
                 {"id": "Y", "score": 0.5, "metadata": {"color": "red"}},
             ],
             "cold",
-        )
+        ),
+    )
 
     def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
         # X re-upserted as color=blue → fails {color: red} → NOT a match, but it
         # IS above the watermark so it suppresses the stale consolidated X.
         return ({"X"}, [])
 
-    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
     monkeypatch.setattr(v1q, "recall_search", _fake_recall)
 
     out = v1q.run_query("t1", _parsed(flt={"color": "red"}))
@@ -312,17 +340,18 @@ def test_run_query_union_live_recall_past_top_k_suppresses_stale_consolidated(
     `top_k` within recall, so it is not in the returned matches. The stale consolidated X
     must not surface in its place.
     """
-    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
-        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+    _wire_consolidated(
+        monkeypatch,
+        shard={"id": 1, "consolidated_lsn": 0},
         # Stale consolidated X ranks well within the final top_k by consolidated distance.
-        return ([{"id": "X", "score": 0.05, "metadata": {}}], "cold")
+        result=([{"id": "X", "score": 0.05, "metadata": {}}], "cold"),
+    )
 
     def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
         # X is above the watermark (suppresses) but its live row ranked past
         # top_k within recall, so it contributed no match.
         return ({"X"}, [])
 
-    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
     monkeypatch.setattr(v1q, "recall_search", _fake_recall)
 
     out = v1q.run_query("t1", _parsed(top_k=1))
@@ -335,8 +364,8 @@ def test_run_query_union_no_shard_returns_recall_synchronously(union_on, monkeyp
     `mode` is `recall` (the consolidated tier contributed nothing) and there is no
     `job_id` — the read-your-writes property.
     """
-    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
-        return None  # no shard yet
+    # No shard yet: both resolution and the FAISS search return None.
+    _wire_consolidated(monkeypatch, shard=None, result=None)
 
     def _fake_recall(tenant, dataset, vec, top_k, watermark, flt):
         assert watermark == 0, "no shard → watermark 0 → all recall rows qualify"
@@ -345,7 +374,6 @@ def test_run_query_union_no_shard_returns_recall_synchronously(union_on, monkeyp
             [{"id": "just-written", "score": 0.0, "metadata": {}, "deleted": False}],
         )
 
-    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
     monkeypatch.setattr(v1q, "recall_search", _fake_recall)
 
     out = v1q.run_query("t1", _parsed())
@@ -356,10 +384,7 @@ def test_run_query_union_no_shard_returns_recall_synchronously(union_on, monkeyp
 
 def test_run_query_union_no_shard_no_recall_falls_back_to_ephemeral(union_on, monkeypatch):
     """No consolidated shard AND no recall row → the ephemeral enqueue path (unchanged)."""
-    monkeypatch.setattr(
-        v1q, "_hot_search",
-        lambda *a, **k: None,
-    )
+    _wire_consolidated(monkeypatch, shard=None, result=None)
     monkeypatch.setattr(v1q, "recall_search", lambda *a, **k: (set(), []))
     published = {}
     monkeypatch.setattr(v1q, "publish", lambda topic, msg: published.update({"topic": topic, "msg": msg}))
@@ -375,14 +400,13 @@ def test_run_query_union_recall_failure_maps_to_503(union_on, monkeypatch):
     """A recall-store failure surfaces as the v1 503 envelope, never a 500/raw."""
     from fastapi.responses import JSONResponse
 
-    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
-        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
-        return ([], "cold")
+    _wire_consolidated(
+        monkeypatch, shard={"id": 1, "consolidated_lsn": 0}, result=([], "cold")
+    )
 
     def _boom(*a, **k):
         raise OSError("recall store down")
 
-    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
     monkeypatch.setattr(v1q, "recall_search", _boom)
 
     out = v1q.run_query("t1", _parsed())
@@ -419,16 +443,17 @@ def test_run_query_union_recall_unavailable_maps_to_503_recall_unavailable(
     # module, so they are the same object.)
     RecallUnavailable = v1q.RecallUnavailable
 
-    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
-        # A healthy consolidated shard WITH a stale match for X — if the code silently
-        # degraded to consolidated-only, this would leak as a 200 instead of a 503.
-        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
-        return ([{"id": "stale", "score": 0.1, "metadata": {}}], "cold")
+    # A healthy consolidated shard WITH a stale match for X — if the code silently
+    # degraded to consolidated-only, this would leak as a 200 instead of a 503.
+    _wire_consolidated(
+        monkeypatch,
+        shard={"id": 1, "consolidated_lsn": 0},
+        result=([{"id": "stale", "score": 0.1, "metadata": {}}], "cold"),
+    )
 
     def _recall_down(*a, **k):
         raise RecallUnavailable("recall store unreachable: OperationalError")
 
-    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
     monkeypatch.setattr(v1q, "recall_search", _recall_down)
 
     out = v1q.run_query("t1", _parsed())
@@ -451,11 +476,11 @@ def test_run_query_recall_down_does_not_silently_serve_consolidated(union_on, mo
 
     RecallUnavailable = v1q.RecallUnavailable
 
-    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
-        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
-        return ([{"id": "stale-consolidated", "score": 0.01, "metadata": {}}], "hot")
-
-    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
+    _wire_consolidated(
+        monkeypatch,
+        shard={"id": 1, "consolidated_lsn": 0},
+        result=([{"id": "stale-consolidated", "score": 0.01, "metadata": {}}], "hot"),
+    )
     monkeypatch.setattr(
         v1q, "recall_search",
         lambda *a, **k: (_ for _ in ()).throw(RecallUnavailable("down")),
@@ -473,24 +498,33 @@ def test_run_query_non_recall_operationalerror_is_not_recall_unavailable(
 ):
     """A non-recall OperationalError (e.g. consolidated/control path) is NOT misclassified.
 
-    The consolidated search itself raises a bare `psycopg2.OperationalError` (a
-    control-plane / catalog failure, NOT the recall tier). Because the recall
+    The consolidated FAISS search itself raises a bare `psycopg2.OperationalError`
+    (a control-plane / catalog failure, NOT the recall tier). Because the recall
     wrapper is typed and only raised at the recall boundary, this unwrapped error
     must NOT be classified as `recall_unavailable` — it falls to the generic
     `ephemeral_error` 500, the pre-existing behaviour for an unexpected error on
-    the consolidated path.
+    the consolidated path. With the overlap, recall runs concurrently and succeeds
+    cleanly; the consolidated error must still win and never be reported as recall.
     """
     import psycopg2
     from fastapi.responses import JSONResponse
 
+    def _fake_resolve(tenant, dataset, resolved=None):
+        if resolved is None:
+            resolved = {}
+        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+        return resolved
+
     def _consolidated_down(tenant, dataset, vec, top_k, flt, nprobe, resolved):
         raise psycopg2.OperationalError("control-plane catalog unreachable")
 
-    monkeypatch.setattr(v1q, "_hot_search", _consolidated_down)
-    # recall_search must never be reached — the consolidated search failed first.
+    monkeypatch.setattr(v1q, "_resolve_shard", _fake_resolve)
+    monkeypatch.setattr(v1q, "_search_consolidated_shard", _consolidated_down)
+    # Recall runs concurrently and succeeds — its result must be discarded because
+    # the consolidated branch failed. (A clean recall must not mask the consolidated error.)
     monkeypatch.setattr(
         v1q, "recall_search",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreached")),
+        lambda *a, **k: ({"r"}, [{"id": "r", "score": 1.0, "metadata": {}, "deleted": False}]),
     )
 
     out = v1q.run_query("t1", _parsed())
@@ -500,23 +534,182 @@ def test_run_query_non_recall_operationalerror_is_not_recall_unavailable(
     assert _envelope_code(out) == "ephemeral_error"
 
 
+def test_run_query_both_branches_fail_consolidated_error_wins(union_on, monkeypatch):
+    """BOTH the consolidated search and recall fail → deterministic precedence.
+
+    With the overlap both branches run concurrently and both can fail. The
+    documented precedence is consolidated-first (it preserves the serial path's
+    ordering, where the consolidated search ran before recall). So a simultaneous
+    consolidated `ephemeral_error` 500 + recall `RecallUnavailable` 503 must
+    surface the CONSOLIDATED 500 — the recall failure is not masked by being
+    silently dropped, it simply loses the documented tie-break.
+    """
+    import psycopg2
+    from fastapi.responses import JSONResponse
+
+    RecallUnavailable = v1q.RecallUnavailable
+
+    def _fake_resolve(tenant, dataset, resolved=None):
+        if resolved is None:
+            resolved = {}
+        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+        return resolved
+
+    def _consolidated_down(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        raise psycopg2.OperationalError("consolidated path down")
+
+    def _recall_down(*a, **k):
+        raise RecallUnavailable("recall down")
+
+    monkeypatch.setattr(v1q, "_resolve_shard", _fake_resolve)
+    monkeypatch.setattr(v1q, "_search_consolidated_shard", _consolidated_down)
+    monkeypatch.setattr(v1q, "recall_search", _recall_down)
+
+    out = v1q.run_query("t1", _parsed())
+    assert isinstance(out, JSONResponse)
+    # Consolidated error wins the tie-break: ephemeral_error 500, NOT recall_unavailable.
+    assert out.status_code == 500
+    assert _envelope_code(out) == "ephemeral_error"
+
+
+def test_run_query_consolidated_resolution_failure_maps_to_consolidated_envelope(
+    union_on, monkeypatch
+):
+    """A failure in the cheap shard RESOLUTION (catalog lookup) maps to the
+    consolidated error envelope, not recall — even though recall is submitted
+    only after a successful resolution, a resolution failure must short-circuit
+    to the consolidated 503/500 and never open the recall path."""
+    import psycopg2
+    from fastapi.responses import JSONResponse
+
+    def _resolve_down(tenant, dataset, resolved=None):
+        raise psycopg2.OperationalError("catalog unreachable")
+
+    monkeypatch.setattr(v1q, "_resolve_shard", _resolve_down)
+    # recall_search must never be reached — resolution failed before submit.
+    monkeypatch.setattr(
+        v1q, "recall_search",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("recall reached after resolution failure")),
+    )
+
+    out = v1q.run_query("t1", _parsed())
+    assert isinstance(out, JSONResponse)
+    assert _envelope_code(out) != "recall_unavailable"
+    assert out.status_code == 500
+    assert _envelope_code(out) == "ephemeral_error"
+
+
+# --- overlap (#31): the two searches run CONCURRENTLY ---------------------
+
+
+def test_run_query_overlaps_consolidated_and_recall(union_on, monkeypatch):
+    """The consolidated FAISS search and the recall scan run CONCURRENTLY.
+
+    Each fake sleeps ~SLEEP_S. If `run_query` ran them serially the wall-time
+    would be ~2*SLEEP_S; overlapped it is ~SLEEP_S. We assert the wall-time is
+    comfortably under the serial sum (a generous margin keeps it non-flaky on a
+    loaded CI box). This proves the serial→concurrent refactor actually erased the
+    additive recall tax. `time.sleep` releases the GIL, so the two genuinely
+    overlap exactly as FAISS's C++ search and psycopg2's round-trip do in
+    production.
+    """
+    import time as _time
+
+    SLEEP_S = 0.10  # 100 ms each
+
+    def _fake_resolve(tenant, dataset, resolved=None):
+        if resolved is None:
+            resolved = {}
+        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+        return resolved
+
+    def _slow_search(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        _time.sleep(SLEEP_S)
+        return ([{"id": "c", "score": 1.0, "metadata": {}}], "hot")
+
+    def _slow_recall(tenant, dataset, vec, top_k, watermark, flt):
+        _time.sleep(SLEEP_S)
+        return (set(), [])
+
+    monkeypatch.setattr(v1q, "_resolve_shard", _fake_resolve)
+    monkeypatch.setattr(v1q, "_search_consolidated_shard", _slow_search)
+    monkeypatch.setattr(v1q, "recall_search", _slow_recall)
+
+    t0 = _time.perf_counter()
+    out = v1q.run_query("t1", _parsed())
+    elapsed = _time.perf_counter() - t0
+
+    assert out["mode"] == "hot"
+    # Serial would be ~2*SLEEP_S (0.20s); overlapped ~SLEEP_S (0.10s). The
+    # midpoint (1.5*SLEEP_S = 0.15s) is a generous, non-flaky ceiling that a
+    # serial run cannot meet but a concurrent run clears with wide margin.
+    assert elapsed < 1.5 * SLEEP_S, (
+        f"union wall-time {elapsed:.3f}s ~= serial sum ({2*SLEEP_S:.2f}s); "
+        f"the searches did not overlap"
+    )
+
+
+def test_run_query_joins_recall_future_even_on_baseexception(union_on, monkeypatch):
+    """P2: the in-flight recall worker is NEVER abandoned, even if the inline
+    consolidated branch raises a `BaseException` (KeyboardInterrupt/SystemExit).
+
+    The inline FAISS branch is wrapped in `except Exception`, so a `BaseException`
+    propagates straight out — but the recall future is joined in a `finally`, so
+    the worker is retrieved before the `BaseException` escapes `run_query`. We use
+    a worker that flips a flag once joined, raise a `KeyboardInterrupt` from the
+    inline consolidated branch, and assert the worker WAS joined (flag set) and the
+    `BaseException` still propagated (not swallowed).
+    """
+    import threading
+
+    joined = threading.Event()
+
+    def _fake_resolve(tenant, dataset, resolved=None):
+        if resolved is None:
+            resolved = {}
+        resolved["shard"] = {"id": 1, "consolidated_lsn": 0}
+        return resolved
+
+    def _consolidated_baseexc(tenant, dataset, vec, top_k, flt, nprobe, resolved):
+        raise KeyboardInterrupt("inline FAISS hit a BaseException")
+
+    def _recall_marks_joined(tenant, dataset, vec, top_k, watermark, flt):
+        joined.set()
+        return (set(), [])
+
+    monkeypatch.setattr(v1q, "_resolve_shard", _fake_resolve)
+    monkeypatch.setattr(v1q, "_search_consolidated_shard", _consolidated_baseexc)
+    monkeypatch.setattr(v1q, "recall_search", _recall_marks_joined)
+
+    with pytest.raises(KeyboardInterrupt):
+        v1q.run_query("t1", _parsed())
+
+    # The recall worker actually ran (it was submitted before FAISS), and the
+    # `finally` join retrieved its result rather than abandoning it.
+    assert joined.is_set(), "recall future was abandoned on a BaseException"
+
+
 # --- flag OFF: byte-identical, no recall connection -----------------------
 
 
 def test_run_query_flag_off_is_consolidated_only_no_recall_call(monkeypatch):
     """Flag off (default): the consolidated result is returned verbatim and
-    `recall_search` is NEVER called."""
+    `recall_search` is NEVER called.
+
+    The off path runs the sequential `_consolidated_search` composition (resolve
+    + FAISS), no recall, no thread — byte-identical to the old `_hot_search` path.
+    """
     monkeypatch.setattr(v1q, "recall_enabled", lambda: False)
 
-    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved):
-        # When off, `resolved` is None — the caller never asks for the shard.
+    def _fake_consolidated(tenant, dataset, vec, top_k, flt, nprobe, resolved=None):
+        # When off, `resolved` is None — the caller never asks for the I3 pairing.
         assert resolved is None, "flag-off must not request the I3 shard pairing"
         return ([{"id": "c", "score": 1.0, "metadata": {}}], "hot")
 
     def _must_not_call(*a, **k):  # pragma: no cover
         raise AssertionError("recall_search called with the flag OFF")
 
-    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
+    monkeypatch.setattr(v1q, "_consolidated_search", _fake_consolidated)
     monkeypatch.setattr(v1q, "recall_search", _must_not_call)
 
     out = v1q.run_query("t1", _parsed())
@@ -545,10 +738,10 @@ def test_recall_search_opens_no_connection_when_flag_off(monkeypatch):
 
     monkeypatch.setattr(state_mod.psycopg2, "connect", _boom)
 
-    def _fake_hot(tenant, dataset, vec, top_k, flt, nprobe, resolved=None):
+    def _fake_consolidated(tenant, dataset, vec, top_k, flt, nprobe, resolved=None):
         return ([{"id": "c", "score": 1.0, "metadata": {}}], "cold")
 
-    monkeypatch.setattr(v1q, "_hot_search", _fake_hot)
+    monkeypatch.setattr(v1q, "_consolidated_search", _fake_consolidated)
 
     out = v1q.run_query("t1", _parsed())
     assert out["mode"] == "cold"

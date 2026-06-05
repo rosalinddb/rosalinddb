@@ -18,21 +18,16 @@ skinparam sequenceMessageAlign center
 actor "client" as client
 participant "query_dp\n(run_query)" as dp
 database "shard_catalog\n(consolidated_lsn)" as catalog
-participant "_hot_search\n(FAISS via SSD/RAM cache)" as consolidated
+participant "_search_consolidated_shard\n(FAISS via SSD/RAM cache)" as consolidated
 database "Recall\n(pgvector, recall_search)" as recall
 
 client -> dp : POST /query {vector, top_k, filter}
 activate dp
 
-== Resolve the seam (use the watermark of the shard this query actually read) ==
+== Resolve the seam ONCE (_resolve_shard): the watermark of the shard this query will read ==
 
-dp -> catalog : list_shards -> latest shard S
-alt shard S exists
-  dp -> consolidated : search S (FAISS, L2^2)\nvia SSD/RAM cache
-  activate consolidated
-  consolidated --> dp : consolidated hits (L2^2) +\nOUT: the exact shard row resolved,\nits consolidated_lsn = W
-  deactivate consolidated
-else no shard yet (list_shards empty)
+dp -> catalog : _resolve_shard -> list_shards -> latest shard S\n(cheap catalog lookup; yields consolidated_lsn = W)
+alt no shard yet (list_shards empty)
   note right of dp #E9F7E9
     Watermark W = 0 -> every Recall row qualifies.
     Answer SYNCHRONOUSLY from Recall (read-your-writes
@@ -40,19 +35,39 @@ else no shard yet (list_shards empty)
   end note
 end
 
-== Search Recall with the RESOLVED watermark (brute-force exact) ==
+== Overlap (#31): consolidated FAISS search and Recall scan run CONCURRENTLY (recall needs only W) ==
 
-dp -> recall : recall_search WHERE tenant, dataset,\nlsn > W (the watermark of the shard this query READ,\nNOT a fresh list_shards), filter
-activate recall
-note right of recall
-  Brute-force exact L2 over the SMALL recall partition.
-  Score computed as power(embedding <-> q, 2) = L2^2,
-  so it merges DIRECTLY with the consolidated shard's FAISS L2^2.
-  Returns BOTH live matches and the FULL set of recall ids
-  above W (incl. tombstoned / filtered-out / past-top_k).
+note over dp
+  After ONE resolution, run both INDEPENDENT searches concurrently:
+  recall scan on a bounded worker thread (request OTel context re-attached
+  so recall.search stays a child of the request span), FAISS search inline.
+  Union wall-time ~ max(consolidated, recall), not the sum (~15 ms tax erased).
 end note
-recall --> dp : recall hits (L2^2) + full recall-id set above W
-deactivate recall
+
+par consolidated FAISS search (inline)
+  dp -> consolidated : _search_consolidated_shard(S)\n(FAISS, L2^2) via SSD/RAM cache
+  activate consolidated
+  consolidated --> dp : consolidated hits (L2^2)
+  deactivate consolidated
+else Recall scan (worker thread)
+  dp -> recall : recall_search WHERE tenant, dataset,\nlsn > W (the watermark of the shard this query READ,\nNOT a fresh list_shards), filter
+  activate recall
+  note right of recall
+    Brute-force exact L2 over the SMALL recall partition.
+    Score computed as power(embedding <-> q, 2) = L2^2,
+    so it merges DIRECTLY with the consolidated shard's FAISS L2^2.
+    Returns BOTH live matches and the FULL set of recall ids
+    above W (incl. tombstoned / filtered-out / past-top_k).
+  end note
+  recall --> dp : recall hits (L2^2) + full recall-id set above W
+  deactivate recall
+end
+
+note over dp #FBE9E9
+  Error precedence on a double failure: consolidated error wins (preserves
+  the pre-overlap serial ordering). A recall failure is never masked; a
+  consolidated failure is never reported as a recall error.
+end note
 
 == Merge ==
 

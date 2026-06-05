@@ -227,11 +227,11 @@ def test_query_path_loads_newest_shard_after_incremental(state, tmp_path, monkey
     importlib.reload(vq)
     # A query near the batch-2 vector must surface b0 — only possible if the
     # hot path loaded the newest (incremental) shard.
-    matches, _mode = vq._hot_search("ten_test", "qp", [0.0, 1.0, 0.0, 0.0], top_k=2)
+    matches, _mode = vq._consolidated_search("ten_test", "qp", [0.0, 1.0, 0.0, 0.0], top_k=2)
     ids = {m["id"] for m in matches}
     assert "b0" in ids
     # And the batch-1 vector is still searchable from the same shard.
-    matches1, _ = vq._hot_search("ten_test", "qp", [1.0, 0.0, 0.0, 0.0], top_k=2)
+    matches1, _ = vq._consolidated_search("ten_test", "qp", [1.0, 0.0, 0.0, 0.0], top_k=2)
     assert "a0" in {m["id"] for m in matches1}
 
 

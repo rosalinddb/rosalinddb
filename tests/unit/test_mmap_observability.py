@@ -356,7 +356,7 @@ def test_page_fault_delta_is_recorded_around_search(
     samples = iter([100, 107])
     monkeypatch.setattr(v1q, "_read_major_faults", lambda *a, **k: next(samples))
 
-    out = v1q._hot_search("tenant", "ds", [0.1] * dim, top_k=3)
+    out = v1q._consolidated_search("tenant", "ds", [0.1] * dim, top_k=3)
     assert out is not None
 
     points = _metric_points(reader, "rosalinddb.shard.page_faults")

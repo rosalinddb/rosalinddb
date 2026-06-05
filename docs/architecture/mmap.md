@@ -58,7 +58,8 @@ the on-disk index file via `mmap(2)` instead of slurping it into RSS. The flag
 replaces the in-RAM `InvertedLists` object with an `OnDiskInvertedLists` that
 keeps a small offset table in RAM (one entry per IVF cell) and lets the kernel
 fault posting-list pages into the page cache on first access. The flag is
-threaded through exactly one call site — the cold-load branch in `_hot_search`
+threaded through exactly one call site — the cold-load branch in
+`_search_consolidated_shard`
 in [`services/query_api/v1_query.py`](../../services/query_api/v1_query.py) and
 its mirror in [`services/ephemeral_runner/run.py`](../../services/ephemeral_runner/run.py)
 — and is gated on `RB_FAISS_MMAP` so a rollback is one env-var flip.
