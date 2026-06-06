@@ -1,9 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rosalinddb"
+version = "0.1.0"
+description = "RosalindDB — object-storage-native vector database with read-your-writes (Recall + Consolidate)"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+# Runtime + test dependencies are pinned in requirements.txt (the single source
+# of truth, shared by Docker + CI). Read them dynamically here so there is no
+# drift between the pinned env and the installed package.
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+# src-layout. The app packages live under src/ and are *installed*
+# (`pip install -e .`) so `import services.*` / `import adapters.*` resolve via
+# the installed package — NOT via PYTHONPATH or sys.path manipulation.
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Ship the SQL migrations: they are data files that live inside the
+# adapters.state package and are read at runtime (Path(__file__).parent).
+[tool.setuptools.package-data]
+"adapters.state" = ["migrations/*.sql", "migrations/recall/*.sql"]
+
 [tool.pytest.ini_options]
 # The suite is two-tiered. Markers are applied automatically by directory in
 # tests/conftest.py (tests/unit -> unit, tests/integration -> integration), so
 # `pytest -m unit` runs the fast hermetic suite (no Docker) and
 # `pytest -m integration` runs the MinIO-backed suite (Docker required).
 testpaths = ["tests"]
+# TEST-ONLY path entry: a couple of integration tests reuse fixtures via
+# `from tests.integration.test_consolidation import ...`, so the `tests` package
+# must be importable. This does NOT put src/ on the path — the app is an
+# installed package (`pip install -e .`); services.*/adapters.* never rely on a
+# path trick. (Cleaner follow-up: move those shared fixtures into a conftest.)
+pythonpath = ["."]
 markers = [
     "unit: fast, hermetic tests — zero filesystem and zero network I/O; storage goes through the memory:// adapter",
     "integration: end-to-end tests against a real MinIO container (testcontainers); requires Docker",

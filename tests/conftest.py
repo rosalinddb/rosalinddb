@@ -17,14 +17,9 @@ The marking is done by directory in ``pytest_collection_modifyitems`` so no
 individual test needs a hand-written marker.
 """
 import os
-import sys
-from pathlib import Path
 
-
-# Ensure repo root is on sys.path so 'adapters', 'services' are importable.
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# The app is installed as a package (`pip install -e .`), so `import services.*`
+# and `import adapters.*` resolve via the installed package — no sys.path hacks.
 
 # Default to in-memory state for tests (the integration suite still uses the
 # memory:// state adapter — real Postgres for integration is a documented
