@@ -11,8 +11,7 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
@@ -28,11 +27,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Application code. Only the directories the process groups import are
-# copied (see .dockerignore for what is excluded from the build context).
-COPY adapters/ /app/adapters/
-COPY services/ /app/services/
+# Application code (src-layout) + packaging metadata, then install the package
+# editable so `import services.*` / `import adapters.*` resolve via the installed
+# package — no PYTHONPATH / cwd reliance. Deps are already installed above, so
+# `--no-deps` keeps this a fast, offline step.
+COPY pyproject.toml /app/
+COPY src/ /app/src/
 COPY scripts/ /app/scripts/
+RUN pip install --no-cache-dir -e . --no-deps
 
 # Run as a non-root user. CACHE_DIR (the on-disk FAISS shard cache) lives under
 # the writable home directory; set CACHE_DIR to a writable path in your
