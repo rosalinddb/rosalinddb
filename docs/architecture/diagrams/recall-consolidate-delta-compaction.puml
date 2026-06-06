@@ -1,0 +1,54 @@
+@startuml recall-consolidate-delta-compaction
+' Consolidation under RB_DELTA_TIER: the MINOR fold (cheap, every recall flush)
+' and the MAJOR compaction (only at RB_MAX_DELTAS). Contrast with the single-shard
+' full rewrite in recall-consolidate-consolidation.puml, which rebuilt the WHOLE
+' shard on EVERY flush -- the cause of the recall-growth "cliff" under sustained
+' writes. Here a flush is O(new rows); the generation is rebuilt only once every
+' RB_MAX_DELTAS folds.
+
+title Delta-tier consolidation: cheap minor fold + periodic major compaction (RB_DELTA_TIER on)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+participant "index_builder\n(_run_consolidate_locked)" as builder
+database "Recall\n(pgvector)" as recall
+database "shard_catalog\n(generations, frontier)" as catalog
+database "S3 shards\n(base + deltas + quantizer)" as s3
+
+== MINOR FOLD -- every recall flush (cap RB_RECALL_MAX_ROWS or idle RB_RECALL_IDLE_S) ==
+
+builder -> catalog : live_generation(tenant,dataset)\n-> base + live deltas + frontier
+activate builder
+builder -> recall : snapshot recall rows WHERE lsn > frontier\n(ONLY the band above the frontier -- O(new rows))
+builder -> s3 : load quantizer-vG (frozen) -> clone trained-empty\n-> bare IVFFlat, add_with_ids(new rows) -> delta blob
+builder -> catalog : add_shard(level=1, parent=base, quantizer_version=G,\ncovered_lsn_lo=frontier+1, covered_lsn_hi=N,\ntombstone_int_ids=deleted ids above frontier)
+note right of catalog
+  Commit-before-trim (I2). The frontier advances by the new
+  contiguous band; recall rows <= new frontier become eligible
+  for the grace-bounded trim (kept while < 2 generations old).
+end note
+deactivate builder
+
+alt live deltas < RB_MAX_DELTAS (8)
+  builder -> builder : done -- fan-out still bounded, return
+else live deltas reach RB_MAX_DELTAS  (_maybe_major_compaction)
+  == MAJOR COMPACTION ==
+  builder -> s3 : reconstruct deduped survivors across base + deltas\n(newest-occurrence-wins; drop tombstoned ids)
+  activate builder
+  builder -> s3 : build a FRESH base under a CLONED quantizer-vG\n(same version, NO retrain) -- the only O(generation) step
+  builder -> catalog : add_shard(new base, level=0) -> TRANSACTIONAL cutover\n(the new generation becomes live atomically)
+  builder -> catalog : grace sweep -- superseded_shards drops generations\n> 2 old (membership-based, not list-position)
+  note right of builder #FBE9E9
+    Heaviest op: peak RSS ~ generation size (~3.9 GB at 1M / dim-128),
+    so it must run on a higher-memory lane. Phase-2: stream the
+    reconstruct under an explicit RSS budget.
+  end note
+  deactivate builder
+end
+
+@enduml

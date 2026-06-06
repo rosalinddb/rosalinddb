@@ -57,6 +57,29 @@ companions). All live in [`diagrams/`](diagrams/):
 
 Validated with PlantUML 1.2024.7 (`-checkonly` + PNG render, both clean) — see the PR for details.
 
+### Delta-tier consolidation (`RB_DELTA_TIER`, default off)
+
+The diagrams above describe the **default** path: each consolidation rewrites the *one* shard
+for a dataset and snaps the watermark. Under **sustained** writes that full rewrite can't keep
+up — Recall grows unbounded and query latency climbs (the "cliff"). Behind `RB_DELTA_TIER` the
+Consolidate tier is instead an **LSM of delta shards**: a *generation* is one **base** shard
+(level 0) plus up to `RB_MAX_DELTAS` small **delta** shards (level 1) that share one frozen
+coarse quantizer. A Recall flush appends a cheap **minor fold** (`O(new rows)`); at
+`RB_MAX_DELTAS` a **major compaction** folds the generation into a fresh base. Validated to 1M
+(SIFT, dim-128): Recall-tier occupancy and query p50 stay flat instead of climbing. The
+net-new companions (all in [`diagrams/`](diagrams/)):
+
+| File | Kind | Shows |
+|---|---|---|
+| [`recall-consolidate-delta-model.puml`](diagrams/recall-consolidate-delta-model.puml) | structure | A *generation* = base shard (level 0, bare `IndexIVFFlat`, native ids) + up to `RB_MAX_DELTAS` delta shards (level 1) sharing one frozen `quantizer-vG`; the **contiguous-MIN frontier** watermark; `keep=2` generations for grace; major compaction → new generation. |
+| [`recall-consolidate-delta-compaction.puml`](diagrams/recall-consolidate-delta-compaction.puml) | sequence | Consolidation as a **minor fold** (snapshot recall rows `lsn > frontier` → bare-IVF delta under the cloned frozen quantizer → `add_shard(level=1, covered_lsn_lo/hi, tombstone_int_ids)`, commit-before-trim I2) vs a **major compaction** at `RB_MAX_DELTAS` (reconstruct deduped survivors → fresh base, transactional cutover, generation-membership grace sweep). |
+| [`recall-consolidate-delta-query-union.puml`](diagrams/recall-consolidate-delta-query-union.puml) | query union sequence | resolve the live **generation** (base + live deltas) from one snapshot → frontier = contiguous-MIN (gap-clamped) → search Recall (`lsn > frontier`) + base + every live delta → merge with **newest-delta-wins** dedup + delta `tombstone_int_ids` suppression + recall-wins, sort, top_k. |
+
+> The single-shard `recall-consolidate-{tandem,watermark,lifecycle,consolidation,query-union}`
+> diagrams remain accurate for the default (flag-off) path; the three above are the
+> `RB_DELTA_TIER`-on variant. ("Generation" lines up across both: each major compaction starts
+> a new generation, the same unit the `keep=2` grace sweep counts.)
+
 ### Recall tier internals
 
 A companion set focused on **how the Recall tier works BY ITSELF** — its own

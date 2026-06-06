@@ -64,4 +64,12 @@ note bottom of os
   complete (no gap, no overlap).
 end note
 
+note right of os #F4F8FF
+  RB_DELTA_TIER on: the Consolidate tier is no longer ONE shard
+  rewritten per flush -- it is an LSM GENERATION = base shard +
+  delta shards (cheap minor folds, periodic major compaction).
+  See recall-consolidate-delta-model.puml /
+  -delta-compaction.puml / -delta-query-union.puml.
+end note
+
 @enduml
