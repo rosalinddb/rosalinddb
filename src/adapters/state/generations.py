@@ -26,7 +26,7 @@ from typing import List, Optional
 
 # `list_shards` is reached through the state module at call time so the seam
 # stays stable across reloads/monkeypatches and across a future catalog split.
-import adapters.state.state as _state
+from adapters.state._lazy_state import state as _state  # lazy proxy: resolves the facade at call time (breaks the import cycle)
 
 
 def _shard_level(shard: dict) -> int:
