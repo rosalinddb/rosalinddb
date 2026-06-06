@@ -20,12 +20,6 @@ dependencies = { file = ["requirements.txt"] }
 # the installed package — NOT via PYTHONPATH or sys.path manipulation.
 [tool.setuptools]
 package-dir = { "" = "src" }
-# Top-level single-file modules are NOT discovered by find() (it finds packages
-# only), so declare config.py explicitly. The editable install puts src/ on the
-# path so `import config` already works there; this guarantees a non-editable
-# `pip install .` wheel ships it too (it is part of the app — adapters.observability
-# .otel and the query services import `from config import truthy`).
-py-modules = ["config"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
