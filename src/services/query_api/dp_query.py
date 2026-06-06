@@ -32,13 +32,13 @@ This router is mounted on `dp_app.py` (the deployed Query Data Plane).
 """
 
 import hmac
-import os
 from typing import Optional
 
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+from adapters import config
 from services.query_api.v1_query import (
     _err,
     execute_v1_query,
@@ -63,7 +63,7 @@ def _check_proxy_secret(provided: Optional[str]) -> Optional[JSONResponse]:
     `RB_PROXY_SECRET` is read live (not cached at import) so a test can set or
     clear it per-case without re-importing the module.
     """
-    expected = os.getenv("RB_PROXY_SECRET")
+    expected = config.proxy_secret()
     if not expected:
         # Unset → skip the check; private-network isolation (Docker network,
         # k8s ClusterIP, Tailscale, etc.) is the sole control.

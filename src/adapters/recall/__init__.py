@@ -49,13 +49,13 @@ callers) keeps matching by identity.
 import contextlib
 import datetime as _dt
 import json
-import os
 import time
 from typing import Iterator, List, Optional, Tuple
 
 import psycopg2
 import psycopg2.pool
 
+from adapters import config
 from adapters.errors import PoolCheckoutTimeout, RecallUnavailable
 from adapters.observability import metrics as obs_metrics
 from adapters.observability.tracing import recall_search_span, state_connect_span
@@ -94,11 +94,7 @@ def _recall_dsn() -> Optional[str]:
     value is treated as unset so an empty compose default cannot accidentally
     enable it.
     """
-    raw = os.getenv("RB_RECALL_DSN")
-    if raw is None:
-        return None
-    raw = raw.strip()
-    return raw or None
+    return config.recall_dsn()
 
 
 def recall_enabled() -> bool:
@@ -117,12 +113,7 @@ def recall_enabled() -> bool:
     `RB_RECALL=true` but forgets to point `RB_RECALL_DSN` at an instance stays
     on the byte-identical flag-off path rather than erroring on every write.
     """
-    if os.getenv("RB_RECALL", "").strip().lower() not in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
+    if not config.recall():
         return False
     return _recall_dsn() is not None
 
@@ -274,10 +265,7 @@ def _recall_pool_max_size() -> int:
     worker processes run side by side. A missing or malformed value falls back
     to the default rather than crashing.
     """
-    raw = os.getenv("RB_RECALL_POOL_MAX")
-    if raw and raw.isdigit() and int(raw) > 0:
-        return int(raw)
-    return _DEFAULT_RECALL_POOL_MAX
+    return config.recall_pool_max()
 
 
 def _get_recall_pool(

@@ -38,7 +38,10 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from opentelemetry import context as otel_context
 
-from adapters.config import truthy as _truthy
+from adapters import config
+# Re-exported for back-compat: `services.ephemeral_runner.run` and the mmap
+# parity tests reach the canonical truthy parser as `v1_query._truthy`.
+from adapters.config import truthy as _truthy  # noqa: F401
 from adapters.cache import CatalogCache, ensure_cached as _ensure_cached_shared
 from adapters.errors import (
     DownloadCoalescingTimeout,
@@ -79,7 +82,7 @@ from services.auth.jwt_utils import current_tenant_id
 from services.auth.quota import query_quota_429, quotas_enabled, rate_limit
 from services.query_api import result_store
 
-CACHE_DIR = os.getenv("CACHE_DIR", "/var/cache/shards")
+CACHE_DIR = config.cache_dir()
 DEFAULT_TOP_K = 10
 MAX_TOP_K = 1000
 
@@ -114,8 +117,7 @@ def query_nprobe() -> int:
     Reads `RB_QUERY_NPROBE` live so a test or an operator can retune it
     without re-importing the module. Floored at 1, clamped at `MAX_NPROBE`.
     """
-    raw = max(1, int(os.getenv("RB_QUERY_NPROBE", str(DEFAULT_NPROBE))))
-    return min(raw, MAX_NPROBE)
+    return config.query_nprobe()
 
 
 def _delta_tier_enabled() -> bool:
@@ -127,7 +129,7 @@ def _delta_tier_enabled() -> bool:
     resolution + `_watermark_for_shard`). The whole tier is dark-launchable and
     revertible by env until the bench gates pass (spec §9, rollback contract).
     """
-    return _truthy(os.getenv("RB_DELTA_TIER"))
+    return config.delta_tier()
 
 
 def _ivf_search_params(index, override: Optional[int] = None, full_coverage: bool = False):
@@ -242,10 +244,10 @@ _RESULTS_LOCK = result_store._RESULTS_LOCK
 # scale bench, for instance, overrides it to 2 GB. Deployers on tiny nodes can
 # lower it; an oversized shard is then served via the graceful bypass rather
 # than thrashing the cache.
-RB_SHARD_CACHE_BYTES = max(1, int(os.getenv("RB_SHARD_CACHE_BYTES", str(1024 * 1024 * 1024))))
+RB_SHARD_CACHE_BYTES = config.shard_cache_bytes()
 # Optional secondary count cap. 0 (or unset → 0) disables it; the byte budget
 # is the primary bound.
-RB_SHARD_CACHE_SIZE = max(0, int(os.getenv("RB_SHARD_CACHE_SIZE", "0")))
+RB_SHARD_CACHE_SIZE = config.shard_cache_size()
 
 # Shard ids already warned about for exceeding the cache budget. Keeps the
 # oversize WARNING "one-time-ish" — logged once per shard id per process so an
@@ -316,7 +318,7 @@ _STAT_PATH_AVAILABLE: Optional[bool] = None
 # dances. Tests that need to flip the flag use `importlib.reload(v1_query)`
 # (see `tests/unit/test_mmap_flag.py` and `tests/unit/test_dp_io_offload.py`
 # for the pattern).
-_MMAP_ENABLED = _truthy(os.getenv("RB_FAISS_MMAP"))
+_MMAP_ENABLED = config.faiss_mmap()
 
 # Fixed estimate charged to the byte-budgeted cache for an mmap'd FAISS entry.
 # The mmap'd index's working-set is governed by the OS page cache, not the
@@ -491,10 +493,7 @@ def _catalog_freshness_s() -> float:
     enough that bursty same-dataset traffic shares cache hits. `0`
     disables the cache.
     """
-    try:
-        return max(0.0, float(os.getenv("RB_CATALOG_FRESHNESS_S", "5")))
-    except ValueError:
-        return 5.0
+    return config.catalog_freshness_s()
 
 
 def _catalog_cache_active() -> bool:
@@ -503,7 +502,7 @@ def _catalog_cache_active() -> bool:
     Both gates default-off-equivalent: with the tier off OR TTL=0 the
     wrapper must defer every call to `list_shards`.
     """
-    return bool(os.getenv("RB_SHARD_TIER_BYTES")) and _catalog_freshness_s() > 0
+    return config.shard_tier_bytes_set() and _catalog_freshness_s() > 0
 
 
 def _cached_list_shards(tenant: str, dataset: str) -> list:
@@ -569,7 +568,7 @@ def _catalog_cache_clear() -> None:
 # unset, no thread starts and the TTL pull is the only invalidation
 # channel. The import is local so a process that never opts in does not
 # even import psycopg2's LISTEN scaffolding.
-if _truthy(os.getenv("RB_CATALOG_LISTEN")):
+if config.catalog_listen():
     from services._common import catalog_listener as _catalog_listener
 
     _catalog_listener.subscribe(_on_catalog_notify)
@@ -615,7 +614,7 @@ _INFLIGHT_DOWNLOADS_LOCK = threading.Lock()
 # where a single shard download legitimately takes longer than the default
 # (e.g. a multi-GB shard on a slow link). Default 300 s comfortably covers a
 # multi-GB GET on typical infra while bounding the worst-case waiter stall.
-_DOWNLOAD_COALESCE_WAIT_S = float(os.getenv("RB_DOWNLOAD_COALESCE_WAIT_S", "300"))
+_DOWNLOAD_COALESCE_WAIT_S = config.download_coalesce_wait_s()
 
 
 # `DownloadCoalescingTimeout` is defined once in `adapters.errors` (shared
@@ -1496,7 +1495,7 @@ def _classify_hot_path_error(exc: BaseException) -> Tuple[str, str]:
 # This is not a regression vs the serial path: concurrent recall load equals the
 # number of in-flight requests in BOTH the serial and overlap designs, so the pool
 # enforces the same ceiling either way.
-_RECALL_OVERLAP_WORKERS = max(1, int(os.getenv("RB_RECALL_OVERLAP_WORKERS", "32")))
+_RECALL_OVERLAP_WORKERS = config.recall_overlap_workers()
 _RECALL_EXECUTOR = ThreadPoolExecutor(
     max_workers=_RECALL_OVERLAP_WORKERS,
     thread_name_prefix="recall-overlap",
@@ -1992,7 +1991,7 @@ def _enqueue_ephemeral(
             # not return unfiltered results.
             "filter": flt,
             "correlation_id": correlation_id,
-            "reply_to": os.getenv("RESULT_TOPIC", "RESULT_READY"),
+            "reply_to": config.result_topic(),
         },
     )
     counter("ephemeral_queries", 1)

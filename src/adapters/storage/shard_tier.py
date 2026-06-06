@@ -60,26 +60,11 @@ import uuid
 from collections import OrderedDict
 from typing import Dict, NamedTuple, Optional
 
+from adapters import config
 from adapters.errors import CacheCapacityExceeded, ShardTierTimeout
 
 
 _log = logging.getLogger(__name__)
-
-
-def _env_float(name: str, default: str) -> str:
-    """Read `name` from env, treating empty string as unset (= use `default`).
-
-    Compose `${X:-}` forwards an unset shell var as an empty string into the
-    container's env, not as a missing var. `os.getenv(name, default)` only
-    returns `default` when the var is genuinely missing — an empty-string
-    value passes through and breaks `float("")`. This helper collapses both
-    "missing" and "empty" to "use the default", which is what the
-    operator-mental-model expects ("I didn't set it" == "use default").
-    """
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    return v
 
 
 # --- public types ---------------------------------------------------------
@@ -125,25 +110,27 @@ class ResidencyEntry(NamedTuple):
 
 # Byte budget for the tier. When unset in the environment, default to a
 # test-friendly 2 GiB.
-_TIER_BYTES = max(
-    1, int(_env_float("RB_SHARD_TIER_BYTES", str(2 * 1024 * 1024 * 1024)))
-)
+_TIER_BYTES = config.shard_tier_bytes()
 
 # Tier directory. Defaults to `${CACHE_DIR}/tier-managed/` so a deployment
 # that already has files in `CACHE_DIR` (written by the legacy `_ensure_cached`
 # path) does not have those files silently adopted by the tier on first
 # fetch. The subdirectory keeps files from the two cache layers clearly
 # demarcated.
-_DEFAULT_CACHE_DIR = _env_float("CACHE_DIR", "/var/cache/shards")
-_TIER_DIR = _env_float(
-    "RB_SHARD_TIER_DIR", os.path.join(_DEFAULT_CACHE_DIR, "tier-managed")
+# shard_tier historically read CACHE_DIR with empty-string-as-unset semantics (a
+# Compose `${CACHE_DIR:-}` passthrough must fall back to the default, not ""),
+# unlike config.cache_dir() (plain os.getenv, matching the other 5 consumers), so
+# collapse an explicitly-empty value to the default here.
+_DEFAULT_CACHE_DIR = config.cache_dir() or "/var/cache/shards"
+_TIER_DIR = config.shard_tier_dir() or os.path.join(
+    _DEFAULT_CACHE_DIR, "tier-managed"
 )
 
 # Bounded wait for coalesced waiters. A hung initiator should fail the
 # waiters with a clear error rather than block them indefinitely. 300 s
 # comfortably covers a multi-GB GET on typical infra while bounding the
 # worst-case waiter stall.
-_COALESCE_WAIT_S = float(_env_float("RB_SHARD_TIER_COALESCE_WAIT_S", "300"))
+_COALESCE_WAIT_S = config.shard_tier_coalesce_wait_s()
 
 # Maximum age of an orphan `.tmp` file before the import-time sweep removes
 # it. A crashed initiator leaves `{path}.{pid}.{uuid8}.tmp` behind; without
@@ -152,7 +139,7 @@ _COALESCE_WAIT_S = float(_env_float("RB_SHARD_TIER_COALESCE_WAIT_S", "300"))
 # well above any realistic in-flight download (the bounded wait above is
 # 300s); raising the threshold above 1h would let a single failed
 # multi-day-uptime run leak gigabytes.
-_ORPHAN_TMP_MAX_AGE_S = float(_env_float("RB_SHARD_TIER_TMP_MAX_AGE_S", "3600"))
+_ORPHAN_TMP_MAX_AGE_S = config.shard_tier_tmp_max_age_s()
 
 # `prewarm()` admission floor: an LRU candidate younger than this many
 # seconds CANNOT be evicted to make room for a speculative arrival. This
@@ -165,7 +152,7 @@ _ORPHAN_TMP_MAX_AGE_S = float(_env_float("RB_SHARD_TIER_TMP_MAX_AGE_S", "3600"))
 # monkey-patching this constant (no DP restart needed). Tests pin both
 # behaviours: the boundary case (age == floor) admits, and a live edit
 # takes effect on the next prewarm.
-_MIN_RESIDENT_S = max(0.0, float(_env_float("RB_SHARD_TIER_MIN_RESIDENT_S", "30")))
+_MIN_RESIDENT_S = config.shard_tier_min_resident_s()
 
 
 # Residency table. Keyed by `shard_uri` — the same key the in-flight

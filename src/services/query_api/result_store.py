@@ -23,9 +23,10 @@ working.
 """
 
 import json
-import os
 import threading
 from typing import Dict, Optional
+
+from adapters import config
 
 # Reuse the queue adapter's Redis connection mechanism: it already binds a
 # client from `REDIS_URL` at import time. Sharing it means one connection
@@ -38,7 +39,7 @@ _KEY_PREFIX = "query_result:"
 # Ephemeral results are short-lived — a client polls `GET /v1/query/status`
 # for a few seconds. One hour is generous headroom for a slow poller while
 # still bounding Redis memory (the key self-expires; no sweeper needed).
-RESULT_TTL_SECONDS = int(os.getenv("RB_QUERY_RESULT_TTL", "3600"))
+RESULT_TTL_SECONDS = config.query_result_ttl()
 
 # In-process fallback used only when there is no `REDIS_URL` (unit tests /
 # single-process mode). Guarded by a lock so the RESULT_READY consumer thread

@@ -40,6 +40,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from adapters import config
+
 
 _LOG = logging.getLogger(__name__)
 
@@ -60,7 +62,7 @@ def _cache_dir() -> Path:
     after the env var is set picks up the new location (test fixtures
     rely on this — production sets the env once at startup).
     """
-    return Path(os.getenv("CACHE_DIR", "/var/cache/shards"))
+    return Path(config.cache_dir())
 
 
 def _persistence_path() -> Path:
@@ -117,10 +119,10 @@ def _resolve() -> str:
     write to disk (generate-and-persist path) but never reads from
     deployment-platform-specific env vars beyond `HOSTNAME`.
     """
-    explicit = os.getenv("RB_DP_ID")
+    explicit = config.dp_id()
     if explicit:
         return explicit
-    hostname = os.getenv("HOSTNAME")
+    hostname = config.hostname()
     if hostname:
         return hostname
     persisted = _read_persisted()

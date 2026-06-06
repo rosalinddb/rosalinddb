@@ -39,11 +39,11 @@ once. Two layers keep that safe:
     clobbers a terminal status a worker just wrote.
 """
 
-import os
 import threading
 import time
 import uuid
 
+from adapters import config
 from adapters.queue.queue import (
     acquire_reaper_lock,
     reclaim_stale_processing,
@@ -63,19 +63,19 @@ RECLAIMED_TOPICS = (
 # How long a message may sit on a processing list before the reaper assumes
 # the worker that took it has died/hung and reclaims it. Generous by default so
 # a slow-but-healthy job is never reclaimed out from under a live worker.
-QUEUE_RECLAIM_TIMEOUT = float(os.getenv("QUEUE_RECLAIM_TIMEOUT", "300"))
+QUEUE_RECLAIM_TIMEOUT = config.queue_reclaim_timeout()
 
 # How long a dataset may sit in `validating`/`indexing` before the reaper flips
 # it to `error`. The backstop for a worker hang.
-DATASET_STUCK_TIMEOUT = float(os.getenv("DATASET_STUCK_TIMEOUT", "900"))
+DATASET_STUCK_TIMEOUT = config.dataset_stuck_timeout()
 
 # Seconds between reaper ticks when run as a background loop.
-REAPER_INTERVAL = float(os.getenv("REAPER_INTERVAL", "30"))
+REAPER_INTERVAL = config.reaper_interval()
 
 # TTL of the single-reaper lock. A little longer than the tick interval so the
 # lock outlives one tick even under clock skew, but still expires on its own if
 # the holder dies — no stuck-lock starvation.
-REAPER_LOCK_TTL = float(os.getenv("REAPER_LOCK_TTL", str(REAPER_INTERVAL + 30)))
+REAPER_LOCK_TTL = config.reaper_lock_ttl()
 
 # Per-process identity stamped into the reaper lock so `release_reaper_lock`
 # only deletes a lock this process still owns.

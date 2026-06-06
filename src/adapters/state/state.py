@@ -46,7 +46,6 @@ attribute because the recall write path reaches it via `_state.execute_values`
 
 import contextvars
 import datetime as _dt
-import os
 import threading
 from typing import Callable, Optional, Tuple
 
@@ -54,8 +53,10 @@ import psycopg2
 import psycopg2.pool
 from psycopg2.extras import RealDictCursor, execute_values  # noqa: F401 (RealDictCursor/execute_values re-exported; execute_values reached by recall write path via _state.execute_values)
 
+from adapters import config
 
-_MEMORY_MODE = os.getenv("DATABASE_URL", "memory://local").startswith("memory://")
+
+_MEMORY_MODE = config.database_url().startswith("memory://")
 
 # A single process-wide lock guards the in-memory quota counters so that the
 # lazy daily reset + the consume check + the increment happen as one atomic
@@ -223,11 +224,7 @@ def _quota_defaults() -> Tuple[int, int]:
     Shared helper: used by `quota.py` (`create_tenant`) AND by the OSS bootstrap
     in `migrations.py`. Lives HERE so both reach it via `_state._quota_defaults`.
     """
-    vq = os.getenv("RB_TEST_VECTOR_QUOTA")
-    qq = os.getenv("RB_TEST_QUERY_QUOTA")
-    vector_quota = int(vq) if vq and vq.isdigit() else _DEFAULT_VECTOR_QUOTA
-    query_quota = int(qq) if qq and qq.isdigit() else _DEFAULT_DAILY_QUERY_QUOTA
-    return vector_quota, query_quota
+    return config.test_vector_quota(), config.test_query_quota()
 
 
 # Default DP pool — the value migration 006 stamps on every tenant. The CP

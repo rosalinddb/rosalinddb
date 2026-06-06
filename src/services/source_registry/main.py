@@ -21,7 +21,6 @@ import base64
 import json
 import logging
 import math
-import os
 import re
 import uuid
 from typing import Optional
@@ -33,6 +32,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from adapters import config
 from adapters.errors import error_envelope
 from adapters.landing.parquet_reader import id_to_int64, read_shard_sidecar
 from adapters.observability import init_observability
@@ -83,10 +83,7 @@ _DEFAULT_RECALL_MAX_ROWS = 2000
 
 def _recall_max_rows() -> int:
     """Return the per-(tenant, dataset) recall-row cap (`RB_RECALL_MAX_ROWS`)."""
-    raw = os.getenv("RB_RECALL_MAX_ROWS")
-    if raw and raw.strip().lstrip("-").isdigit() and int(raw) > 0:
-        return int(raw)
-    return _DEFAULT_RECALL_MAX_ROWS
+    return config.recall_max_rows()
 
 
 # Observability bootstrap. Runs at import so it works both when this module is
@@ -112,9 +109,7 @@ app.add_middleware(RequestScopedConnectionMiddleware)
 # CORS_ALLOW_ORIGINS env var. Auth is via Bearer token (Authorization header,
 # not cookies), so credentials=False is correct.
 _dev_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
-_extra_origins = [
-    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()
-]
+_extra_origins = config.cors_allow_origins()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_extra_origins,
@@ -168,6 +163,10 @@ def _oss_startup() -> None:
     once per process at the WARNING level when auth is disabled — quiet when
     `RB_REQUIRE_AUTH=true`.
     """
+    # Fail-fast on required-at-boot config (e.g. JWT_SECRET when auth is on)
+    # before this process starts serving. Reads env fresh. This also covers the
+    # Control Plane, which reuses this exact `app` (see control_plane.cp_app).
+    config.validate()
     # Seed the "default" tenant row in memory mode. Postgres mode seeds it in
     # the migration runner (`scripts/migrate.py` -> `_apply_migrations`); this
     # call is a guarded no-op there.
@@ -218,14 +217,14 @@ def how_to_connect():
 
 
 _DATASET_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
-_INGEST_MAX_BYTES = int(os.getenv("INGEST_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MiB
+_INGEST_MAX_BYTES = config.ingest_max_bytes()  # 10 MiB
 # Largest finite float4 (single-precision). Embeddings are stored as pgvector
 # `vector` (float4) in the recall tier and cast to float32 on the consolidated
 # path, so a magnitude beyond this overflows to Infinity on storage. Validation
 # rejects any value above it (or non-finite) per-line, identically in both flag
 # modes.
 _FLOAT4_MAX = 3.4028235e38
-_LANDING_PREFIX = os.getenv("LANDING_PREFIX", "s3://rosalinddb/landing")
+_LANDING_PREFIX = config.landing_prefix()
 # Raw bulk-import uploads are staged OUTSIDE the dataset landing prefix so
 # the index builder (which scans `landing/{tenant}/{dataset}/` recursively for
 # `.parquet`) never sees a raw `upload.parquet` and double-indexes it. The
@@ -233,13 +232,16 @@ _LANDING_PREFIX = os.getenv("LANDING_PREFIX", "s3://rosalinddb/landing")
 # top-level prefix the builder is never pointed at. Defaults to the landing
 # root with its last path segment swapped to `staging`.
 def _default_staging_prefix() -> str:
-    base = os.getenv("LANDING_PREFIX", "s3://rosalinddb/landing").rstrip("/")
+    base = config.landing_prefix().rstrip("/")
     head, _, _ = base.rpartition("/")
     return f"{head}/staging" if head else f"{base}-staging"
 
 
-_STAGING_PREFIX = os.getenv("STAGING_PREFIX", _default_staging_prefix())
-_TENANT_PREFIX = os.getenv("TENANT_PREFIX", "true").lower() == "true"
+# Honor an explicitly-set empty STAGING_PREFIX as "" (original used
+# os.getenv(..., default), so only an UNSET value derives the default).
+_sp = config.staging_prefix()
+_STAGING_PREFIX = _sp if _sp is not None else _default_staging_prefix()
+_TENANT_PREFIX = config.tenant_prefix()
 
 # --- bulk import limits ---------------------------------------------------
 # The staged upload cap for the async import flow — far larger than the small
@@ -249,9 +251,9 @@ _TENANT_PREFIX = os.getenv("TENANT_PREFIX", "true").lower() == "true"
 # universally supported across S3-compatible backends — so the bulk-import
 # flow uses presigned PUT). The import worker `head`s the staged object and
 # fails the job if it exceeds this cap. Default 5 GiB; overridable per-deployment.
-_IMPORT_MAX_BYTES = int(os.getenv("IMPORT_MAX_BYTES", str(5 * 1024 * 1024 * 1024)))
+_IMPORT_MAX_BYTES = config.import_max_bytes()
 # Presigned upload URL lifetime, seconds (default 1 hour).
-_IMPORT_UPLOAD_TTL_S = int(os.getenv("IMPORT_UPLOAD_TTL_S", "3600"))
+_IMPORT_UPLOAD_TTL_S = config.import_upload_ttl_s()
 _IMPORT_FORMATS = ("ndjson", "parquet")
 _IMPORT_ERROR_MODES = ("continue", "abort")
 _IMPORT_EXT = {"ndjson": "ndjson", "parquet": "parquet"}

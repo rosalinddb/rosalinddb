@@ -24,13 +24,14 @@ writes, index shard IO, cache hydration, and the async bulk-import staging
 flow.
 """
 
-import os
 import threading
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import boto3
 import requests
 from botocore.exceptions import ClientError
+
+from adapters import config
 
 
 # --- memory:// store ------------------------------------------------------
@@ -483,10 +484,10 @@ def _s3_client():
         # Re-check inside the lock: a thread that lost the race must reuse the
         # client the winner built rather than construct a second one.
         if _S3_CLIENT is None:
-            endpoint_url = os.getenv("S3_ENDPOINT_URL")
-            access_key = os.getenv("S3_ACCESS_KEY")
-            secret_key = os.getenv("S3_SECRET_KEY")
-            region = os.getenv("S3_REGION", "us-east-1")
+            endpoint_url = config.s3_endpoint_url()
+            access_key = config.s3_access_key()
+            secret_key = config.s3_secret_key()
+            region = config.s3_region()
             _S3_CLIENT = boto3.client(
                 "s3",
                 endpoint_url=endpoint_url,

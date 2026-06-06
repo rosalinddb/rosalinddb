@@ -41,7 +41,6 @@ so it never leaks into business/validation logic.
 """
 
 import json
-import os
 import queue
 import time
 import uuid
@@ -51,6 +50,8 @@ from opentelemetry import context as _otel_context
 from opentelemetry import trace as _otel_trace
 from opentelemetry.propagate import extract as _otel_extract
 from opentelemetry.propagate import inject as _otel_inject
+
+from adapters import config
 
 # Reserved message key carrying the serialised W3C trace context. Stripped
 # before the payload is handed to consumers.
@@ -62,7 +63,7 @@ _MSG_ID_KEY = "_msg_id"
 
 # Max delivery attempts before a message is dead-lettered. A poison message
 # that crashes the worker every time must not redeliver forever.
-QUEUE_MAX_ATTEMPTS = int(os.getenv("QUEUE_MAX_ATTEMPTS", "5"))
+QUEUE_MAX_ATTEMPTS = config.queue_max_attempts()
 
 _local_queues: dict[str, queue.Queue] = {
     "VALIDATE_DATASET": queue.Queue(),
@@ -81,7 +82,7 @@ _local_queues: dict[str, queue.Queue] = {
     "RESULT_READY": queue.Queue(),
 }
 
-_REDIS_URL = os.getenv("REDIS_URL")
+_REDIS_URL = config.redis_url()
 _redis = None
 if _REDIS_URL:
     import redis  # type: ignore

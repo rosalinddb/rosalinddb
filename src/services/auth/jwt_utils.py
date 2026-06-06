@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import secrets
 import threading
 import time
@@ -50,6 +49,7 @@ from typing import Dict, Optional, Tuple
 import jwt as pyjwt
 from fastapi import Header, HTTPException, status
 
+from adapters import config
 from adapters.state import state as state_mod
 
 
@@ -92,12 +92,7 @@ def auth_required() -> bool:
     — including an unset env var — counts as OFF. Production self-host
     deploys export `RB_REQUIRE_AUTH=true` (see docs/deploy/self-host.md).
     """
-    return os.getenv("RB_REQUIRE_AUTH", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    return config.require_auth()
 
 
 # --- API-key auth resolution cache ----------------------------------------
@@ -160,7 +155,7 @@ def _resolve_secret() -> str:
     obviously not durable across restarts — a WARNING is logged so any
     accidental prod misconfig is loud.
     """
-    env = os.getenv("JWT_SECRET")
+    env = config.jwt_secret()
     if env:
         return env
     if not getattr(_resolve_secret, "_warned", False):

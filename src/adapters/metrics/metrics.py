@@ -7,20 +7,21 @@ Counters, gauges, and timers are aggregated under a thread lock and exposed via
 to CloudWatch.
 """
 
-import os
 import threading
 import time
 from collections import defaultdict
 from typing import Optional
+
+from adapters import config
 
 _counters = defaultdict(int)
 _gauges = defaultdict(float)
 _timers = defaultdict(list)
 _lock = threading.Lock()
 
-_CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "local")
+_CLOUD_PROVIDER = config.cloud_provider()
 _cloudwatch = None
-_namespace = os.getenv("CLOUDWATCH_NAMESPACE", "RosalindDB")
+_namespace = config.cloudwatch_namespace()
 
 if _CLOUD_PROVIDER == "aws":
     try:
@@ -63,7 +64,7 @@ def _send_to_cloudwatch(metric_name: str, value: float, unit: str) -> None:
         return
     
     try:
-        service_name = os.getenv("SERVICE_ROLE", "unknown")
+        service_name = config.service_role()
         _cloudwatch.put_metric_data(
             Namespace=_namespace,
             MetricData=[

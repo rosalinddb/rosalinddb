@@ -42,6 +42,8 @@ import threading
 import uuid
 from typing import Dict, Optional, Type
 
+from adapters import config
+
 
 def ensure_cached(
     shard_uri: str,
@@ -73,7 +75,7 @@ def ensure_cached(
     # `adapters.storage.shard_tier` (and the env gate) is honoured at call time.
     from adapters.storage import shard_tier
 
-    if os.getenv("RB_SHARD_TIER_BYTES"):
+    if config.shard_tier_bytes_set():
         # Tier handles its own directory creation, single-flight, and
         # eviction. `ShardTierTimeout` and `FileNotFoundError` are the two
         # raise paths the caller's classifier already maps to 503; let them
