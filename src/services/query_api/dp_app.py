@@ -22,7 +22,7 @@ import os
 
 from fastapi import FastAPI, Request
 
-from config import truthy as _truthy
+from adapters.config import truthy as _truthy
 from adapters.observability import init_observability
 from adapters.observability.otel import instrument_fastapi
 from adapters.state.conn_middleware import RequestScopedConnectionMiddleware

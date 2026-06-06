@@ -36,7 +36,7 @@ from typing import List, Optional
 import faiss  # type: ignore
 import numpy as np
 
-from config import truthy as _truthy
+from adapters.config import truthy as _truthy
 
 from adapters.observability import init_observability
 from adapters.observability import metrics as obs_metrics

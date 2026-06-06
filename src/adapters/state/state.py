@@ -265,13 +265,12 @@ _DEFAULT_DP_POOL = "shared"
 # (e.g. `_DEFAULT_PG_POOL_MAX`, `_MIGRATION_VERSIONS`, `_DEFAULT_RECALL_POOL_MAX`)
 # for `state_mod.X` completeness.
 #
-# IMPORT-ORDER CONTRACT: `adapters.state.state` is the canonical entry point and
-# must be imported before any of its submodules — the submodules import THIS
-# module at their top, and this module re-imports from them only here at the
-# bottom, so importing a submodule first in a fresh interpreter would hit a
-# partially-initialised cycle. In practice nothing does (every entrypoint, test,
-# and tool reaches the tier via `adapters.state.state`), so the cycle never
-# triggers; it is a deliberate facade trade-off, not an accident.
+# No import cycle: the submodules do NOT import this module at their top — they
+# bind it through the lazy `adapters.state.state._lazy_state` proxy, which resolves
+# this module only at attribute-access (call) time. So this end-of-module re-import
+# from them is safe in either import order (importing a submodule first no longer
+# hits a partially-initialised module). `adapters.state.state` remains the
+# canonical entry point; the submodules are an implementation detail.
 
 from adapters.state.pooling import (  # noqa: E402,F401  (intentional end-of-module re-export)
     _DEFAULT_PG_POOL_MAX,

@@ -34,7 +34,7 @@ import logging
 import os
 import threading
 
-from config import truthy as _truthy
+from adapters.config import truthy as _truthy
 
 # --- module state ---------------------------------------------------------
 

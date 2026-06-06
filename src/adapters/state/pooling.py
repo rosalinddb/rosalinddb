@@ -47,7 +47,7 @@ from adapters.observability.tracing import state_connect_span
 # at call time so monkeypatches and `importlib.reload(state)` are both honoured.
 # Imported here, but every access is deferred to call time (no import-time use),
 # so the partial-init of `state` during its own import of this module is safe.
-import adapters.state.state as _state
+from adapters.state._lazy_state import state as _state  # lazy proxy: resolves the facade at call time (breaks the import cycle)
 
 
 _DEFAULT_PG_POOL_MAX = 10  # per-process ceiling; override with RB_PG_POOL_MAX

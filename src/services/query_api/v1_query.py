@@ -38,7 +38,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from opentelemetry import context as otel_context
 
-from config import truthy as _truthy
+from adapters.config import truthy as _truthy
 from adapters.cache import CatalogCache, ensure_cached as _ensure_cached_shared
 from adapters.errors import (
     DownloadCoalescingTimeout,

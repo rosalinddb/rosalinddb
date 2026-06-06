@@ -65,7 +65,7 @@ from psycopg2.extras import RealDictCursor
 # Reference them through `_state.X` at call time. Imported here, but every access
 # is deferred to call time (no import-time use), so the partial-init of `state`
 # during its own import of this module is safe.
-import adapters.state.state as _state
+from adapters.state._lazy_state import state as _state  # lazy proxy: resolves the facade at call time (breaks the import cycle)
 
 
 # --- Memory-mode catalog-invalidation notify hooks ------------------------
