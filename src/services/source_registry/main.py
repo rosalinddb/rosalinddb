@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from adapters.errors import error_envelope
 from adapters.landing.parquet_reader import id_to_int64, read_shard_sidecar
 from adapters.observability import init_observability
 from adapters.observability.otel import instrument_fastapi
@@ -257,11 +258,9 @@ _IMPORT_EXT = {"ndjson": "ndjson", "parquet": "parquet"}
 
 
 def _err(status_code: int, code: str, message: str, details: Optional[dict] = None) -> JSONResponse:
-    """Build a v1 error envelope response."""
-    body: dict = {"error": {"code": code, "message": message}}
-    if details is not None:
-        body["error"]["details"] = details
-    return JSONResponse(status_code=status_code, content=body)
+    """Build a v1 error envelope response. Delegates to the canonical
+    `adapters.errors.error_envelope` (same byte-for-byte body)."""
+    return error_envelope(status_code, code, message, details)
 
 
 def _dataset_response(row: dict) -> dict:

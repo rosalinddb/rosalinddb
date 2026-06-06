@@ -35,6 +35,7 @@ from typing import Dict, Optional
 from fastapi import Header
 from fastapi.responses import JSONResponse
 
+from adapters.errors import RateLimited, set_rate_limited_response_factory
 from adapters.observability import metrics as obs_metrics
 from services.auth.jwt_utils import (
     API_KEY_PREFIX,
@@ -167,18 +168,13 @@ def _rate_limited_response() -> JSONResponse:
     )
 
 
-class RateLimited(Exception):
-    """Raised by the `rate_limit` dependency when a bucket is exhausted.
-
-    Carries a pre-built JSONResponse; the app-level handler installed by
-    `install_rate_limit_handler` returns it verbatim. We use an exception
-    rather than returning a response directly because FastAPI dependencies
-    cannot short-circuit a request with a response object.
-    """
-
-    def __init__(self) -> None:
-        self.response = _rate_limited_response()
-        super().__init__("rate_limited")
+# `RateLimited` is defined once in `adapters.errors` (so its class identity is
+# shared and the registered exception handler / isinstance checks keep working)
+# and re-exported here under its original `services.auth.quota.RateLimited` name.
+# Its constructor builds `self.response` from `_rate_limited_response`, which we
+# register as the factory below — keeping the response-shaping concern local to
+# this module while the class lives in the stdlib-only errors leaf.
+set_rate_limited_response_factory(_rate_limited_response)
 
 
 def rate_limit(authorization: Optional[str] = Header(default=None)) -> None:

@@ -90,7 +90,7 @@ def _ensure_cached(shard_uri: str) -> str:
         if not os.path.exists(path):
             # Atomic publish: write to a unique temp file then rename, so a
             # concurrent reader in another process sharing CACHE_DIR never
-            # sees a partial file (a plain write races — see v1_query._ensure_cached).
+            # sees a partial file (a plain write races — see adapters.cache.shard_fetch.ensure_cached).
             tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
             try:
                 with open(tmp, "wb") as f:

@@ -22,6 +22,7 @@ import os
 
 from fastapi import FastAPI, Request
 
+from config import truthy as _truthy
 from adapters.observability import init_observability
 from adapters.observability.otel import instrument_fastapi
 from adapters.state.conn_middleware import RequestScopedConnectionMiddleware
@@ -31,12 +32,6 @@ from services.auth.auth import install_exception_handlers, install_pool_exhausti
 from services.query_api.dp_query import router as dp_query_router
 from services.query_api.v1_query import _err, start_result_consumer
 
-
-def _truthy(value: str | None) -> bool:
-    """Match the rest of the codebase's env-flag parsing — `true`/`1`/`yes`."""
-    if not value:
-        return False
-    return value.strip().lower() in ("1", "true", "yes", "on")
 
 # Observability bootstrap at import. The OTEL_SERVICE_NAME secret overrides the
 # default in production (`rosalinddb-query-dp`, per the CP↔DP contract).

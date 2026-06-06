@@ -7,18 +7,15 @@ dataset, and performs a FAISS top-K search. In the minimal implementation,
 results are computed and discarded; production would return via callback.
 """
 
-import json
 import os
 import time
-import threading
-import uuid
-from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import faiss  # type: ignore
 import numpy as np
 
+from adapters.cache import CatalogCache, ensure_cached as _ensure_cached_shared
+from adapters.errors import classify_query_error
 from adapters.observability import init_observability
 from adapters.observability import metrics as obs_metrics
 from adapters.observability.tracing import (
@@ -29,22 +26,17 @@ from adapters.observability.tracing import (
 )
 from adapters.queue.queue import consume, publish, ack, nack
 from adapters.queue.shutdown import install_signal_handlers, should_stop
-from adapters.state.state import RecallUnavailable, list_shards, migrate
+from adapters.state.state import list_shards, migrate
 from adapters.landing.parquet_reader import read_shard_sidecar
-from adapters.metrics.metrics import snapshot
+from adapters.metrics.server import (
+    make_metrics_handler,
+    start_metrics_server as _start_metrics_server,
+)
 # SSD-tier import. The import-time `.tmp` orphan sweep is bounded and
 # log-and-continue, so importing unconditionally is cheap; the activation
 # gate inside `_ensure_cached` makes sure the tier's `fetch` only runs when
 # the deployment has opted in via `RB_SHARD_TIER_BYTES`.
-from adapters.storage import shard_tier
-
-# Classify an arbitrary exception into a v1 error envelope. botocore is an
-# optional import — only S3 deployments need it — so a missing botocore must
-# not break this module on a local memory:// run.
-try:
-    from botocore.exceptions import ClientError as _BotoClientError  # type: ignore
-except Exception:  # noqa: BLE001 - boto3 not installed (memory-only test env)
-    _BotoClientError = None  # type: ignore[assignment]
+from adapters.storage import shard_tier  # noqa: F401  (imported for its import-time .tmp orphan sweep; see comment above)
 
 # Reuse the hot-path AND-of-equals predicate so the two query paths cannot
 # drift. The ephemeral runner does a brute-force search and already has every
@@ -58,14 +50,12 @@ from services.query_api.v1_query import (
     metadata_matches_filter,
 )
 
-# NOTE: this module has its own local `_ensure_cached` (below) that is
-# deliberately NOT the coalescing version in `services/query_api/v1_query.py`.
-# Factoring the helper into a shared module would invert the existing one-way
-# import (this runner -> v1_query) or break a circular. The ephemeral path
-# runs at much lower concurrency than the hot path, where the download stampede
-# was observed and fixed; if ephemeral concurrency grows, port the coalescing
-# logic across or extract a shared `adapters/storage/shard_fetch.py` module
-# that both call.
+# This module's `_ensure_cached` (below) and catalog cache call the shared
+# `adapters.cache` helpers. The ephemeral path deliberately runs WITHOUT
+# download coalescing (`coalescing=False`): it runs at much lower concurrency
+# than the hot path, where the download stampede was observed and fixed. If
+# ephemeral concurrency grows, flip `coalescing=True` and supply the
+# single-flight state.
 
 # Observability bootstrap at import — idempotent; see validator_worker/run.py.
 init_observability("rosalinddb-ephemeral-runner")
@@ -74,25 +64,19 @@ CACHE_DIR = os.getenv("CACHE_DIR", "/var/cache/shards")
 METRICS_PORT = int(os.getenv("METRICS_PORT", "9102"))
 
 
-# --- Per-`(tenant, dataset)` catalog cache (mirror of v1_query) --------------
+# --- Per-`(tenant, dataset)` catalog cache -----------------------------------
 #
-# Mirrored from `services.query_api.v1_query` for the same circular-import
-# reason that keeps `_ensure_cached` and `_classify_error` duplicated here.
-# The two copies MUST keep their public shape identical:
+# The cache logic lives once in `adapters.cache.CatalogCache`; this runner
+# owns its own instance (state is per-service — independent of the hot path's
+# cache). The thin wrappers below resolve `list_shards` / `_now` from THIS
+# module's namespace at call time so a test monkeypatching either retunes the
+# cache. Public shape is unchanged:
 #   - `_cached_list_shards(tenant, dataset) -> list`
 #   - `_invalidate_catalog_cache(tenant, dataset) -> bool`
 #   - `_on_catalog_notify(payload: dict) -> None`
 #   - `_now()` indirected for testability
 #   - `_catalog_cache_clear()` test helper
-# See the v1_query.py comment block for the full rationale; this comment
-# is intentionally short to avoid letting the two drift apart.
-
-_CATALOG_CACHE_MAX_ENTRIES = 10_000
-_CATALOG_CACHE: "OrderedDict[tuple[str, str], tuple[float, list]]" = OrderedDict()
-_CATALOG_CACHE_LOCK = threading.Lock()
-# Per-key generation counter — see v1_query.py mirror for the race the
-# generation check closes (concurrent invalidate during in-flight fetch).
-_CATALOG_CACHE_GEN: "Dict[tuple[str, str], int]" = {}
+_CATALOG_CACHE = CatalogCache()
 
 
 def _now() -> float:
@@ -114,34 +98,20 @@ def _catalog_cache_active() -> bool:
 
 
 def _cached_list_shards(tenant: str, dataset: str) -> list:
-    """TTL-cached wrapper around `list_shards`. See v1_query.py mirror.
+    """TTL-cached wrapper around `list_shards`.
 
     Single-flight is NOT a contract: N concurrent callers on a cold miss
     can each call the source. `list_shards` is cheap relative to the
     search itself; the bounded worst case is a startup thundering herd.
     """
-    if not _catalog_cache_active():
-        return list_shards(tenant, dataset)
-    key = (tenant, dataset)
-    ttl = _catalog_freshness_s()
-    now = _now()
-    with _CATALOG_CACHE_LOCK:
-        entry = _CATALOG_CACHE.get(key)
-        if entry is not None and (now - entry[0]) < ttl:
-            _CATALOG_CACHE.move_to_end(key)
-            return entry[1]
-        # Snapshot generation so a concurrent invalidate after this
-        # point causes our install to lose. See v1_query.py mirror.
-        gen_pre = _CATALOG_CACHE_GEN.get(key, 0)
-    rows = list_shards(tenant, dataset)
-    with _CATALOG_CACHE_LOCK:
-        if _CATALOG_CACHE_GEN.get(key, 0) != gen_pre:
-            return rows
-        _CATALOG_CACHE[key] = (now, rows)
-        _CATALOG_CACHE.move_to_end(key)
-        while len(_CATALOG_CACHE) > _CATALOG_CACHE_MAX_ENTRIES:
-            _CATALOG_CACHE.popitem(last=False)
-    return rows
+    return _CATALOG_CACHE.cached_list_shards(
+        tenant,
+        dataset,
+        list_shards,
+        _now,
+        _catalog_freshness_s(),
+        _catalog_cache_active(),
+    )
 
 
 def _invalidate_catalog_cache(tenant: str, dataset: str) -> bool:
@@ -150,10 +120,7 @@ def _invalidate_catalog_cache(tenant: str, dataset: str) -> bool:
     Bumps the per-key generation counter so an in-flight fetch refuses
     to install the now-stale rows.
     """
-    key = (tenant, dataset)
-    with _CATALOG_CACHE_LOCK:
-        _CATALOG_CACHE_GEN[key] = _CATALOG_CACHE_GEN.get(key, 0) + 1
-        return _CATALOG_CACHE.pop(key, None) is not None
+    return _CATALOG_CACHE.invalidate(tenant, dataset)
 
 
 def _on_catalog_notify(payload: dict) -> None:
@@ -166,9 +133,7 @@ def _on_catalog_notify(payload: dict) -> None:
 
 def _catalog_cache_clear() -> None:
     """Test helper — flush every cached entry."""
-    with _CATALOG_CACHE_LOCK:
-        _CATALOG_CACHE.clear()
-        _CATALOG_CACHE_GEN.clear()
+    _CATALOG_CACHE.clear()
 
 
 # Match the v1_query opt-in: subscribe the cache invalidator to the
@@ -208,48 +173,17 @@ def _classify_error(exc: BaseException) -> Tuple[str, str]:
     The returned `safe_message` carries only the EXCEPTION CLASS NAME — never
     `str(exc)` — so a botocore `ClientError` cannot leak an S3 endpoint URL,
     a bucket name, or signed-URL parameters into the customer-visible error.
+
+    The classification table itself now lives once in
+    `adapters.errors.classify_query_error` (it owns the exception hierarchy and
+    the only adapter-layer imports the table needs, so importing it here does NOT
+    violate the one-way rule the way importing from `services.query_api` would).
+    This wrapper pins the cold-shard catch-all message
+    (`"Cold-shard query failed: <Cls>"`); the hot path's
+    `_classify_hot_path_error` delegates to the same canonical table with its own
+    `"Query failed: <Cls>"` prefix, so the two classifiers can no longer drift.
     """
-    if isinstance(exc, RecallUnavailable):
-        # SYMMETRY with `_classify_hot_path_error` in v1_query.py: the recall
-        # tier being unreachable is a distinct, retryable 503 `recall_unavailable`
-        # — never the generic `ephemeral_error` 500. The ephemeral runner does
-        # not itself call `recall_search` today (recall answers on the SYNC query
-        # path), so this branch is not reached in practice — it exists to keep the
-        # two classification tables byte-identical, the explicit contract this
-        # twin documents, so a future runner-side recall read classifies the same.
-        return "recall_unavailable", "Recall tier is temporarily unavailable"
-    if isinstance(exc, PermissionError):
-        return "cache_unavailable", "Shard cache is unreadable or unwritable"
-    if isinstance(exc, shard_tier.CacheCapacityExceeded):
-        # SSD-tier admission floor rejected a speculative arrival. Mirror of
-        # the `_classify_hot_path_error` branch in v1_query.py; the
-        # duplication is intentional to keep this module's import graph free
-        # of services.query_api.
-        return "cache_capacity_exceeded", "SSD cache tier is at capacity"
-    if isinstance(exc, shard_tier.ShardTierTimeout):
-        # SSD-tier coalescing timeout — the in-flight initiator on the tier
-        # did not release the per-URI event within
-        # `RB_SHARD_TIER_COALESCE_WAIT_S`. Same customer-visible semantics as
-        # a botocore transient failure: retry-safe, surfaces as 503. Kept
-        # symmetric with `_classify_hot_path_error` in v1_query.py; the two
-        # classifiers are intentionally duplicated to keep the ephemeral
-        # runner's import graph free of services.query_api.
-        return "storage_unavailable", "Shard storage is temporarily unavailable"
-    if isinstance(exc, FileNotFoundError):
-        # A missing cache directory looks like FileNotFoundError on the cache
-        # write path; a missing S3 key also surfaces as FileNotFoundError via
-        # `_s3_get_object`. Both collapse to `storage_unavailable` — the shard
-        # the catalog points at is not retrievable. The runner cannot tell
-        # them apart at this layer and the caller's remediation is the same
-        # (check storage health), so this is the intended bucketing.
-        return "storage_unavailable", "Shard storage is temporarily unavailable"
-    if _BotoClientError is not None and isinstance(exc, _BotoClientError):
-        return "storage_unavailable", "Shard storage is temporarily unavailable"
-    if isinstance(exc, OSError):
-        # A generic OSError on the cache path (disk full, EIO, etc.) — bucket
-        # with `cache_unavailable` so self-hosters get a specific signal.
-        return "cache_unavailable", "Shard cache I/O error"
-    return "ephemeral_error", f"Cold-shard query failed: {type(exc).__name__}"
+    return classify_query_error(exc, default_message_prefix="Cold-shard query failed")
 
 
 def _ensure_cached(shard_uri: str) -> str:
@@ -267,45 +201,22 @@ def _ensure_cached(shard_uri: str) -> str:
     `faiss.read_index` fails on the truncated bytes. An atomic rename means a
     reader sees either no file or the fully-written file — never a partial one.
 
-    SSD-tier activation gate (mirror of the hot-path wiring in
+    SSD-tier activation gate (same wiring as the hot path in
     `services/query_api/v1_query.py`). When `RB_SHARD_TIER_BYTES` is set,
     delegation runs through `shard_tier.fetch(shard_uri)`. When the env is
-    unset the legacy body below runs unchanged so a deployment that has not
-    opted in sees unchanged behaviour.
+    unset the legacy body runs unchanged so a deployment that has not opted
+    in sees unchanged behaviour.
+
+    The body lives in `adapters.cache.shard_fetch.ensure_cached`. The
+    ephemeral path passes `coalescing=False`: it runs at much lower
+    concurrency than the hot path, where the download stampede was observed
+    and fixed.
     """
-    if os.getenv("RB_SHARD_TIER_BYTES"):
-        # Tier owns its own directory, single-flight, and eviction. Its
-        # `ShardTierTimeout` and `FileNotFoundError` both classify to 503
-        # via `_classify_error`.
-        return shard_tier.fetch(shard_uri)
-
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    if shard_uri.startswith("s3://") or shard_uri.startswith("memory://"):
-        # `download_to` streams the GET to disk without buffering the whole
-        # object in RAM (matches the hot path's `_ensure_cached`; both use
-        # this pattern to avoid the multi-GB-shard OOM of the prior
-        # `f.write(read_bytes(shard_uri))` approach).
-        from adapters.storage.storage import download_to
-
-        cache_key = shard_uri.split("://", 1)[1].replace("/", "_")
-        path = os.path.join(CACHE_DIR, cache_key)
-        if not os.path.exists(path):
-            tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
-            try:
-                download_to(shard_uri, tmp)
-                # Atomic publish — concurrent readers never see a partial file.
-                os.replace(tmp, path)
-            except BaseException:
-                # On any failure before the rename, remove the leftover temp
-                # file so a crash mid-write does not leak `.tmp` files into
-                # CACHE_DIR. Best-effort: the file may already be gone.
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-        return path
-    raise ValueError("Unsupported shard uri")
+    return _ensure_cached_shared(
+        shard_uri,
+        cache_dir=CACHE_DIR,
+        coalescing=False,
+    )
 
 
 def handle(
@@ -439,80 +350,17 @@ def handle(
     return matches
 
 
-class MetricsHandler(BaseHTTPRequestHandler):
-    """HTTP handler for metrics endpoints."""
-
-    def do_GET(self):
-        """Handle GET requests for metrics."""
-        if self.path == "/metrics":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(snapshot()).encode())
-        elif self.path == "/prometheus":
-            self._serve_prometheus()
-        elif self.path == "/healthz":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status": "ok", "service": "ephemeral_runner"}')
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def _serve_prometheus(self):
-        """Serve Prometheus format metrics."""
-        try:
-            from prometheus_client import CollectorRegistry, generate_latest, Gauge
-        except ImportError:
-            self.send_response(503)
-            self.end_headers()
-            self.wfile.write(b"prometheus-client not installed")
-            return
-
-        reg = CollectorRegistry()
-        snap = snapshot()
-        counters = snap.get("counters", {})
-        gauges = snap.get("gauges", {})
-        timers = snap.get("timers", {})
-
-        # Export counters as gauges
-        for name, value in counters.items():
-            g = Gauge(f"ephemeral_{name}", f"ephemeral counter {name}", registry=reg)
-            g.set(float(value))
-
-        # Export gauges
-        for name, value in gauges.items():
-            g = Gauge(f"ephemeral_{name}", f"ephemeral gauge {name}", registry=reg)
-            g.set(float(value))
-
-        # Export timer stats
-        for name, values in timers.items():
-            if values:
-                count = len(values)
-                avg_ms = (sum(values) / count) * 1000.0
-                Gauge(f"ephemeral_{name}_count", f"ephemeral timer {name} count", registry=reg).set(float(count))
-                Gauge(f"ephemeral_{name}_avg_ms", f"ephemeral timer {name} avg ms", registry=reg).set(float(avg_ms))
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; version=0.0.4")
-        self.end_headers()
-        self.wfile.write(generate_latest(reg))
-
-    def log_message(self, format, *args):
-        """Suppress default HTTP logging."""
-        pass
+# The metrics HTTP handler + server are the canonical implementation in
+# `adapters.metrics.server`. `MetricsHandler` is re-exported (a configured
+# subclass with this service's `/healthz` service name + Prometheus prefix) so
+# the name stays importable from this module; `start_metrics_server()` keeps its
+# no-arg signature and forwards this service's two strings + `METRICS_PORT`.
+MetricsHandler = make_metrics_handler("ephemeral_runner", "ephemeral_")
 
 
 def start_metrics_server():
     """Start the metrics HTTP server in a background thread."""
-    def run_server():
-        server = HTTPServer(("0.0.0.0", METRICS_PORT), MetricsHandler)
-        server.serve_forever()
-
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
-    print(f"Metrics server started on port {METRICS_PORT}")
+    return _start_metrics_server("ephemeral_runner", "ephemeral_", METRICS_PORT)
 
 
 def main_loop():
