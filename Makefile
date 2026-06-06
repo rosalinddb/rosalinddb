@@ -20,17 +20,17 @@ build:
 venv:
 	$(PYTHON_BIN) -m venv $(VENV)
 	$(PIP) install -U pip
-	$(PIP) install -r requirements.txt
+	$(PIP) install -e .
 
 # test-unit:        fast, hermetic suite — memory:// storage, no Docker.
 # test-integration: end-to-end suite — spins up an ephemeral MinIO container
 #                   per session via testcontainers (Docker required).
 # test:             both tiers.
 test-unit: venv
-	PYTHONPATH=. $(PYTEST) -m unit -q
+	$(PYTEST) -m unit -q
 
 test-integration: venv
-	PYTHONPATH=. $(PYTEST) -m integration -q
+	$(PYTEST) -m integration -q
 
 test: test-unit test-integration
 
