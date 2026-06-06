@@ -27,7 +27,7 @@ import sys
 
 def main() -> None:
     """Apply the database schema once, then exit non-zero on failure."""
-    from adapters.state.state import migrate
+    from adapters.state.state import migrate, migrate_recall
 
     print("migrate: applying database schema...")
     # force=True: this entrypoint must apply the schema even when it inherits
@@ -35,6 +35,15 @@ def main() -> None:
     # long-running services see, where that flag suppresses on-boot migration).
     migrate(force=True)
     print("migrate: schema is up to date.")
+
+    # Recall-tier schema. Runs against the SEPARATE pgvector instance addressed
+    # by RB_RECALL_DSN. DEFAULT-OFF: when RB_RECALL_DSN is unset this is a pure
+    # no-op — no connection is opened and the line below reports it skipped, so a
+    # flag-off deploy behaves byte-identically to today.
+    if migrate_recall(force=True):
+        print("migrate: recall-tier (pgvector) schema is up to date.")
+    else:
+        print("migrate: recall tier off (RB_RECALL_DSN unset); skipping recall schema.")
 
 
 if __name__ == "__main__":

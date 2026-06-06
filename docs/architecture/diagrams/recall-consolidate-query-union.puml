@@ -1,0 +1,92 @@
+@startuml recall-consolidate-query-union
+' Query union sequence: resolve the latest shard + its consolidated_lsn
+' watermark -> search Recall (lsn > watermark, brute-force exact) and the
+' Consolidate shard (FAISS via the SSD/RAM cache) -> merge: square pgvector
+' L2 -> L2^2 (metric alignment), recall-wins dedup, suppress recall-tombstoned
+' ids, sort ascending, take top_k. Also shows the no-shard recall/ephemeral
+' branch and the mode label (which always reflects the consolidated-shard cache only).
+
+title Query union: search Recall + Consolidate, then merge (RB_RECALL on)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+actor "client" as client
+participant "query_dp\n(run_query)" as dp
+database "shard_catalog\n(consolidated_lsn)" as catalog
+participant "_search_consolidated_shard\n(FAISS via SSD/RAM cache)" as consolidated
+database "Recall\n(pgvector, recall_search)" as recall
+
+client -> dp : POST /query {vector, top_k, filter}
+activate dp
+
+== Resolve the seam ONCE (_resolve_shard): the watermark of the shard this query will read ==
+
+dp -> catalog : _resolve_shard -> list_shards -> latest shard S\n(cheap catalog lookup; yields consolidated_lsn = W)
+alt no shard yet (list_shards empty)
+  note right of dp #E9F7E9
+    Watermark W = 0 -> every Recall row qualifies.
+    Answer SYNCHRONOUSLY from Recall (read-your-writes
+    for a brand-new dataset). Does NOT fall to ephemeral.
+  end note
+end
+
+== Overlap (#31): consolidated FAISS search and Recall scan run CONCURRENTLY (recall needs only W) ==
+
+note over dp
+  After ONE resolution, run both INDEPENDENT searches concurrently:
+  recall scan on a bounded worker thread (request OTel context re-attached
+  so recall.search stays a child of the request span), FAISS search inline.
+  Union wall-time ~ max(consolidated, recall), not the sum (~15 ms tax erased).
+end note
+
+par consolidated FAISS search (inline)
+  dp -> consolidated : _search_consolidated_shard(S)\n(FAISS, L2^2) via SSD/RAM cache
+  activate consolidated
+  consolidated --> dp : consolidated hits (L2^2)
+  deactivate consolidated
+else Recall scan (worker thread)
+  dp -> recall : recall_search WHERE tenant, dataset,\nlsn > W (the watermark of the shard this query READ,\nNOT a fresh list_shards), filter
+  activate recall
+  note right of recall
+    Brute-force exact L2 over the SMALL recall partition.
+    Score computed as power(embedding <-> q, 2) = L2^2,
+    so it merges DIRECTLY with the consolidated shard's FAISS L2^2.
+    Returns BOTH live matches and the FULL set of recall ids
+    above W (incl. tombstoned / filtered-out / past-top_k).
+  end note
+  recall --> dp : recall hits (L2^2) + full recall-id set above W
+  deactivate recall
+end
+
+note over dp #FBE9E9
+  Error precedence on a double failure: consolidated error wins (preserves
+  the pre-overlap serial ordering). A recall failure is never masked; a
+  consolidated failure is never reported as a recall error.
+end note
+
+== Merge ==
+
+dp -> dp : (1) METRIC ALIGNMENT -- square pgvector L2 -> L2^2\n(over identical un-normalised vectors; the most likely silent bug)
+dp -> dp : (2) DEDUP recall-wins -- any consolidated hit whose id is in the\nfull recall-id-set-above-W is dropped (Recall is newer)
+dp -> dp : (3) SUPPRESS tombstones -- a deleted/filtered recall row\nsuppresses its consolidated twin but contributes NO match\n(only a filter-passing LIVE recall row adds a match)
+dp -> dp : (4) SORT ascending by L2^2, take top_k
+
+== mode label (reflects the consolidated-shard cache only, never Recall) ==
+
+note over dp #FDF3E7
+  consolidated resolved (warm) -> mode=hot   | consolidated resolved (load) -> mode=cold
+  no consolidated shard, recall answered -> mode=recall
+  no consolidated shard, no recall row    -> mode=ephemeral (+ job_id)
+  So hot/cold does NOT imply Recall was idle -- the label
+  only describes the consolidated-shard cache state.
+end note
+
+dp --> client : {matches, mode, ...}
+deactivate dp
+
+@enduml

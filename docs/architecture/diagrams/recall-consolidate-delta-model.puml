@@ -1,0 +1,65 @@
+@startuml recall-consolidate-delta-model
+' STRUCTURE of the delta-shard LSM on the Consolidate side (RB_DELTA_TIER on).
+' Replaces the single-shard-per-dataset model: a GENERATION = one base shard
+' (level 0) + up to RB_MAX_DELTAS small delta shards (level 1) that all SHARE one
+' frozen coarse quantizer. Each recall flush appends a cheap delta (minor fold,
+' O(new rows)); at RB_MAX_DELTAS a major compaction folds the whole generation
+' into a fresh base. Read fan-out stays bounded.
+'
+' This is the RB_DELTA_TIER variant of the single Consolidate shard shown in
+' recall-consolidate-tandem.puml. Default (flag off) is still ONE shard rewritten
+' on every flush. NOTE: "generation" here = base+its-deltas (a quantizer epoch),
+' which is the SAME word used for the keep=2 grace sweep -- they line up: each
+' major compaction starts a new generation.
+
+title RosalindDB delta-tier: a generation = base + delta shards (RB_DELTA_TIER on)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam wrapWidth 230
+skinparam nodesep 22
+skinparam ranksep 45
+
+database "Recall tier\npgvector\nowns lsn > frontier" as recall
+
+package "Consolidate tier (S3) -- generation G (live)" #F4F8FF {
+  file "quantizer-vG.index\n(frozen coarse quantizer,\nshared by the whole generation)" as q #LightYellow
+  rectangle "base shard\nlevel 0, bare IndexIVFFlat\nnative add_with_ids\ncovers (.., Wbase]" as base
+  rectangle "delta 1\nlevel 1, parent = base\ncovers (Wbase, h1]" as d1
+  rectangle "delta 2\ncovers (h1, h2]" as d2
+  rectangle "delta k  (k <= RB_MAX_DELTAS=8)\ncovers (h{k-1}, hk]\n+ tombstone_int_ids" as dk
+}
+
+cloud "older generation G-1\nkept for grace (keep=2 generations),\nswept once > 2 generations old" as oldgen #EEEEEE
+
+q .down.> base : trained-empty clone (no retrain)
+q .down.> d1
+q .down.> d2
+q .down.> dk
+base -[hidden]right-> d1
+d1 -[hidden]right-> d2
+d2 -[hidden]right-> dk
+oldgen -[hidden]down-> q
+
+recall --> d1 : minor fold = append a delta for\nrecall rows above the frontier\n(O(new rows), no retrain)
+
+note bottom of dk
+  FRONTIER watermark = contiguous-MIN of the covered bands
+  (gap-clamped; NEVER max). Recall owns lsn > frontier; the
+  generation owns lsn <= frontier. A query reads recall + base
+  + ALL live deltas; on a repeated id NEWEST-DELTA-WINS, and a
+  delta's tombstone_int_ids suppress older copies.
+end note
+
+note right of oldgen
+  At RB_MAX_DELTAS (8) live deltas -> MAJOR COMPACTION:
+  reconstruct deduped survivors (drop tombstones) into a fresh
+  base under a CLONED quantizer (same vG, no retrain), with a
+  transactional cutover -> a NEW generation. RB_MAX_DELTAS_HARD
+  (16) is the backstop ceiling.
+end note
+
+@enduml

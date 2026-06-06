@@ -29,7 +29,7 @@ from adapters.observability.tracing import (
 )
 from adapters.queue.queue import consume, publish, ack, nack
 from adapters.queue.shutdown import install_signal_handlers, should_stop
-from adapters.state.state import list_shards, migrate
+from adapters.state.state import RecallUnavailable, list_shards, migrate
 from adapters.landing.parquet_reader import read_shard_sidecar
 from adapters.metrics.metrics import snapshot
 # SSD-tier import. The import-time `.tmp` orphan sweep is bounded and
@@ -197,6 +197,8 @@ def _classify_error(exc: BaseException) -> Tuple[str, str]:
 
     Codes are drawn from / extended on the v1 error catalog (`docs/api/v1.md`):
 
+      - `recall_unavailable` — the recall (pgvector) tier is unreachable; the
+        query is safe to retry once recall recovers. Surfaces as 503.
       - `cache_unavailable` — the local shard cache directory is unreadable
         or unwritable. Self-host hint: check `CACHE_DIR` mount permissions.
       - `storage_unavailable` — the object-store fetch failed. The query is
@@ -207,6 +209,15 @@ def _classify_error(exc: BaseException) -> Tuple[str, str]:
     `str(exc)` — so a botocore `ClientError` cannot leak an S3 endpoint URL,
     a bucket name, or signed-URL parameters into the customer-visible error.
     """
+    if isinstance(exc, RecallUnavailable):
+        # SYMMETRY with `_classify_hot_path_error` in v1_query.py: the recall
+        # tier being unreachable is a distinct, retryable 503 `recall_unavailable`
+        # — never the generic `ephemeral_error` 500. The ephemeral runner does
+        # not itself call `recall_search` today (recall answers on the SYNC query
+        # path), so this branch is not reached in practice — it exists to keep the
+        # two classification tables byte-identical, the explicit contract this
+        # twin documents, so a future runner-side recall read classifies the same.
+        return "recall_unavailable", "Recall tier is temporarily unavailable"
     if isinstance(exc, PermissionError):
         return "cache_unavailable", "Shard cache is unreadable or unwritable"
     if isinstance(exc, shard_tier.CacheCapacityExceeded):

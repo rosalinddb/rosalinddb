@@ -29,12 +29,14 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import faiss  # type: ignore
 import numpy as np
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
+from opentelemetry import context as otel_context
 
 from adapters.landing.parquet_reader import read_shard_sidecar
 from adapters.metrics.metrics import counter, timer
@@ -48,7 +50,15 @@ from adapters.observability.tracing import (
 )
 from adapters.queue.queue import consume, publish, ack, nack
 from adapters.queue.shutdown import should_stop
-from adapters.state.state import get_dataset, list_shards, try_consume_query
+from adapters.state import state as _state
+from adapters.state.state import (
+    RecallUnavailable,
+    get_dataset,
+    list_shards,
+    recall_enabled,
+    recall_search,
+    try_consume_query,
+)
 # SSD-tier import. The import-time side effect is the bounded `.tmp` orphan
 # sweep in `adapters/storage/shard_tier.py` (one `scandir`, log-and-continue
 # on errors), cheap enough to run unconditionally. The actual `fetch` call at
@@ -96,6 +106,18 @@ def query_nprobe() -> int:
     """
     raw = max(1, int(os.getenv("RB_QUERY_NPROBE", str(DEFAULT_NPROBE))))
     return min(raw, MAX_NPROBE)
+
+
+def _delta_tier_enabled() -> bool:
+    """Return True when the delta-tier read union (`RB_DELTA_TIER`) is on.
+
+    DEFAULT OFF. Read LIVE (not captured at import) so a test or an operator can
+    flip it without re-importing the module — and, crucially, so with the flag OFF
+    every resolve/watermark/search path is byte-identical to today (single-shard
+    resolution + `_watermark_for_shard`). The whole tier is dark-launchable and
+    revertible by env until the bench gates pass (spec §9, rollback contract).
+    """
+    return _truthy(os.getenv("RB_DELTA_TIER"))
 
 
 def _ivf_search_params(index, override: Optional[int] = None, full_coverage: bool = False):
@@ -172,21 +194,56 @@ _RESULTS_LOCK = result_store._RESULTS_LOCK
 #     large shards co-resident would OOM the node. Instead each entry's
 #     approximate footprint (index + parsed sidecar) is measured once at
 #     insert time and a running total is kept; on insert the LRU end is
-#     evicted until `total <= RB_SHARD_CACHE_BYTES` (default 512 MB). An
-#     `OrderedDict` is the LRU — a hit moves the key to the end. A single
-#     entry larger than the whole budget is admitted then immediately evicted
-#     (usable for that one query, never retained) so eviction can't loop.
+#     evicted until `total <= RB_SHARD_CACHE_BYTES`. An `OrderedDict` is the
+#     LRU — a hit moves the key to the end.
 #     `RB_SHARD_CACHE_SIZE` remains an optional *secondary* safety cap.
+#   - Oversized-shard bypass (the 1M-scale correctness fix): a single shard
+#     whose measured footprint alone EXCEEDS the whole budget can never
+#     coexist with anything else. Inserting it as MRU and then running the
+#     eviction loop would evict every warm neighbour first and finally the
+#     oversized entry too — wiping the cache on *every* query for that shard
+#     (pathological evict-then-reinsert thrash). So `_cache_put` detects the
+#     oversize case up front and BYPASSES the cache entirely: the entry is
+#     never inserted, no neighbour is evicted, and the current query still
+#     searches the in-hand index/sidecar held in the call site's locals. The
+#     bypass emits `record_shard_cache("oversize")` + a one-time-per-shard
+#     WARNING so an under-provisioned operator can see they need a bigger
+#     `RB_SHARD_CACHE_BYTES`.
 #   - Evicted in step with the shard sweep: when the rough-edges sweeper
 #     deletes a superseded shard, `evict_shard()` drops its cache entry so a
 #     stale index is never served. Resolving the *newest* shard per query
 #     means a freshly-built shard is a natural cache miss → cold load.
 #   - Thread-guarded: `_hot_search` runs concurrently under the GIL; every
 #     read/mutate of the cache holds `_SHARD_CACHE_LOCK`.
-RB_SHARD_CACHE_BYTES = max(1, int(os.getenv("RB_SHARD_CACHE_BYTES", str(512 * 1024 * 1024))))
+# `RB_SHARD_CACHE_BYTES` — the in-memory shard-cache byte budget; the primary
+# operator knob for this cache. Default 1 GiB.
+#
+# Default rationale: the cache must be able to hold at least ONE large shard,
+# otherwise that shard is bypassed on every query (a permanent cold load) and
+# the cache provides zero value at the scale where it matters most. A 1M-vector
+# flat-float32 shard is dim x 4B x 1e6: ~512 MB at 128 dims, ~3 GB at 768 dims.
+# The previous 512 MB default could not hold even a single 128-dim 1M shard
+# once the sidecar is accounted for — so at 1M scale it degenerated into the
+# oversize-bypass path for the common case. 1 GiB comfortably holds a 128-dim
+# 1M shard (the most common large config) with headroom for the sidecar and a
+# warm neighbour or two, while staying small enough not to dominate RAM on a
+# modest node (a 4 GB pod still leaves ~3 GB for everything else). Deployers
+# running 768-dim-at-1M (or wanting more warm shards) raise this — the private
+# scale bench, for instance, overrides it to 2 GB. Deployers on tiny nodes can
+# lower it; an oversized shard is then served via the graceful bypass rather
+# than thrashing the cache.
+RB_SHARD_CACHE_BYTES = max(1, int(os.getenv("RB_SHARD_CACHE_BYTES", str(1024 * 1024 * 1024))))
 # Optional secondary count cap. 0 (or unset → 0) disables it; the byte budget
 # is the primary bound.
 RB_SHARD_CACHE_SIZE = max(0, int(os.getenv("RB_SHARD_CACHE_SIZE", "0")))
+
+# Shard ids already warned about for exceeding the cache budget. Keeps the
+# oversize WARNING "one-time-ish" — logged once per shard id per process so an
+# under-provisioned operator gets a loud signal without a per-query log storm.
+# Kept strictly bounded: `evict_shard()` discards a swept shard's id and
+# `cache_clear()` empties the set, so it never accumulates ids for shards that
+# are gone and a re-added shard can warn again.
+_OVERSIZE_WARNED: set = set()
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -264,8 +321,9 @@ _MMAP_ENABLED = _truthy(os.getenv("RB_FAISS_MMAP"))
 # Python process's RSS, so `serialize_index(...).nbytes` (which would deserialise
 # the entire index to measure it — defeating the point of mmap) is the wrong
 # accounting. 32 MiB is large enough that an unbounded number of mmap'd entries
-# still pressures the cache toward eviction; small enough that a 512 MB cache
-# can hold many warm shards. Documented in `docs/architecture/mmap.md`.
+# still pressures the cache toward eviction; small enough that the default
+# `RB_SHARD_CACHE_BYTES` budget holds many warm shards. Documented in
+# `docs/architecture/mmap.md`.
 _MMAP_INDEX_ESTIMATE_BYTES = 32 * 1024 * 1024
 
 
@@ -680,12 +738,50 @@ def _cache_put(shard_id, index, sidecar) -> None:
 
     The entry's footprint is measured once here. On insert, LRU entries are
     evicted until the running total fits `RB_SHARD_CACHE_BYTES` (and, if
-    enabled, the secondary count cap `RB_SHARD_CACHE_SIZE`). An entry larger
-    than the whole budget is admitted then immediately evicted so it is still
-    usable for the current query but is never retained.
+    enabled, the secondary count cap `RB_SHARD_CACHE_SIZE`).
+
+    Oversized-shard bypass: a shard whose footprint alone exceeds the whole
+    budget can never coexist with any other entry. Inserting it would force the
+    eviction loop to drain every warm neighbour before discarding the oversized
+    entry itself — thrashing the cache on every query for that shard. Instead
+    we detect that case up front and return WITHOUT touching the cache: the
+    entry is never inserted, no neighbour is evicted, and the caller's in-hand
+    `index`/`sidecar` still serve the current query. The bypass is recorded as
+    `record_shard_cache("oversize")` and warned about once per shard id so an
+    under-provisioned operator sees they should raise `RB_SHARD_CACHE_BYTES`.
     """
     global _SHARD_CACHE_BYTES_USED
     nbytes = _entry_nbytes(index, sidecar)
+
+    # Oversized-shard graceful bypass — never insert, never evict neighbours.
+    if nbytes > RB_SHARD_CACHE_BYTES:
+        with _SHARD_CACHE_LOCK:
+            # Drop any prior (smaller) entry for this id so a stale index is
+            # never served, but do NOT evict anyone else.
+            old = _SHARD_CACHE.pop(shard_id, None)
+            if old is not None:
+                _SHARD_CACHE_BYTES_USED -= old[2]
+            first_time = shard_id not in _OVERSIZE_WARNED
+            if first_time:
+                _OVERSIZE_WARNED.add(shard_id)
+        # Signal + warn outside the cache lock (logging/metrics must not run
+        # under the hot-path lock).
+        try:
+            obs_metrics.record_shard_cache("oversize")
+        except Exception:  # noqa: BLE001 - metrics must never break the query path
+            pass
+        if first_time:
+            logging.getLogger(__name__).warning(
+                "shard %s footprint (~%d bytes) exceeds the whole shard-cache "
+                "budget RB_SHARD_CACHE_BYTES=%d; serving it BYPASSED (not "
+                "cached) to avoid evicting the warm cache. Raise "
+                "RB_SHARD_CACHE_BYTES to cache shards this large.",
+                shard_id,
+                nbytes,
+                RB_SHARD_CACHE_BYTES,
+            )
+        return
+
     with _SHARD_CACHE_LOCK:
         # Replacing an existing key: drop its old footprint first.
         old = _SHARD_CACHE.pop(shard_id, None)
@@ -695,8 +791,8 @@ def _cache_put(shard_id, index, sidecar) -> None:
         _SHARD_CACHE.move_to_end(shard_id)
         _SHARD_CACHE_BYTES_USED += nbytes
         # Evict LRU entries until within the byte budget. The just-inserted
-        # entry is the MRU, so it is evicted last — if it alone exceeds the
-        # budget it is admitted-then-evicted (usable now, not retained).
+        # entry is the MRU, so it is evicted last; the oversize case is handled
+        # above, so this loop only ever trims genuinely-evictable neighbours.
         while _SHARD_CACHE_BYTES_USED > RB_SHARD_CACHE_BYTES and _SHARD_CACHE:
             _evicted_id, evicted = _SHARD_CACHE.popitem(last=False)
             _SHARD_CACHE_BYTES_USED -= evicted[2]
@@ -717,6 +813,9 @@ def evict_shard(shard_id) -> bool:
     global _SHARD_CACHE_BYTES_USED
     with _SHARD_CACHE_LOCK:
         entry = _SHARD_CACHE.pop(shard_id, None)
+        # Drop any oversize-warned mark so a re-added shard can warn again and
+        # the warned set cannot grow without bound as shards come and go.
+        _OVERSIZE_WARNED.discard(shard_id)
         if entry is None:
             return False
         _SHARD_CACHE_BYTES_USED -= entry[2]
@@ -729,6 +828,8 @@ def cache_clear() -> None:
     with _SHARD_CACHE_LOCK:
         _SHARD_CACHE.clear()
         _SHARD_CACHE_BYTES_USED = 0
+        # Keep the oversize-warned set bounded: a full reset clears it too.
+        _OVERSIZE_WARNED.clear()
 
 
 router = APIRouter()
@@ -951,19 +1052,138 @@ def metadata_matches_filter(metadata: dict, flt: Dict[str, Any]) -> bool:
     return True
 
 
-def _hot_search(
+# --- Consolidated (FAISS) search: resolution and search, split -----------------
+#
+# `_hot_search` (the old name) bundled TWO independent phases into one call:
+#
+#   1. SHARD RESOLUTION — the cheap Postgres catalog lookup that picks the
+#      newest shard and yields the recall watermark (its `consolidated_lsn`).
+#   2. The FAISS SEARCH — the ~33 ms (at 1M) vector search on the resolved
+#      shard's deserialised index.
+#
+# The recall scan only needs phase 1's WATERMARK, not phase 2's FAISS result,
+# so bundling them forced `run_query` to wait for the whole consolidated search
+# (resolution + FAISS) before even STARTING the recall round-trip — making the
+# recall cost strictly additive (the measured ~15 ms recall tax, #31). Splitting
+# the two phases lets `run_query` resolve ONCE, then run the FAISS search and the
+# recall scan CONCURRENTLY (recall only needs the watermark).
+#
+# The `_hot_search` name is retired (the "hot" overload was always misleading —
+# it returned a hot|consolidated cache-state, not a "hot tier"). The OTel span
+# name `query.hot_search` is DELIBERATELY KEPT for now: bench dashboards and
+# latency attribution key on it; a span rename is tracked separately as #33.
+
+
+def _resolve_shard(
+    tenant: str,
+    dataset: str,
+    resolved: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve the newest shard for `(tenant, dataset)` — phase 1 only (no FAISS).
+
+    Returns the resolved-shard info dict (with the newest catalog row under the
+    key `"shard"`), or `None` when the dataset has no shard yet (the SAME
+    no-shard signal `_hot_search` returned, so the ephemeral fallback still
+    triggers). The returned dict is exactly what `_watermark_for_shard(...)`
+    consumes via `.get("shard")` — resolve ONCE here and pair the watermark to
+    THIS shard (invariant I3); never read a watermark independently.
+
+    `resolved`, when supplied, is the SAME out-dict the caller passes through to
+    `_search_consolidated_shard` so the FAISS search reads exactly the shard this
+    resolution picked. When `resolved` is None a fresh dict is allocated. On a
+    no-shard dataset the dict is left without a `"shard"` key (watermark 0).
+
+    Runs UNDER the caller's open `query.hot_search` span (the caller opens it so
+    the consolidated FAISS spans nest under the SAME parent). The
+    `state.list_shards` span is opened here so the catalog lookup stays an
+    attributable child of `query.hot_search`.
+    """
+    if resolved is None:
+        resolved = {}
+    # The Postgres shard-catalog lookup — its own span (it used to run
+    # before any span opened and was therefore invisible in traces).
+    with list_shards_span(tenant=tenant, dataset=dataset):
+        # Per-`(tenant, dataset)` catalog cache wrapper. With the SSD
+        # tier off OR `RB_CATALOG_FRESHNESS_S=0` this is a passthrough
+        # to `list_shards`; with both active, repeated lookups for the
+        # same dataset within the TTL skip the Postgres round-trip.
+        shards = _cached_list_shards(tenant, dataset)
+    if not shards:
+        # No shard for this dataset yet — the same signal `_hot_search`
+        # returned. `resolved` carries no `"shard"` key so the watermark is 0
+        # and (with recall on) all recall rows qualify; with recall off the
+        # caller falls through to the ephemeral path. Byte-identical in BOTH
+        # the flag-off and flag-on paths (the spec's preserved no-shard signal).
+        return None
+
+    if not _delta_tier_enabled():
+        # --- Flag OFF: single-shard resolution, byte-identical to today -----
+        # I3 watermark pairing: record WHICH shard the consolidated search will
+        # read, so the recall-tier union filters with this exact shard's
+        # consolidated_lsn (never a watermark resolved independently). `latest`
+        # is the head of the newest-first catalog list — the same row
+        # `_search_consolidated_shard` loads.
+        resolved["shard"] = shards[0]
+        return resolved
+
+    # --- Flag ON: resolve the live generation (base + live deltas) ----------
+    # Single-snapshot resolution (I3): membership, watermark, AND tombstones all
+    # derive from the SAME `shards` snapshot taken above. We compute the live
+    # generation from THAT list via `state._generations` (rather than calling
+    # `state.live_generation`, which would issue a SECOND catalog read and could
+    # tear the (set, watermark) pair against a concurrent compaction/cutover).
+    generations = _state._generations(shards)
+    if not generations:
+        # The snapshot has rows but none form a generation (e.g. only orphan
+        # deltas whose base was swept) — treat as no resolvable shard, the same
+        # no-shard signal so the caller falls through to recall/ephemeral.
+        return None
+    base, *deltas = generations[0]
+    # Order deltas by their LSN band so the frontier-watermark walk and the
+    # contiguity proof (§5.1) see them oldest-band-first. `id` breaks ties
+    # deterministically (matches state.live_generation's ordering).
+    deltas.sort(key=lambda s: (int(s.get("covered_lsn_lo", 0) or 0), s["id"]))
+    resolved["shards"] = [base, *deltas]
+    # Stash the resolved deltas' catalog tombstones (int64) for cold-vs-cold
+    # delete suppression. They are read from the SAME resolved rows the watermark
+    # derives from → version-atomic with the frontier (§3.3, §5.2).
+    tombstones: List[int] = []
+    for d in deltas:
+        tombstones.extend(int(x) for x in (d.get("tombstone_int_ids") or []))
+    resolved["delta_tombstone_int_ids"] = tombstones
+    return resolved
+
+
+def _search_consolidated_shard(
     tenant: str,
     dataset: str,
     vector: List[float],
     top_k: int,
     flt: Optional[Dict[str, Any]] = None,
     nprobe: Optional[int] = None,
+    resolved: Optional[Dict[str, Any]] = None,
 ):
-    """Run the hot-path FAISS search against the newest shard.
+    """Run the FAISS search on the already-resolved shard(s) — phase 2 only.
 
-    Returns `(matches, mode)` where `mode` is `"hot"` or `"cold"` (a shard
-    that had to be faulted into the local cache for the first time), or
-    `None` if no shard exists for the dataset yet.
+    Returns `(matches, mode)` where `mode` is the cache-state `"hot"` (cache
+    hit) or `"cold"` (a shard that had to be faulted into the local cache for
+    the first time) — the SAME strings `_hot_search` returned — or `None` if
+    `resolved` carries no shard (the no-shard signal — so the caller still
+    falls through to the ephemeral path exactly as before).
+
+    `resolved` is the out-dict produced by `_resolve_shard(...)`. With the delta
+    tier OFF it reads `resolved["shard"]` (the single newest shard) and never
+    re-resolves, so the FAISS search reads exactly the shard the recall watermark
+    was paired to (invariant I3) — byte-identical to today. With the delta tier
+    ON it reads `resolved["shards"]` (base + live deltas), loads+searches EACH,
+    and CONCATENATES the matches: a global top-k vector is in its own shard's
+    top-k (a shard is a subset of the generation), so over-fetching `top_k`
+    per shard and letting the caller's merge sort+truncate is lossless (P0-C).
+    The per-shard nprobe is delivered via `faiss.SearchParametersIVF` per call
+    (never a cached-index mutation), so searching N shards is concurrency-safe.
+    If any frontier shard is UNREADABLE the load/search raises and propagates,
+    so `run_query` returns the consolidated 503 rather than silently narrowing
+    the cold set below what was actually read (§5.1).
 
     `nprobe`, when supplied, overrides the server-default IVF `nprobe` for
     this query only — used by the recall benchmark to sweep `nprobe` across
@@ -984,85 +1204,176 @@ def _hot_search(
     query can still legitimately return fewer than `top_k` results when the
     dataset genuinely contains fewer than `top_k` matching records — that is
     an exact answer, not an approximation or an error.
+
+    Runs UNDER the caller's open `query.hot_search` span so the `shard.download`,
+    `faiss.load_index` and `faiss.search` children stay attributable to it.
     """
-    has_filter = bool(flt)
-    # `query.hot_search` is the parent span; the catalog lookup, shard
-    # download, index deserialize and vector search nest under it as separate
-    # children so a query trace decomposes into attributable pieces.
-    with hot_search_span(tenant=tenant, dataset=dataset):
-        # The Postgres shard-catalog lookup — its own span (it used to run
-        # before any span opened and was therefore invisible in traces).
-        with list_shards_span(tenant=tenant, dataset=dataset):
-            # Per-`(tenant, dataset)` catalog cache wrapper. With the SSD
-            # tier off OR `RB_CATALOG_FRESHNESS_S=0` this is a passthrough
-            # to `list_shards`; with both active, repeated lookups for the
-            # same dataset within the TTL skip the Postgres round-trip.
-            shards = _cached_list_shards(tenant, dataset)
+    if not resolved:
+        return None
+
+    shards = resolved.get("shards")
+    if shards is not None:
+        # --- Flag ON: loop-search the base + live deltas, concatenate -------
         if not shards:
             return None
-        latest = shards[0]
-        shard_id = latest.get("id")
-
-        # In-memory cache lookup. A hit reuses the already-deserialised FAISS
-        # index + parsed sidecar (the query is then just the search); a miss
-        # is a real cold load — the `shard.download` and `faiss.load_index`
-        # spans make a cold query obviously distinguishable from a warm one
-        # in a trace.
-        cached = _cache_get(shard_id)
-        if cached is not None:
-            index, sidecar = cached
-            is_cold = False
-            obs_metrics.record_shard_cache("hit")
-        else:
-            with shard_download_span(uri=latest["shard_uri"]):
-                # `_ensure_cached` internally checks `RB_SHARD_TIER_BYTES`
-                # to decide between the SSD tier and the legacy in-process
-                # single-flight. The URI is the cache key in either path —
-                # no separate shard id needed at this layer.
-                local_path = _ensure_cached(latest["shard_uri"])
-            # `mmap=_MMAP_ENABLED` stamps `rosalinddb.mmap` on the span so a
-            # trace makes the cold-load strategy (mmap vs full deserialise)
-            # obvious without an out-of-band lookup of the deployment's env.
-            with faiss_load_index_span(uri=latest["shard_uri"], mmap=_MMAP_ENABLED):
-                # mmap path: FAISS keeps the index file open and serves reads
-                # from the page cache instead of copying the whole serialised
-                # blob into RSS. `IO_FLAG_READ_ONLY` pairs with the mmap flag
-                # — the cached entry is shared across queries, so a write
-                # would race with concurrent searches in flight.
-                if _MMAP_ENABLED:
-                    index = faiss.read_index(
-                        local_path, faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY
-                    )
-                else:
-                    index = faiss.read_index(local_path)
-            sidecar = read_shard_sidecar(latest["shard_uri"])
-            _cache_put(shard_id, index, sidecar)
-            is_cold = True
-            obs_metrics.record_shard_cache("miss")
-        x = np.array([vector], dtype=np.float32)
-
-        # `faiss.search` span — now the actual vector search ALONE, so the
-        # name finally means what it says. High-cardinality tenant/dataset
-        # attributes are correct on a span (not a metric).
-        #
-        # Page-fault sampler: read /proc/self/stat's `majflt` before and
-        # after the search and record the delta to `rosalinddb.shard.page_faults`.
-        # On the mmap path this is the operator-facing signal that the shard's
-        # pages were cold in the page cache (synchronous disk reads happened
-        # during the search). With mmap off the delta stays at zero — the
-        # whole index is already resident in RSS — so the metric is a clean
-        # "mmap is on AND the cache cooled" indicator. Best-effort: the
-        # sampler returns None on macOS dev / format surprise; we then skip
-        # the record.
-        maj_before = _read_major_faults()
-        with faiss_search_span(tenant=tenant, dataset=dataset, top_k=top_k) as sp:
-            matches = _run_faiss_search(
-                index, sidecar, x, top_k, flt, nprobe, has_filter, sp
+        # DELTA-WINS DEDUP (review #11 BLOCKER): when an id is RE-UPSERTED, PR-B
+        # folds the NEW copy into a delta but the OLD copy stays in the base, so
+        # the concatenated union would return that id TWICE (stale base copy +
+        # new delta copy), consuming two top_k slots and pushing a real result
+        # out. The frontier-tombstone path only suppresses DELETES, not
+        # re-upsert duplicates. So dedup the concatenated consolidated matches by
+        # id, keeping the copy from the NEWEST band (greatest `covered_lsn_hi`).
+        # `resolved["shards"]` is ordered by `covered_lsn_lo` ASCENDING (base
+        # oldest → deltas newest), so writing each shard's matches into an
+        # `id -> match` dict in that order lets the later/newer copy overwrite
+        # the earlier/older one — newest-wins. The deduped matches are that
+        # dict's values; the UNCHANGED `_merge_recall_and_consolidated` still
+        # sorts by score + truncates top_k. This is consolidated-vs-consolidated
+        # ONLY — recall stays authoritative and is merged separately. It COMPOSES
+        # with tombstone suppression: a deleted id is suppressed entirely; a
+        # re-upserted id keeps exactly its newest copy.
+        deduped: Dict[str, dict] = {}
+        # `mode` is the WEAKEST cache state across the fan-out: if ANY shard was
+        # a cold load the query paid a cold tax, so the customer-facing mode is
+        # "cold"; only when EVERY shard was a warm cache hit is it "hot".
+        any_cold = False
+        for shard in shards:
+            shard_matches, is_cold = _search_one_shard(
+                tenant, dataset, vector, top_k, flt, nprobe, shard
             )
-        maj_after = _read_major_faults()
-        if maj_before is not None and maj_after is not None:
-            obs_metrics.record_shard_page_faults(max(0, maj_after - maj_before))
+            for m in shard_matches:
+                # Later iterations are newer bands → overwrite to keep newest.
+                deduped[m["id"]] = m
+            any_cold = any_cold or is_cold
+        return list(deduped.values()), ("cold" if any_cold else "hot")
+
+    # --- Flag OFF: single-shard search, byte-identical to today -------------
+    latest = resolved.get("shard")
+    if latest is None:
+        return None
+    matches, is_cold = _search_one_shard(
+        tenant, dataset, vector, top_k, flt, nprobe, latest
+    )
     return matches, ("cold" if is_cold else "hot")
+
+
+def _search_one_shard(
+    tenant: str,
+    dataset: str,
+    vector: List[float],
+    top_k: int,
+    flt: Optional[Dict[str, Any]],
+    nprobe: Optional[int],
+    shard: Dict[str, Any],
+) -> Tuple[List[dict], bool]:
+    """Load (cache-first) and FAISS-search ONE shard. Returns `(matches, is_cold)`.
+
+    The body the single-shard path always ran, extracted so the multi-shard
+    loop can reuse it per-shard. The per-`shard_id` byte-budgeted LRU cache,
+    the `_ivf_search_params` per-call `SearchParametersIVF` nprobe (no cached-
+    index mutation), and the oversize-bypass / mmap accounting are ALL unchanged.
+    Raises on an unreadable shard (download/deserialise failure) so the caller
+    surfaces the consolidated error rather than silently dropping the shard.
+    """
+    has_filter = bool(flt)
+    shard_id = shard.get("id")
+
+    # In-memory cache lookup. A hit reuses the already-deserialised FAISS
+    # index + parsed sidecar (the query is then just the search); a miss
+    # is a real cold load — the `shard.download` and `faiss.load_index`
+    # spans make a cold query obviously distinguishable from a warm one
+    # in a trace.
+    cached = _cache_get(shard_id)
+    if cached is not None:
+        index, sidecar = cached
+        is_cold = False
+        obs_metrics.record_shard_cache("hit")
+    else:
+        with shard_download_span(uri=shard["shard_uri"]):
+            # `_ensure_cached` internally checks `RB_SHARD_TIER_BYTES`
+            # to decide between the SSD tier and the legacy in-process
+            # single-flight. The URI is the cache key in either path —
+            # no separate shard id needed at this layer.
+            local_path = _ensure_cached(shard["shard_uri"])
+        # `mmap=_MMAP_ENABLED` stamps `rosalinddb.mmap` on the span so a
+        # trace makes the cold-load strategy (mmap vs full deserialise)
+        # obvious without an out-of-band lookup of the deployment's env.
+        with faiss_load_index_span(uri=shard["shard_uri"], mmap=_MMAP_ENABLED):
+            # mmap path: FAISS keeps the index file open and serves reads
+            # from the page cache instead of copying the whole serialised
+            # blob into RSS. `IO_FLAG_READ_ONLY` pairs with the mmap flag
+            # — the cached entry is shared across queries, so a write
+            # would race with concurrent searches in flight.
+            if _MMAP_ENABLED:
+                index = faiss.read_index(
+                    local_path, faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY
+                )
+            else:
+                index = faiss.read_index(local_path)
+        sidecar = read_shard_sidecar(shard["shard_uri"])
+        _cache_put(shard_id, index, sidecar)
+        is_cold = True
+        obs_metrics.record_shard_cache("miss")
+    x = np.array([vector], dtype=np.float32)
+
+    # `faiss.search` span — now the actual vector search ALONE, so the
+    # name finally means what it says. High-cardinality tenant/dataset
+    # attributes are correct on a span (not a metric).
+    #
+    # Page-fault sampler: read /proc/self/stat's `majflt` before and
+    # after the search and record the delta to `rosalinddb.shard.page_faults`.
+    # On the mmap path this is the operator-facing signal that the shard's
+    # pages were cold in the page cache (synchronous disk reads happened
+    # during the search). With mmap off the delta stays at zero — the
+    # whole index is already resident in RSS — so the metric is a clean
+    # "mmap is on AND the cache cooled" indicator. Best-effort: the
+    # sampler returns None on macOS dev / format surprise; we then skip
+    # the record.
+    maj_before = _read_major_faults()
+    with faiss_search_span(tenant=tenant, dataset=dataset, top_k=top_k) as sp:
+        matches = _run_faiss_search(
+            index, sidecar, x, top_k, flt, nprobe, has_filter, sp
+        )
+    maj_after = _read_major_faults()
+    if maj_before is not None and maj_after is not None:
+        obs_metrics.record_shard_page_faults(max(0, maj_after - maj_before))
+    return matches, is_cold
+
+
+def _consolidated_search(
+    tenant: str,
+    dataset: str,
+    vector: List[float],
+    top_k: int,
+    flt: Optional[Dict[str, Any]] = None,
+    nprobe: Optional[int] = None,
+    resolved: Optional[Dict[str, Any]] = None,
+):
+    """Resolve the newest shard, then FAISS-search it — the serial composition.
+
+    Equivalent to the retired `_hot_search`: opens the `query.hot_search` span
+    and runs `_resolve_shard(...)` + `_search_consolidated_shard(...)` in
+    sequence under it. Returns `(matches, mode)` (cache-state `"hot"`/`"cold"`)
+    or `None` when the dataset has no shard yet.
+
+    This is the CONSOLIDATED-ONLY path (recall off) and the entry point for
+    callers that just want a complete consolidated search without orchestrating
+    the resolve/search split themselves (tests, the incremental-indexing/mmap
+    integration checks). The recall-union path in `run_query` does NOT call this
+    — it opens its own `query.hot_search` span and runs the two phases with the
+    FAISS search OVERLAPPING the recall scan.
+    """
+    # `query.hot_search` is the parent span; the catalog lookup, shard
+    # download, index deserialize and vector search nest under it as separate
+    # children so a query trace decomposes into attributable pieces. The span
+    # literal stays `query.hot_search` (bench/attribution key on it; rename #33).
+    with hot_search_span(tenant=tenant, dataset=dataset):
+        resolved = _resolve_shard(tenant, dataset, resolved)
+        if resolved is None:
+            return None
+        return _search_consolidated_shard(
+            tenant, dataset, vector, top_k, flt, nprobe, resolved
+        )
 
 
 def _run_faiss_search(index, sidecar, x, top_k, flt, nprobe, has_filter, sp):
@@ -1274,6 +1585,21 @@ def _classify_hot_path_error(exc: BaseException) -> Tuple[str, str]:
     never surfaced — a botocore `ClientError` carries an endpoint URL and
     sometimes signed-URL params that must not leak to the customer.
     """
+    if isinstance(exc, RecallUnavailable):
+        # The recall (pgvector) tier is unreachable for this query — a typed
+        # boundary error raised ONLY by the recall search path (`recall_search`
+        # wraps a recall-store connection failure / sustained recall-pool
+        # exhaustion in `RecallUnavailable`). Distinct, retryable 503: NOT the
+        # generic `ephemeral_error` 500 (benchmark finding C2: an unclassified
+        # psycopg2 OperationalError from the recall path used to hard-500), NOT
+        # the write-side `recall_write_failed`. The query path must NOT silently
+        # serve consolidated-only results — a recall outage means recent,
+        # unconsolidated writes are unreadable, so a silent consolidated-only 200 would
+        # break read-your-writes without signal. A 503 tells the client to retry.
+        # Scoped by TYPE, not by `isinstance(exc, OperationalError)`, so an
+        # identical psycopg2 error from the control-plane/consolidated path is NOT
+        # misclassified as recall_unavailable.
+        return "recall_unavailable", "Recall tier is temporarily unavailable"
     if isinstance(exc, PermissionError):
         return "cache_unavailable", "Shard cache is unreadable or unwritable"
     if isinstance(exc, shard_tier.CacheCapacityExceeded):
@@ -1312,6 +1638,216 @@ def _classify_hot_path_error(exc: BaseException) -> Tuple[str, str]:
     return "ephemeral_error", f"Query failed: {type(exc).__name__}"
 
 
+# --- Recall + Consolidated union (RB_RECALL) ------------------------------
+#
+# When the recall tier is on, `POST /v1/query` searches BOTH tiers and merges
+# (docs/architecture/recall-consolidate.md, "Read path — the union"):
+#
+#   - Consolidated: the `_search_consolidated_shard` FAISS path, returning
+#     matches with FAISS **L2² distances** and the cache-state `mode`
+#     (hot|cold). UNCHANGED.
+#   - Recall: a brute-force exact scan over `recall_vectors` above the resolved
+#     shard's watermark, returning rows with the SAME metric (pgvector `<->`
+#     squared → L2²) plus tombstones.
+#
+# The two are unioned by `_merge_recall_and_consolidated`: recall is AUTHORITATIVE for any
+# id above the watermark, so every recall id (live, tombstoned, or filtered-out)
+# SUPPRESSES the stale consolidated copy of that id; only filter-passing live recall rows
+# contribute an actual match. The result is sorted ascending by L2² and truncated
+# to `top_k` (invariant I1 guarantees the two tiers partition the universe, so the
+# union is complete and non-double-counting).
+#
+# OVERLAP (#31): the consolidated FAISS search and the recall scan are
+# INDEPENDENT once the shard is resolved (recall needs only the watermark, not
+# the FAISS result). `run_query` therefore resolves the shard ONCE, then runs
+# the FAISS search inline while the recall scan runs on a worker thread, so the
+# union's wall-time is ~max(consolidated, recall) instead of their sum — erasing
+# the measured ~15 ms additive recall tax. Both genuinely overlap under the GIL:
+# FAISS releases it during its C++ search and psycopg2 releases it during the
+# network round-trip.
+#
+# `_RECALL_EXECUTOR`: a module-level, BOUNDED ThreadPoolExecutor for the recall
+# half of the overlap. A shared pool (not a per-call thread) avoids unbounded
+# thread creation under query_dp concurrency; the bound is sized to track that
+# concurrency so it does not serialize requests by starving on workers. Each
+# query submits exactly ONE recall task and immediately runs FAISS inline, so a
+# pool of N workers supports N concurrent overlapping queries; beyond that a
+# query's recall task simply queues behind the FAISS work it would have waited on
+# anyway (no correctness impact, graceful degradation under saturation). The
+# default tracks a modest data-plane fan-out and is overridable via
+# `RB_RECALL_OVERLAP_WORKERS` for high-concurrency deployments.
+#
+# RELATION TO `RB_RECALL_POOL_MAX` (state.py, default 10): this executor bound is
+# INDEPENDENT of the recall connection pool, and it is the pool — NOT this
+# executor — that is the recall-concurrency limiter. The default (32) is
+# deliberately wider than the default pool (10): once more than `RB_RECALL_POOL_MAX`
+# recall tasks are in flight, the excess block on `recall_pooled_conn()` and, on
+# sustained exhaustion, raise `PoolCheckoutTimeout` → the typed `RecallUnavailable`
+# → a 503 `recall_unavailable`. So this bound provides NO real backpressure; sizing
+# it generously just avoids the executor itself serializing the submit step. It
+# should TRACK `RB_RECALL_POOL_MAX` (keep it >= the pool) — a value below the pool
+# would cap recall concurrency at the executor instead, leaving pool capacity idle.
+# This is not a regression vs the serial path: concurrent recall load equals the
+# number of in-flight requests in BOTH the serial and overlap designs, so the pool
+# enforces the same ceiling either way.
+_RECALL_OVERLAP_WORKERS = max(1, int(os.getenv("RB_RECALL_OVERLAP_WORKERS", "32")))
+_RECALL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_RECALL_OVERLAP_WORKERS,
+    thread_name_prefix="recall-overlap",
+)
+
+
+def _watermark_for_shard(shard: Optional[Dict[str, Any]]) -> int:
+    """Resolve the recall watermark from the consolidated-search's resolved shard (I3).
+
+    The watermark is the `consolidated_lsn` of the shard the consolidated search ACTUALLY
+    resolved — every recall row with `lsn > watermark` is unconsolidated and must
+    be unioned in. If no shard exists yet (`shard is None`), the watermark is `0`
+    so ALL recall rows qualify (a brand-new dataset's writes live only in recall).
+    A shard row predating migration 008, or the memory-mode shard row that has no
+    `consolidated_lsn` field, defaults to `0` — backward-compatible with the
+    `NOT NULL DEFAULT 0` column.
+    """
+    if not shard:
+        return 0
+    raw = shard.get("consolidated_lsn", 0)
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _frontier_watermark(resolved: Optional[Dict[str, Any]]) -> int:
+    """Recall watermark from the resolved base+delta SET — the contiguous frontier.
+
+    Replaces `_watermark_for_shard` for the multi-shard (flag-on) case. The base
+    anchors at its `covered_lsn_hi` (falling back to `consolidated_lsn` when
+    `hi == 0`, for legacy/base-only rows written before migration 009). Each delta,
+    ordered by `covered_lsn_lo`, must CONTIGUOUSLY extend the cover:
+    `lo[i] == prev_hi + 1`. The watermark is the LAST contiguous `hi`.
+
+    If there is a GAP (a delta missing from a stale catalog cache, so the resolved
+    set's bands do not abut), the frontier is CLAMPED to the contiguous max BEFORE
+    the gap (the conservative MIN). Recall then re-serves the uncovered band —
+    over-serving is safe (suppression dedups); under-serving (the `max()` bug)
+    would silently drop the (clamped, gap] vectors into neither tier (§5.1, I1).
+
+    This NEVER returns `max(consolidated_lsn)` over the set: a `max()` watermark
+    with an unreadable/omitted delta is a silent partition hole. When the resolved
+    dict carries no `"shards"` (no shard, or the flag-off path slipping through),
+    the watermark is 0 so ALL recall rows qualify.
+    """
+    if not resolved:
+        return 0
+    shards = resolved.get("shards")
+    if not shards:
+        return 0
+    ordered = sorted(shards, key=lambda s: (int(s.get("covered_lsn_lo", 0) or 0), s.get("id", 0)))
+    base = ordered[0]
+    # Base anchor: its covered_lsn_hi, or consolidated_lsn for a legacy row.
+    hi = int(base.get("covered_lsn_hi", 0) or 0)
+    if hi <= 0:
+        hi = int(base.get("consolidated_lsn", 0) or 0)
+    frontier = hi
+    for delta in ordered[1:]:
+        lo = int(delta.get("covered_lsn_lo", 0) or 0)
+        d_hi = int(delta.get("covered_lsn_hi", 0) or 0)
+        if lo == frontier + 1:
+            # Contiguous: extend the frontier to this delta's hi.
+            frontier = d_hi
+        else:
+            # GAP (lo skips ahead) or an out-of-order/overlapping band — clamp to
+            # the contiguous max so far. Do NOT advance past the hole.
+            break
+    return frontier
+
+
+def _tombstone_suppress_ids(resolved: Optional[Dict[str, Any]]) -> set:
+    """Map the resolved deltas' int64 catalog tombstones back to STRING ids.
+
+    A fold whose lsn is already `<= watermark` carries the deleted cold ids as
+    `tombstone_int_ids` (int64 hashes) on its delta row. Those ids are below the
+    frontier, so recall does NOT cover them (recall only owns `lsn > frontier`) —
+    the cold-vs-cold delete must be applied at the read by suppressing the matching
+    cold id. We invert each int64 to its string id via the per-shard `.meta.json`
+    sidecars (the sidecar maps `str(int64) -> {id, metadata}`) and return the set
+    to extend `recall_suppress_ids` with. The merge then drops those cold ids.
+
+    Best-effort per int64: a tombstone whose sidecar entry is missing (an
+    unreadable sidecar, or an id not present in any resolved shard's sidecar) is
+    skipped — over-suppression would drop a live id, so we only suppress an id we
+    can positively resolve. The cold id is then physically purged at the next
+    major compaction regardless (PR-D).
+    """
+    if not resolved:
+        return set()
+    tombstones = resolved.get("delta_tombstone_int_ids") or []
+    if not tombstones:
+        return set()
+    shards = resolved.get("shards") or []
+    # Build a single int64(str) -> string-id lookup across all resolved sidecars.
+    lookup: Dict[str, str] = {}
+    for shard in shards:
+        uri = shard.get("shard_uri")
+        if not uri:
+            continue
+        # `read_shard_sidecar` already swallows missing/unreadable-sidecar errors
+        # and returns `{}` (its docstring guarantees graceful degradation), so a
+        # try/except here would be unreachable dead code (review #11).
+        sidecar = read_shard_sidecar(uri)
+        for k, entry in sidecar.items():
+            if k not in lookup and isinstance(entry, dict):
+                sid = entry.get("id")
+                if sid is not None:
+                    lookup[k] = sid
+    suppress: set = set()
+    for t in tombstones:
+        sid = lookup.get(str(int(t)))
+        if sid is not None:
+            suppress.add(sid)
+    return suppress
+
+
+def _merge_recall_and_consolidated(
+    recall_suppress_ids: set,
+    recall_matches: List[dict],
+    consolidated_matches: List[dict],
+    top_k: int,
+) -> List[dict]:
+    """Union recall + consolidated matches: recall-authoritative suppression, then top_k.
+
+    Rules (docs/architecture/recall-consolidate.md, "Read path — the union",
+    "Dedup"):
+      - **Recall is authoritative for any id above the watermark.** Recall
+        suppresses the stale consolidated copy of EVERY id it has a row for —
+        `recall_suppress_ids` is the FULL set of recall ids above the watermark
+        (live, tombstoned, filtered-out, and ranked-past-top_k alike). A consolidated
+        match survives only if recall has NO row for its id. This closes the leak
+        where a live re-upsert that fails the filter (or ranks past `top_k`) let a
+        stale, filter-matching consolidated copy surface.
+      - **Only filter-passing live recall rows are MATCHES.** `recall_matches`
+        are exactly those rows; a tombstone or a filtered-out live row
+        contributes NO match (it only suppresses, via `recall_suppress_ids`).
+      - **Sort + truncate.** The surviving matches (recall matches + the
+        un-suppressed consolidated matches) are sorted ascending by L2² `score` and
+        truncated to `top_k`.
+
+    Both inputs already carry FAISS-aligned L2² `score`s (the recall scan squares
+    pgvector's `<->`), so a single ascending sort over the union ranks correctly.
+    """
+    # Recall matches always survive; consolidated matches survive only if recall has NO
+    # row for that id (suppression keys on the FULL recall id-set, not just the
+    # ids that became matches).
+    merged: List[dict] = [
+        {"id": r["id"], "score": r["score"], "metadata": r["metadata"]}
+        for r in recall_matches
+    ]
+    merged.extend(m for m in consolidated_matches if m["id"] not in recall_suppress_ids)
+    # Stable ascending sort by L2² distance; truncate to top_k.
+    merged.sort(key=lambda m: m["score"])
+    return merged[:top_k]
+
+
 def run_query(tenant_id: str, parsed: _ParsedQuery) -> Union[JSONResponse, dict]:
     """Run the hot/ephemeral search for an already-validated query.
 
@@ -1329,8 +1865,17 @@ def run_query(tenant_id: str, parsed: _ParsedQuery) -> Union[JSONResponse, dict]
     mode:"ephemeral"}` with HTTP 200). An exception now classifies into a v1
     error envelope and returns the 503 (or class-specific code) directly —
     the ephemeral fallback is reserved for its actual semantics: the dataset
-    legitimately has no shard yet. `_hot_search` returns `None` ONLY in that
-    case.
+    legitimately has no shard yet. The consolidated search returns `None` ONLY
+    in that case.
+
+    OVERLAP (#31): with the recall union on, the consolidated FAISS search and
+    the recall scan are INDEPENDENT given the resolved shard's watermark (recall
+    needs only the watermark, not the FAISS result). So this resolves the shard
+    ONCE, submits `recall_search` to a worker thread, runs the FAISS search
+    INLINE, and joins the recall future — the union's wall-time is
+    ~max(consolidated, recall) instead of their sum (erasing the ~15 ms recall
+    tax). With recall off the consolidated-only path runs sequentially, exactly
+    as before.
     """
     start = time.time()
     dataset_name = parsed.dataset_name
@@ -1339,45 +1884,295 @@ def run_query(tenant_id: str, parsed: _ParsedQuery) -> Union[JSONResponse, dict]
     flt = parsed.filter
     nprobe_override = parsed.nprobe
 
-    # Hot path. A raised exception means the search could not run (cache fs
-    # unwritable, S3 fetch failed, FAISS index unreadable, etc.) — that is
-    # NOT the same as "no shard exists yet" and must NOT silently fall through
-    # to the ephemeral path. Classify it into a v1 error envelope so the
-    # caller sees an explicit 503 with a structured code, never an empty 200.
+    # Recall-tier union gate. DEFAULT-OFF: with `RB_RECALL` off (or no
+    # `RB_RECALL_DSN`) this is False and the consolidated-only branch below NEVER
+    # opens a recall connection, never resolves a watermark, and is byte-identical
+    # to today. Read once per query so the rest of the function branches on a
+    # single stable value.
+    union_on = recall_enabled()
+
+    if not union_on:
+        # --- Consolidated-only path (recall off) --------------------------
+        # Sequential `_resolve_shard` + `_search_consolidated_shard` via the
+        # `_consolidated_search` composition — byte-identical to the old
+        # `_hot_search` path: no recall, no thread. A raised exception means the
+        # search could not run (cache fs unwritable, S3 fetch failed, FAISS index
+        # unreadable, etc.) — NOT "no shard exists yet" — and must NOT silently
+        # fall through to the ephemeral path; classify it into a v1 error envelope.
+        try:
+            hot = _consolidated_search(
+                tenant_id, dataset_name, vector_f, top_k, flt, nprobe_override
+            )
+        except Exception as exc:  # noqa: BLE001
+            code, safe_message = _classify_hot_path_error(exc)
+            print(
+                "v1_query: hot path failed: "
+                f"tenant={tenant_id} dataset={dataset_name} "
+                f"exc_class={type(exc).__name__} exc={exc!r} code={code}"
+            )
+            # 503 for storage/cache transient errors (retry-safe); 500 for the
+            # generic catch-all (an unexpected exception is a server bug, not a
+            # transient resource failure).
+            status = 500 if code == "ephemeral_error" else 503
+            return _err(status, code, safe_message)
+
+        if hot is not None:
+            matches, mode = hot
+            counter("query_reads", 1)
+            counter("cache_hit", 1)
+            latency_ms = int((time.time() - start) * 1000.0)
+            timer("latency_ms", latency_ms)
+            # rosalinddb.queries{mode} + rosalinddb.query.duration{mode}.
+            # `mode` (hot|cold) is the only label — no tenant/dataset.
+            obs_metrics.record_query(mode)
+            obs_metrics.record_query_duration(latency_ms, mode)
+            # Count filtered queries and record the post-filter result count so
+            # a highly selective filter (few survivors) is observable.
+            if flt:
+                obs_metrics.record_filtered_query()
+                obs_metrics.record_filtered_result_count(len(matches))
+            return {"matches": matches, "latency_ms": latency_ms, "mode": mode}
+
+        # No shard yet → fall through to the ephemeral runner below.
+        return _enqueue_ephemeral(tenant_id, dataset_name, vector_f, top_k, flt, start)
+
+    # --- Recall-tier union (RB_RECALL on): OVERLAP consolidated + recall ---
+    #
+    # Resolve the shard FIRST (cheap catalog lookup), then run the FAISS search
+    # and the recall scan CONCURRENTLY: recall needs only the watermark from the
+    # resolution, not the FAISS result. The recall scan is scoped to rows ABOVE
+    # the resolved shard's watermark (I3); when no shard exists yet the watermark
+    # is 0 so ALL recall rows qualify — this is what lets a brand-new dataset's
+    # just-written vectors be answered SYNCHRONOUSLY from recall instead of forced
+    # down the ephemeral path (docs/architecture/recall-consolidate.md, "Read path
+    # — the union"). A recall-store failure maps to the same v1 503 envelope as a
+    # consolidated-path storage failure — the union must not 500.
+    #
+    # SPAN SHAPE (independent siblings, both timed in wall-clock overlap):
+    #     request span
+    #       ├─ query.hot_search   (resolve + inline FAISS — CONSOLIDATED ONLY)
+    #       └─ recall.search      (the parallel recall scan, on the worker)
+    # `query.hot_search` must measure the CONSOLIDATED search ALONE — bench
+    # dashboards + latency attribution read it as the consolidated-search latency —
+    # so its `with` block wraps ONLY the resolve + inline FAISS and the recall
+    # future is joined AFTER the block closes; the join (the `max(...)` wait) is
+    # NEVER inside `query.hot_search`. `recall.search` is a SIBLING of
+    # `query.hot_search` under the request span, not a child: recall is a parallel,
+    # independent operation, not part of the consolidated search. To get that
+    # parentage the worker re-attaches the context captured BEFORE entering
+    # `hot_search_span` (the request-span context) — OTel current-context is
+    # thread-local and does NOT auto-propagate to a freshly-scheduled worker, so
+    # without this the `recall.search` span would become an orphaned trace root.
+    # The overlap (latency win) is preserved regardless: FAISS runs inline while
+    # recall runs on the worker; only the JOIN moved out of the span. The span
+    # literal stays `query.hot_search` (bench/attribution key on it; rename #33).
+    #
+    # Capture the request-span context BEFORE opening `hot_search_span` so the
+    # recall worker parents `recall.search` to the REQUEST span (sibling of
+    # `query.hot_search`), never to `query.hot_search`.
+    parent_ctx = otel_context.get_current()
+
+    # Bound BEFORE the try so the `finally` join can always assign them, even if a
+    # `BaseException` propagates straight out of the inline consolidated branch.
+    recall_future = None
+    consolidated_exc: Optional[BaseException] = None
+    hot = None
+    recall_exc: Optional[BaseException] = None
+    recall_suppress_ids: set = set()
+    recall_matches: List[dict] = []
     try:
-        hot = _hot_search(tenant_id, dataset_name, vector_f, top_k, flt, nprobe_override)
-    except Exception as exc:  # noqa: BLE001
-        code, safe_message = _classify_hot_path_error(exc)
+        with hot_search_span(tenant=tenant_id, dataset=dataset_name):
+            # I3 watermark pairing: resolve WHICH shard the consolidated search will
+            # read so the recall scan filters with that exact shard's
+            # `consolidated_lsn` — never a watermark resolved independently.
+            # Resolution is the cheap catalog lookup; a raised exception here is a
+            # consolidated-path failure and maps to the consolidated error envelope.
+            # The recall future has not been submitted yet at this point, so there
+            # is nothing to join when we return early here.
+            resolved: Optional[Dict[str, Any]] = {}
+            try:
+                resolved = _resolve_shard(tenant_id, dataset_name, resolved)
+            except Exception as exc:  # noqa: BLE001
+                return _consolidated_error_response(tenant_id, dataset_name, exc)
+
+            # `resolved` is None when no shard exists yet → watermark 0, all
+            # recall rows qualify. With the delta tier ON, `resolved` carries a
+            # base+delta SET under `"shards"` and the watermark is the contiguous
+            # FRONTIER over that set (gap-clamped, never `max()` — §5.1). With it
+            # OFF, `resolved` carries a single `"shard"` and the watermark is its
+            # `consolidated_lsn` exactly as today (I3). One function picks the
+            # right reader off the resolved shape so both paths pair the watermark
+            # to exactly the shard(s) the consolidated search read.
+            if resolved and resolved.get("shards") is not None:
+                watermark = _frontier_watermark(resolved)
+            else:
+                watermark = _watermark_for_shard(
+                    resolved.get("shard") if resolved else None
+                )
+
+            def _recall_worker():
+                # Re-attach the REQUEST context (captured above, before
+                # `hot_search_span` opened) inside the worker so `recall.search`
+                # parents to the request span as a sibling of `query.hot_search`;
+                # detach in a finally so the worker thread's context is left clean
+                # for its next pool task.
+                token = otel_context.attach(parent_ctx)
+                try:
+                    # `recall_search` returns (suppress_ids, matches): the FULL set
+                    # of recall ids above the watermark (for authoritative
+                    # suppression of the stale consolidated copy) AND only the
+                    # filter-passing live rows.
+                    return recall_search(
+                        tenant_id, dataset_name, vector_f, top_k, watermark, flt
+                    )
+                finally:
+                    otel_context.detach(token)
+
+            # Submit recall to the worker, run the FAISS search INLINE — they
+            # overlap. The FAISS search runs UNDER `query.hot_search`; recall runs
+            # on the worker under the request span (sibling).
+            recall_future = _RECALL_EXECUTOR.submit(_recall_worker)
+
+            # Run the consolidated FAISS search inline on the already-resolved
+            # shard. Its exception is captured (not raised here) so the recall
+            # future is ALWAYS joined — never leaked — before any error is returned.
+            try:
+                hot = _search_consolidated_shard(
+                    tenant_id, dataset_name, vector_f, top_k, flt, nprobe_override,
+                    resolved,
+                )
+            except Exception as exc:  # noqa: BLE001
+                consolidated_exc = exc
+        # `query.hot_search` is now CLOSED — its duration covers only resolve +
+        # inline FAISS, NOT the recall wait below.
+    finally:
+        # Join the recall future OUTSIDE `query.hot_search` so the wait does not
+        # inflate the consolidated-search span. The join lives in `finally` so the
+        # in-flight recall worker is NEVER abandoned regardless of how the inline
+        # consolidated branch exits — including a `BaseException`
+        # (KeyboardInterrupt/SystemExit) the `except Exception` above does not
+        # catch, which would otherwise propagate out and skip the join.
+        if recall_future is not None:
+            try:
+                recall_suppress_ids, recall_matches = recall_future.result()
+            except Exception as exc:  # noqa: BLE001
+                recall_exc = exc
+
+    # BOTH-ERROR PRECEDENCE (documented, deterministic): if both branches failed,
+    # report the CONSOLIDATED error first. This is the pre-overlap behaviour's
+    # ordering — the consolidated search ran (and could fail) before recall in the
+    # old serial code — so it preserves which envelope a double failure surfaced.
+    # Either way each branch's exception maps to the SAME envelope it mapped to
+    # serially: a consolidated/FAISS error → `_classify_hot_path_error` → 503
+    # (storage/transient) or 500 (ephemeral_error); a recall error (incl. the
+    # typed `RecallUnavailable`) → its 503 `recall_unavailable`. A recall failure
+    # is NEVER masked, and a consolidated failure is NEVER reported as a recall
+    # error (or vice-versa).
+    if consolidated_exc is not None:
+        return _consolidated_error_response(tenant_id, dataset_name, consolidated_exc)
+    if recall_exc is not None:
+        code, safe_message = _classify_hot_path_error(recall_exc)
         print(
-            "v1_query: hot path failed: "
+            "v1_query: recall search failed: "
             f"tenant={tenant_id} dataset={dataset_name} "
-            f"exc_class={type(exc).__name__} exc={exc!r} code={code}"
+            f"exc_class={type(recall_exc).__name__} exc={recall_exc!r} code={code}"
         )
-        # 503 for storage/cache transient errors (retry-safe); 500 for the
-        # generic catch-all (an unexpected exception is a server bug, not a
-        # transient resource failure).
         status = 500 if code == "ephemeral_error" else 503
         return _err(status, code, safe_message)
 
+    # `cold_mode` reflects the consolidated shard's cache state (hot|cold); when no
+    # consolidated shard exists it is None and the response `mode` reports `recall`
+    # — the consolidated tier contributed nothing, recall answered. See the docs
+    # note on `mode` semantics in the no-consolidated-shard case.
     if hot is not None:
-        matches, mode = hot
+        consolidated_matches, cold_mode = hot
+    else:
+        consolidated_matches, cold_mode = [], None
+
+    # Delta-tier cold-vs-cold delete suppression (flag on): extend the recall
+    # suppress set with the resolved deltas' catalog tombstones, mapped from int64
+    # back to STRING ids via the per-shard sidecars. These ids were deleted by a
+    # fold whose lsn is already `<= frontier`, so recall does NOT cover them — the
+    # delete must be applied at the read by suppressing the matching cold id. The
+    # tombstones are read from the SAME resolved rows the frontier derived from, so
+    # they are version-atomic with the watermark (§3.3). `_merge_recall_and_consolidated`
+    # itself is UNCHANGED — only its `recall_suppress_ids` input grows. When the flag
+    # is off `resolved` has no `delta_tombstone_int_ids`, so this is a no-op.
+    if resolved and resolved.get("delta_tombstone_int_ids"):
+        cold_tombstones = _tombstone_suppress_ids(resolved)
+        if cold_tombstones:
+            # Do not mutate the recall worker's returned set in place; the merge
+            # reads the union of recall ids + cold tombstones.
+            recall_suppress_ids = set(recall_suppress_ids) | cold_tombstones
+
+    # If there is neither a consolidated shard NOR any recall row, fall through to
+    # the ephemeral path exactly as the consolidated-only path would (the dataset is
+    # genuinely empty for this query). No recall id above the watermark AND
+    # hot being None means nothing can answer synchronously. (`suppress_ids`
+    # is non-empty iff there is ANY recall row, including tombstones — a
+    # tombstone-only recall set with no consolidated shard still has nothing to
+    # return, but suppression-only is harmless and the merge yields [].)
+    if not (hot is None and not recall_suppress_ids):
+        matches = _merge_recall_and_consolidated(
+            recall_suppress_ids, recall_matches, consolidated_matches, top_k
+        )
+        # `mode`: the consolidated-shard cache state when a shard was read; `recall`
+        # when only recall could answer (no consolidated shard). The recall tier
+        # contributed regardless — documented in docs/api/query.md.
+        mode = cold_mode if cold_mode is not None else "recall"
         counter("query_reads", 1)
         counter("cache_hit", 1)
         latency_ms = int((time.time() - start) * 1000.0)
         timer("latency_ms", latency_ms)
-        # rosalinddb.queries{mode} + rosalinddb.query.duration{mode}.
-        # `mode` (hot|cold) is the only label — no tenant/dataset.
         obs_metrics.record_query(mode)
         obs_metrics.record_query_duration(latency_ms, mode)
-        # Count filtered queries and record the post-filter result count so
-        # a highly selective filter (few survivors) is observable.
         if flt:
             obs_metrics.record_filtered_query()
             obs_metrics.record_filtered_result_count(len(matches))
         return {"matches": matches, "latency_ms": latency_ms, "mode": mode}
 
-    # No shard yet → fall back to the ephemeral runner. The runner does its
-    # own FAISS search + sidecar lookup and publishes RESULT_READY.
+    # No shard AND no recall row → ephemeral enqueue (shared with the off path).
+    return _enqueue_ephemeral(tenant_id, dataset_name, vector_f, top_k, flt, start)
+
+
+def _consolidated_error_response(
+    tenant_id: str, dataset_name: str, exc: BaseException
+) -> JSONResponse:
+    """Map a consolidated/FAISS-path exception to its v1 error envelope.
+
+    Identical classification + status mapping the serial `_hot_search` path used:
+    `_classify_hot_path_error(exc)` → 503 for storage/cache transient errors
+    (retry-safe) or 500 for the generic `ephemeral_error` catch-all. Extracted so
+    both the recall-on overlap path (resolution failure and the inline FAISS
+    failure) and a single call site share ONE consolidated-error mapping — a
+    consolidated failure is NEVER reported as a recall error.
+    """
+    code, safe_message = _classify_hot_path_error(exc)
+    print(
+        "v1_query: hot path failed: "
+        f"tenant={tenant_id} dataset={dataset_name} "
+        f"exc_class={type(exc).__name__} exc={exc!r} code={code}"
+    )
+    status = 500 if code == "ephemeral_error" else 503
+    return _err(status, code, safe_message)
+
+
+def _enqueue_ephemeral(
+    tenant_id: str,
+    dataset_name: str,
+    vector_f: List[float],
+    top_k: int,
+    flt: Dict[str, Any],
+    start: float,
+) -> dict:
+    """Enqueue an ephemeral query and return the `{matches:[], mode:ephemeral}` shape.
+
+    The dataset has no shard yet (and, with recall on, no recall row either), so
+    nothing can answer synchronously. The ephemeral runner does its own FAISS
+    search + sidecar lookup and publishes RESULT_READY; the caller polls
+    `GET /v1/query/status/{job_id}`. Shared by the recall-off and recall-on paths
+    so the enqueue shape, metrics, and `job_id` are byte-identical in both.
+    """
     correlation_id = "job_" + uuid.uuid4().hex
     publish(
         "RUN_EPHEMERAL_QUERY",

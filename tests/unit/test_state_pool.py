@@ -474,3 +474,103 @@ def test_request_conn_contextvar_visible_in_worker_thread(monkeypatch):
         assert fake._out == 0
     finally:
         importlib.reload(state_mod)
+
+
+# --- commit-leak regression (task #27) ------------------------------------
+#
+# `pooled_conn()`'s standalone clean-exit branch used to be a bare
+#   `conn.commit(); pool.putconn(conn)`
+# with NO try/finally — so if `conn.commit()` itself raised (broken backend /
+# TLS reset / statement_timeout on COMMIT), `putconn()` never ran and the
+# connection leaked from the pool's accounting, permanently shrinking the pool.
+# `recall_pooled_conn()` already had the corrected commit-then-return-in-finally
+# pattern (PR #15 P2 review); this mirrors it into the control-plane pool. The
+# test is the control-plane analogue of
+# `tests/unit/test_recall_pool.py::test_recall_pooled_conn_returns_conn_when_commit_raises`.
+
+
+class _SeededPool:
+    """A pool stub that hands out a PRE-SEEDED connection and tracks checkout.
+
+    Unlike `_FakePool` (which mints a fresh `_FakeConn` per `getconn`), this hands
+    out a specific connection so a commit-raising conn can be injected, and
+    records `_out` so the test proves the conn was RETURNED even when commit
+    raised. Non-empty `_pool` keeps the `reused` probe in `pooled_conn()` happy.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._free = [conn]
+        self._pool = [object()]
+        self._out = 0
+
+    def getconn(self):
+        import psycopg2.pool as _pp
+
+        if not self._free:
+            raise _pp.PoolError("connection pool exhausted")
+        self._out += 1
+        return self._free.pop()
+
+    def putconn(self, conn):
+        self._out -= 1
+        self._free.append(conn)
+
+
+class _CommitRaisesConn:
+    """A control-plane conn whose `commit()` RAISES (broken backend / COMMIT timeout)."""
+
+    def __init__(self):
+        self.commits = 0
+        self.rollbacks = 0
+
+    def commit(self):
+        self.commits += 1
+        raise RuntimeError("COMMIT failed: server closed the connection unexpectedly")
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+def test_pooled_conn_returns_conn_when_commit_raises(monkeypatch):
+    """A clean standalone block whose `commit()` raises STILL returns the conn.
+
+    REGRESSION (task #27, mirror of the recall pool fix): if `conn.commit()` on
+    the standalone clean-exit path raises, the exception must propagate — but the
+    connection must NOT be leaked. A leak permanently shrinks the pool's `_out`
+    accounting, so repeated commit failures eventually exhaust the pool and every
+    checkout 503s. The fix wraps `commit()` in try/finally so `putconn()` runs on
+    every exit, exactly as `recall_pooled_conn()` already does.
+    """
+    monkeypatch.setenv("DATABASE_URL", "memory://local")
+    import adapters.state.state as state_mod
+
+    importlib.reload(state_mod)
+    try:
+        bad = _CommitRaisesConn()
+        pool = _SeededPool(bad)
+        monkeypatch.setattr(state_mod, "_MEMORY_MODE", False)
+        monkeypatch.setattr(state_mod, "_POOL", pool)
+        assert state_mod._REQUEST_CONN.get() is None
+
+        # (a) the commit failure propagates out of the block.
+        with pytest.raises(RuntimeError, match="COMMIT failed"):
+            with state_mod.pooled_conn() as conn:
+                assert conn is bad
+
+        # commit() was attempted exactly once on the clean-exit path, no rollback.
+        assert bad.commits == 1, "clean exit must attempt commit() exactly once"
+        assert bad.rollbacks == 0, "clean exit must not roll back"
+        # (b) the connection is STILL returned to the pool — not leaked.
+        assert pool._out == 0, "commit() failure leaked the conn from the pool"
+
+        # And the returned conn is reusable: the next checkout gets it back (no
+        # new conn). Raise inside the block so it returns via the rollback path
+        # WITHOUT re-invoking the still-failing commit().
+        with pytest.raises(ValueError):
+            with state_mod.pooled_conn() as conn2:
+                assert conn2 is bad
+                raise ValueError("force the rollback-and-return path")
+        assert pool._out == 0, "the reused conn leaked on the exception path"
+    finally:
+        importlib.reload(state_mod)

@@ -1,0 +1,76 @@
+@startuml recall-internal-model
+' STRUCTURE / data-model of the Recall tier IN ISOLATION (independent of the
+' Consolidate tandem). The Recall tier is a SEPARATE data-plane pgvector
+' instance addressed by RB_RECALL_DSN -- NEVER the control-plane Postgres
+' (blast-radius isolation). Two tables: recall_vectors (the rows + tombstones)
+' and recall_lsn_seq (the per-(tenant,dataset) monotonic LSN allocator).
+' Search is brute-force EXACT (no ANN by default); HNSW is a flagged escape
+' hatch that first needs a fixed-dimension migration.
+'
+' This is a clean STRUCTURE view -- the write/search/delete/bounding FLOWS are
+' the other recall-internal-* diagrams, not here.
+
+title Recall tier internals: data model on a separate pgvector instance
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam classAttributeIconSize 0
+skinparam nodesep 30
+skinparam ranksep 50
+
+package "Recall data-plane pgvector instance\n(RB_RECALL_DSN -- NOT the control-plane PG)" #F4F8FF {
+
+  entity "recall_lsn_seq" as seq {
+    .. PK (tenant_id, dataset) ..
+    + tenant_id : text
+    + dataset   : text
+    --
+    last_lsn   : bigint
+  }
+
+  entity "recall_vectors" as rv {
+    .. PK (tenant_id, dataset, id) ..
+    + tenant_id : text
+    + dataset   : text
+    + id        : text
+    --
+    embedding  : vector  (UNPARAMETERISED)
+    metadata   : jsonb
+    lsn        : bigint
+    deleted    : bool  (tombstone)
+    created_at : timestamptz
+  }
+
+  entity "recall_vectors_partition_idx" as idx {
+    b-tree (tenant_id, dataset, lsn)
+  }
+}
+
+seq --> rv : stamps lsn per (tenant, dataset)
+idx ..> rv : scopes scan to one partition
+
+note right of rv #E9F7E9
+  Search is BRUTE-FORCE EXACT L2:
+  jump to one (tenant, dataset) via the
+  b-tree, then exact <-> over those rows.
+  No ANN by default -- the set is kept SMALL
+  by the cap + idle drain, so a full-partition
+  scan is sub-ms with ZERO recall loss.
+  HNSW (RB_RECALL_INDEX=hnsw) is a flagged
+  escape hatch: it needs a FIXED dim, so the
+  unparameterised `vector` must be migrated first.
+end note
+
+note bottom of seq #FDF3E7
+  recall_lsn_seq is a TABLE, not a Postgres SEQUENCE:
+  one row per (tenant, dataset). An atomic
+  upsert-increment (last_lsn = last_lsn + N RETURNING)
+  is serialised by Postgres on that row -> lsn is
+  strictly monotonic per partition. Lives HERE in the
+  recall store, so the write path never touches the CP.
+end note
+
+@enduml

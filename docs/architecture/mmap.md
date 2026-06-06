@@ -9,10 +9,10 @@
 The per-tenant default `_DEFAULT_VECTOR_QUOTA = 100000`
 ([`adapters/state/state.py`](../../adapters/state/state.py)) is not a product
 limit. It is the largest single shard that fits the legacy
-`faiss.read_index(local_path)` path against a 512 MB cache budget.
+`faiss.read_index(local_path)` path against a 1 GiB cache budget.
 
 A 1M-vector, 1536-dim shard is ~6.3 GB on disk and ~6.1 GB resident once
-deserialised — it cannot enter a 512 MB LRU without evicting itself and
+deserialised — it cannot enter a 1 GiB LRU without evicting itself and
 everything around it, so past that threshold the cache stops working as a
 cache. Mmap lifts the limit at the kernel layer: the on-disk index is mapped
 into the query process's address space and only the touched IVF cells are
@@ -58,7 +58,8 @@ the on-disk index file via `mmap(2)` instead of slurping it into RSS. The flag
 replaces the in-RAM `InvertedLists` object with an `OnDiskInvertedLists` that
 keeps a small offset table in RAM (one entry per IVF cell) and lets the kernel
 fault posting-list pages into the page cache on first access. The flag is
-threaded through exactly one call site — the cold-load branch in `_hot_search`
+threaded through exactly one call site — the cold-load branch in
+`_search_consolidated_shard`
 in [`services/query_api/v1_query.py`](../../services/query_api/v1_query.py) and
 its mirror in [`services/ephemeral_runner/run.py`](../../services/ephemeral_runner/run.py)
 — and is gated on `RB_FAISS_MMAP` so a rollback is one env-var flip.
@@ -75,7 +76,7 @@ The byte-budgeted cache accounts for an mmap'd entry with the
 `_MMAP_INDEX_ESTIMATE_BYTES = 32 MiB` constant in `v1_query.py`. That number
 is deliberately conservative — large enough that an unbounded number of mmap'd
 entries still pressures the LRU toward eviction, small enough that the
-default 512 MB cache holds many warm shards. Tune it in one place when
+default 1 GiB cache holds many warm shards. Tune it in one place when
 production traces give us a better number.
 
 The shape of an mmap'd FAISS object inside the query process is small in

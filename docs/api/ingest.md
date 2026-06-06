@@ -71,6 +71,30 @@ subsequent `GET` returns `404 dataset_not_found`. The shard catalog rows
 are purged synchronously in the same transaction; the underlying
 object-storage bytes are reclaimed by a background sweep.
 
+## Get / list / delete individual vectors
+
+Operate on a single vector by its customer-supplied string id, served from
+the consolidated shards. Full reference: [`vectors.md`](./vectors.md).
+
+```bash
+# get one vector's id + metadata
+curl -s http://localhost:8080/v1/datasets/products/vectors/doc-42 \
+  -H "Authorization: Bearer $TOKEN"
+
+# list (paginated; optional metadata filter as URL-encoded JSON)
+curl -s "http://localhost:8080/v1/datasets/products/vectors?limit=100" \
+  -H "Authorization: Bearer $TOKEN"
+
+# delete by id (async: returns 202 {job_id}; poll dataset status to confirm)
+curl -s -X DELETE http://localhost:8080/v1/datasets/products/vectors/doc-42 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+`list` returns `{vectors: [{id, metadata}], next_cursor}` — follow
+`next_cursor` to page. `delete` is asynchronous and eventually consistent
+(same contract as upload): the vector disappears from get/list/query once the
+builder rewrites the shard. The raw vector values are not returned in v1.
+
 ## Tenant isolation
 
 All endpoints filter by `current_tenant_id` resolved from the bearer token

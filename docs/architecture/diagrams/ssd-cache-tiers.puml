@@ -70,7 +70,7 @@ end note
 
 note bottom of ram
   Working set. Bytes-budgeted LRU at
-  RB_SHARD_CACHE_BYTES (default 512 MB).
+  RB_SHARD_CACHE_BYTES (default 1 GiB).
   Under mmap, FAISS pages live in the
   kernel page cache, not RSS.
 end note

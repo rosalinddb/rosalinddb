@@ -67,6 +67,14 @@ QUEUE_MAX_ATTEMPTS = int(os.getenv("QUEUE_MAX_ATTEMPTS", "5"))
 _local_queues: dict[str, queue.Queue] = {
     "VALIDATE_DATASET": queue.Queue(),
     "DATASET_READY": queue.Queue(),
+    "DELETE_VECTORS": queue.Queue(),
+    # `CONSOLIDATE`: a (tenant, dataset) recall partition needs folding into a
+    # new Consolidated shard + the watermark advanced (the recall→consolidated
+    # flush). Enqueued by the per-tenant recall-row cap on the write path and by
+    # the builder's consolidate-on-idle sweep; consumed by the index builder
+    # (single-replica, per-dataset advisory lock). See
+    # docs/architecture/recall-consolidate.md, "Consolidation / flush".
+    "CONSOLIDATE": queue.Queue(),
     "SHARD_BUILT": queue.Queue(),
     "MERGE_READY": queue.Queue(),
     "RUN_EPHEMERAL_QUERY": queue.Queue(),

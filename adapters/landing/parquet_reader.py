@@ -10,6 +10,7 @@ Empty directories yield empty arrays so the builder can short-circuit without
 crashing.
 """
 
+import hashlib
 import io
 import json
 from typing import Dict, List, Tuple
@@ -19,6 +20,26 @@ import pyarrow.parquet as pq
 
 from adapters.observability.tracing import span as _span
 from adapters.storage.storage import _s3_client, _split_s3, read_bytes
+
+
+def id_to_int64(raw_id: str) -> int:
+    """Map a string id to a signed 63-bit int (FAISS IDMap accepts int64).
+
+    SHA1 then mask off the sign bit. FAISS rejects negative ids in IDMap so
+    we keep the top bit zero. Collisions are theoretically possible but
+    irrelevant at MVP scale (<1M vectors per dataset).
+
+    Shared by the index builder (which stamps these ids onto every FAISS
+    vector) and the consolidated-tier CRUD surface in `source_registry`
+    (get/delete-by-id, which must hash a customer's string id to the same
+    int64 the builder used as the sidecar key). It lives here, beside
+    `read_shard_sidecar`, because this module already owns the int64<->record
+    bridge — keeping the hash next to the sidecar reader means the two halves
+    of that bridge cannot drift apart. The builder re-exports it as the
+    private `_id_to_int64` so its existing call sites are unchanged.
+    """
+    h = hashlib.sha1(raw_id.encode("utf-8")).digest()
+    return int.from_bytes(h[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
 
 def read_shard_sidecar(shard_uri: str) -> Dict[str, dict]:

@@ -70,12 +70,14 @@ The ~10 most useful knobs. Every other env var lives in the source — grep
 | `RB_RATE_LIMIT_RPS` | Sustained rate-limit ceiling (when quotas enabled) | `50` |
 | `RB_RATE_LIMIT_BURST` | Burst capacity | `100` |
 | `RB_QUERY_NPROBE` | FAISS IVF nprobe — recall vs. latency knob | `64` |
-| `RB_SHARD_CACHE_BYTES` | Per-DP shard cache byte budget | `512 MiB` |
+| `RB_SHARD_CACHE_BYTES` | Per-DP shard cache byte budget | `1 GiB` |
 | `IMPORT_MAX_BYTES` | Bulk-import staged-upload size cap | `5 GiB` |
 | `RB_PG_POOL_MAX` | Per-process Postgres pool ceiling | `10` |
 | `CORS_ALLOW_ORIGINS` | Comma-separated extra CORS origins for browser clients | `""` (localhost dev range always allowed) |
 | `QUERY_DP_URL` | CP→DP reverse-proxy base URL | `http://localhost:8090` |
 | `RB_PROXY_SECRET` | Shared secret CP sends on every CP→DP call | unset → DP relies on network isolation |
+| `RB_RECALL_DSN` | Recall-tier pgvector DSN | unset → **recall tier off** (see [§3i](#i-recall-tier-read-your-writes)) |
+| `RB_RECALL` | Master switch for recall-tier behaviour | `false` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint | `http://localhost:4318` |
 | `OTEL_SDK_DISABLED` | Opt out of telemetry entirely | `false` |
 
@@ -311,6 +313,90 @@ The CP→DP wire contract:
 The DP has **no** `Authorization` parsing and **no** quota check — it trusts
 the verified `X-RB-Tenant-Id` header the CP sends. Do not expose the DP
 directly to users; route everything via the CP.
+
+### i. Recall tier — read-your-writes
+
+**Default OFF.** RosalindDB is eventually consistent on writes by default
+(`POST /vectors` lands data that an async build later folds into a shard). The
+**recall tier** adds a small, synchronously-writable, immediately-queryable
+tier in front of the immutable shards and unions the two at query time
+— so a just-written vector is visible on the very next query. The full design
+is in [`docs/architecture/recall-consolidate.md`](../architecture/recall-consolidate.md).
+
+The recall tier is a **separate data-plane pgvector instance**, deliberately *not*
+the control-plane Postgres: it is kept off the metadata DB so a tenant write
+storm against the recall tier can never starve the catalog reads that sit on every
+query's critical path ("blast-radius isolation"). The bundled compose stack
+ships a `pgvector` service (image `pgvector/pgvector:pg15`, on host port `5433`)
+for exactly this.
+
+It is entirely opt-in, controlled by these env vars:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `RB_RECALL_DSN` | DSN of the recall pgvector instance. Setting it makes the migrator apply the recall schema and lets services connect. | unset → off |
+| `RB_RECALL` | Master switch for recall-tier behaviour (sync recall write, query union, consolidation). | `false` |
+| `RB_RECALL_MAX_ROWS` | Per-`(tenant, dataset)` recall-row cap. After a recall write, if the partition exceeds this, the builder is asked (via a `CONSOLIDATE` message) to fold the partition into a Consolidated shard — bounding both memory and the union's brute-force recall scan. | `2000` |
+| `RB_RECALL_IDLE_S` | Idle window. A `(tenant, dataset)` whose newest recall write is older than this is consolidated to **zero** recall rows by the builder's idle sweep, so idle datasets stop touching pgvector (scale-to-zero). | `60` |
+
+Both `RB_RECALL_MAX_ROWS` and `RB_RECALL_IDLE_S` only take effect when the recall
+tier is on; with the flag off they are inert.
+
+**Flag-off is byte-identical to today.** With `RB_RECALL_DSN` unset (the default):
+
+- The `pgvector` container starts and goes healthy, but **nothing connects to
+  it** — `RB_RECALL_DSN` defaults to empty on every service and the code treats
+  blank/unset as "off" (no connection opened).
+- `python -m scripts.migrate` applies the control-plane schema exactly as
+  before, then prints `recall tier off (RB_RECALL_DSN unset); skipping recall schema`
+  and applies no recall migrations.
+- Every existing shard carries `consolidated_lsn = 0` (the migration 008 default),
+  so the query path takes the pure consolidated path and existing logic is untouched.
+
+If you do not want the extra idle container at all, simply do not start it:
+`docker compose up` brings up everything, or scope it with
+`docker compose up cp query_dp redis minio postgres ...` to omit `pgvector`.
+
+**Enabling it** (bundled pgvector):
+
+```bash
+export RB_RECALL_DSN=postgresql://postgres:postgres@pgvector:5432/recall
+export RB_RECALL=true
+docker compose up
+```
+
+The migrator waits for the recall instance, then applies the recall schema
+(`CREATE EXTENSION vector` + `recall_vectors` + the per-(tenant,dataset) LSN
+sequence table). For a non-compose deploy, point `RB_RECALL_DSN` at any pgvector
+instance and run `python -m scripts.migrate` — it migrates both the control
+plane and (when `RB_RECALL_DSN` is set) the recall instance. The embedding dimension
+is **per-dataset**: the `recall_vectors.embedding` column is an unparameterised
+pgvector `vector`, so one recall instance serves datasets of differing dimensions.
+
+When `RB_RECALL=true` (with `RB_RECALL_DSN` set), `POST /v1/datasets/{name}/vectors`
+becomes **synchronous**: each accepted record is assigned a per-(tenant,dataset)
+LSN and UPSERTed into the recall store (last-write-wins), then the endpoint returns
+**`200`** instead of `202` — the vector is durable and immediately queryable. In
+this mode the write does **not** land an object or publish a `VALIDATE_DATASET`
+build (those are the eventually-consistent consolidated path). The status code is the
+only client-visible change; the response body shape is unchanged (`job_id` is
+omitted since there is no async job). See
+[`docs/api/v1.md`](../api/v1.md#post-v1datasetsnamevectors).
+
+The query **union** (a query merges recall + consolidated, recall-authoritative)
+and the recall→consolidated **consolidation** (the LSM flush that folds the recall
+tier into the immutable shards and advances the watermark) both ship behind
+`RB_RECALL` too. Consolidation runs in the single-replica `index_builder`,
+triggered by the per-tenant cap (`RB_RECALL_MAX_ROWS`) and by an idle sweep
+(`RB_RECALL_IDLE_S`); it builds the shard, commits the watermark, then trims the
+recall rows grace-bounded — so read-your-writes holds continuously through a
+flush and an idle dataset drains to zero recall rows. The full design (invariants
+I1-I4, the build→commit→trim ordering, cross-DB crash safety) is in
+[`docs/architecture/recall-consolidate.md`](../architecture/recall-consolidate.md).
+
+> The remaining recall-tier *behaviour* (the recall + consolidated union for the
+> per-id get/list/delete surface, and the `mem0` adapter) lands in a later PR
+> behind `RB_RECALL`. This is acceptable because the flag defaults off.
 
 ---
 

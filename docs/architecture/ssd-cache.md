@@ -24,7 +24,7 @@ latency of the one download that runs.
 
 The DP cache before this design was a single in-process tier: an `OrderedDict`
 LRU over deserialised FAISS indexes plus parsed sidecars, byte-budgeted against
-`RB_SHARD_CACHE_BYTES` (default 512 MB). The local `CACHE_DIR` on disk held the
+`RB_SHARD_CACHE_BYTES` (default 1 GiB). The local `CACHE_DIR` on disk held the
 downloaded file but was unbudgeted, unmonitored, and never invalidated; catalog
 updates mutated `shard_catalog` but never notified the DPs.
 
@@ -122,7 +122,7 @@ reports hit-rates within 99% of Belady's optimal on real traces. It is not yet
 implemented — the SSD budget holds only 4–10 shards in the reference
 deployment, so the LRU's exposure to the scan pathology is bounded until the
 working set grows. Pure LFU was rejected (a one-time frequency burst pins
-forever); the RAM tier (`_SHARD_CACHE`, ≤512 MB) stays plain LRU regardless —
+forever); the RAM tier (`_SHARD_CACHE`, ≤1 GiB) stays plain LRU regardless —
 its working set is too small for a frequency sketch to earn its ~1 MB overhead.
 Per-tenant pinning to bound a noisy neighbour is an operator-policy concern and is
 [out of scope](#out-of-scope).
@@ -283,7 +283,7 @@ default off, so an untouched upgrade sees no new traffic.
 
 ### 9. Local-tier capacity sizing
 
-`RB_SHARD_TIER_BYTES` default is 2.5 GiB — roughly 5× `RB_SHARD_CACHE_BYTES`,
+`RB_SHARD_TIER_BYTES` default is 2.5 GiB — roughly 2.5× `RB_SHARD_CACHE_BYTES`,
 and ~10% of the reference deployment's ~25 GB hot set (4 shards × ~6 GB +
 sidecars), matching the classic working-set cache-sizing heuristic. It holds
 ~4 reference shards with sidecars. The default is intentionally conservative;

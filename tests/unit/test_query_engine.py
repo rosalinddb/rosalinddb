@@ -140,15 +140,63 @@ def test_cache_byte_budget_evicts_when_over(monkeypatch):
     assert v1q._SHARD_CACHE_BYTES_USED <= 2400
 
 
-def test_cache_oversized_entry_admitted_then_evicted(monkeypatch):
-    """An entry larger than the whole budget is admitted then immediately
-    evicted — usable for the current query, never retained, no infinite loop."""
+def test_cache_oversized_entry_bypassed_not_retained(monkeypatch):
+    """An entry larger than the whole budget is BYPASSED — never inserted, so
+    it is not retained and the running byte total is untouched.
+
+    The current query still searches the in-hand index/sidecar (the call site
+    holds them in locals); the cache simply declines to store something that
+    can never coexist with anything else under the budget.
+    """
     monkeypatch.setattr(v1q, "RB_SHARD_CACHE_BYTES", 500)
     monkeypatch.setattr(v1q, "RB_SHARD_CACHE_SIZE", 0)
     v1q.cache_clear()
     v1q._cache_put("huge", object(), _SizedSidecar(5000))  # alone > budget
     assert v1q._cache_get("huge") is None  # not retained
     assert v1q._SHARD_CACHE_BYTES_USED == 0
+
+
+def test_cache_oversized_entry_does_not_evict_warm_neighbours(monkeypatch):
+    """The core anti-thrash fix: an oversized shard must NOT evict the rest of
+    the warm cache to make room for something that can never coexist.
+
+    Before the fix the oversized entry was inserted as MRU, then the eviction
+    loop ran until `used <= budget` — which evicted every warm neighbour first
+    and finally the oversized entry too, wiping the whole cache on every query
+    for the oversized shard (pathological thrash at 1M scale).
+    """
+    # Budget holds two ~1 KiB warm entries with headroom to spare.
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_BYTES", 2400)
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_SIZE", 0)
+    v1q.cache_clear()
+    v1q._cache_put("warm1", object(), _SizedSidecar(1000))
+    v1q._cache_put("warm2", object(), _SizedSidecar(1000))
+    used_before = v1q._SHARD_CACHE_BYTES_USED
+
+    # A shard whose footprint alone exceeds the entire budget.
+    v1q._cache_put("huge", object(), _SizedSidecar(10000))
+
+    # The oversized shard is not retained...
+    assert v1q._cache_get("huge") is None
+    # ...and crucially the warm neighbours SURVIVE — no thrash.
+    assert v1q._cache_get("warm1") is not None
+    assert v1q._cache_get("warm2") is not None
+    assert v1q._SHARD_CACHE_BYTES_USED == used_before
+
+
+def test_cache_oversized_entry_no_thrash_under_repeated_queries(monkeypatch):
+    """Repeated oversized-shard puts (simulating repeated cold queries) leave
+    the warm cache fully intact every time — no evict-then-reinsert churn."""
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_BYTES", 2400)
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_SIZE", 0)
+    v1q.cache_clear()
+    v1q._cache_put("warm1", object(), _SizedSidecar(1000))
+    v1q._cache_put("warm2", object(), _SizedSidecar(1000))
+    for _ in range(50):
+        v1q._cache_put("huge", object(), _SizedSidecar(10000))
+    assert v1q._cache_get("warm1") is not None
+    assert v1q._cache_get("warm2") is not None
+    assert v1q._cache_get("huge") is None
 
 
 def test_cache_byte_budget_evicts_lru_first(monkeypatch):
@@ -204,3 +252,58 @@ def test_evict_shard_drops_entry():
     assert v1q._cache_get("doomed") is None
     # Idempotent — evicting an absent shard is a harmless no-op.
     assert v1q.evict_shard("doomed") is False
+
+
+def test_oversize_warned_set_is_bounded(monkeypatch):
+    """`_OVERSIZE_WARNED` must not grow forever: `cache_clear()` empties it and
+    `evict_shard(id)` drops that id, so a re-added shard can warn again and the
+    set can never accumulate ids for shards that are long gone."""
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_BYTES", 500)
+    monkeypatch.setattr(v1q, "RB_SHARD_CACHE_SIZE", 0)
+    v1q.cache_clear()
+    assert v1q._OVERSIZE_WARNED == set()
+
+    # An oversized put records a one-time-per-shard warning mark.
+    v1q._cache_put("huge1", object(), _SizedSidecar(5000))
+    v1q._cache_put("huge2", object(), _SizedSidecar(5000))
+    assert "huge1" in v1q._OVERSIZE_WARNED
+    assert "huge2" in v1q._OVERSIZE_WARNED
+
+    # evict_shard(id) drops just that id from the warned set...
+    v1q.evict_shard("huge1")
+    assert "huge1" not in v1q._OVERSIZE_WARNED
+    assert "huge2" in v1q._OVERSIZE_WARNED
+
+    # ...so a re-added shard can warn again (set re-populates for huge1).
+    v1q._cache_put("huge1", object(), _SizedSidecar(5000))
+    assert "huge1" in v1q._OVERSIZE_WARNED
+
+    # cache_clear() empties the warned set entirely.
+    v1q.cache_clear()
+    assert v1q._OVERSIZE_WARNED == set()
+
+
+def test_shard_cache_bytes_env_override(monkeypatch):
+    """`RB_SHARD_CACHE_BYTES` is the operator knob: reloading the module with
+    the env set must apply the override to the byte budget."""
+    import importlib
+
+    monkeypatch.setenv("RB_SHARD_CACHE_BYTES", str(64 * 1024 * 1024))
+    reloaded = importlib.reload(v1q)
+    try:
+        assert reloaded.RB_SHARD_CACHE_BYTES == 64 * 1024 * 1024
+    finally:
+        # Restore the module to its env-default state for the rest of the suite.
+        monkeypatch.delenv("RB_SHARD_CACHE_BYTES", raising=False)
+        importlib.reload(v1q)
+
+
+def test_shard_cache_bytes_default_holds_one_1m_128dim_shard():
+    """The shipped default must hold at least one 1M-vector / 128-dim shard
+    (128 dims x 4 bytes x 1e6 ~= 512 MB) so a single large shard does not
+    permanently bypass the cache on a default deployment — the regression that
+    motivated raising the default off 512 MB."""
+    one_1m_128dim_shard = 128 * 4 * 1_000_000  # ~= 512 MB
+    # Strictly greater: a budget exactly equal to the shard would leave zero
+    # headroom for the sidecar and force a bypass.
+    assert v1q.RB_SHARD_CACHE_BYTES > one_1m_128dim_shard

@@ -1,0 +1,54 @@
+@startuml recall-consolidate-delta-query-union
+' Query union under RB_DELTA_TIER: resolve the live generation (base + its live
+' deltas) from ONE snapshot, compute the contiguous-MIN frontier, search Recall
+' (lsn > frontier) + base + EVERY live delta, then merge with newest-delta-wins
+' dedup + tombstone suppression. Contrast recall-consolidate-query-union.puml,
+' which resolves a SINGLE consolidated shard.
+
+title Delta-tier query union: Recall + base + live deltas (RB_DELTA_TIER on)
+
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ArrowFontSize 11
+skinparam NoteFontSize 10
+skinparam sequenceMessageAlign center
+
+actor "client" as client
+participant "query_dp\n(run_query)" as dp
+database "shard_catalog\n(generations)" as catalog
+participant "base + live deltas\n(FAISS via SSD/RAM cache)" as gen
+database "Recall\n(pgvector, recall_search)" as recall
+
+client -> dp : POST /query {vector, top_k, filter}
+activate dp
+
+== Resolve the generation ONCE (_resolve_shard -> _generations): base + live deltas from a SINGLE snapshot ==
+dp -> catalog : live_generation -> base S0 + deltas [S1..Sk]\n(one snapshot -> a consistent set; read-your-writes safe)
+dp -> dp : frontier = contiguous-MIN of the deltas' covered bands\n(gap-clamped; NEVER max) -- the watermark Recall reads above
+
+par Recall scan (worker thread)
+  dp -> recall : recall_search WHERE lsn > frontier (brute-force L2^2)\n+ full recall-id set above the frontier
+else base + each live delta (FAISS, L2^2, inline)
+  dp -> gen : search base S0 + delta S1 .. Sk via the cache
+  activate gen
+  gen --> dp : per-shard hits (L2^2) + each delta's tombstone_int_ids
+  deactivate gen
+end
+
+== Merge ==
+dp -> dp : (1) METRIC ALIGNMENT -- square pgvector L2 -> L2^2
+dp -> dp : (2) DEDUP across the generation -- NEWEST-DELTA-WINS on a repeated id\n(a re-upserted vector: keep the copy in the most-recent delta, drop the base/older one)
+dp -> dp : (3) SUPPRESS -- a delta's tombstone_int_ids drop older copies of that id;\nrecall tombstones suppress their consolidated twin
+dp -> dp : (4) DEDUP recall-wins -- Recall is newer than the whole generation
+dp -> dp : (5) SORT ascending by L2^2, take top_k
+
+note over dp
+  Read fan-out = 1 base + up to RB_MAX_DELTAS live deltas, bounded by
+  major compaction. recall@10 vs a monolithic index stays ~0.998 across 0..8 deltas.
+end note
+
+dp --> client : {matches, mode, ...}
+deactivate dp
+
+@enduml

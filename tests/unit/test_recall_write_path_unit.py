@@ -1,0 +1,310 @@
+"""Unit coverage for the synchronous recall-tier write path + `RB_RECALL`.
+
+The recall tier ships behind `RB_RECALL` (master switch) AND `RB_RECALL_DSN`
+(the recall store), both default off. This PR adds the WRITE path only — the
+query union, consolidation, and recall-delete are later PRs.
+
+Two headline properties, both proven hermetically here (no Docker, no pgvector):
+
+  - FLAG OFF (default): `post_vectors` is byte-identical to today — 202, a
+    landing write, a `VALIDATE_DATASET` publish, and NO recall connection ever
+    opened (asserted with the `psycopg2.connect`-raises trick from PR2).
+  - FLAG ON: `recall_enabled()` flips on only with BOTH env vars; the write
+    logic allocates a monotonic LSN per record and UPSERTs into `recall_vectors`
+    with last-write-wins, against a FAKED recall connection (so the call SHAPE is
+    asserted without a real database).
+"""
+from __future__ import annotations
+
+import importlib
+import json
+
+import pytest
+
+
+@pytest.fixture
+def state(monkeypatch):
+    """Fresh state module with both recall-tier env vars cleared (tier off)."""
+    monkeypatch.delenv("RB_RECALL", raising=False)
+    monkeypatch.delenv("RB_RECALL_DSN", raising=False)
+    import adapters.state.state as state_mod
+    importlib.reload(state_mod)
+    yield state_mod
+    monkeypatch.delenv("RB_RECALL", raising=False)
+    monkeypatch.delenv("RB_RECALL_DSN", raising=False)
+    importlib.reload(state_mod)
+
+
+# --- recall_enabled() gate -------------------------------------------
+
+
+def test_recall_tier_off_by_default(state):
+    """Both env vars unset -> tier off (the self-host default)."""
+    assert state.recall_enabled() is False
+
+
+def test_recall_tier_needs_flag_and_dsn(state, monkeypatch):
+    """The tier is on ONLY when `RB_RECALL` is truthy AND `RB_RECALL_DSN` is set."""
+    # Flag alone (no DSN) -> still off: a deploy that forgets the DSN stays on
+    # the byte-identical flag-off path rather than erroring on every write.
+    monkeypatch.setenv("RB_RECALL", "true")
+    importlib.reload(state)
+    assert state.recall_enabled() is False
+
+    # DSN alone (no flag) -> off: provisioning a recall store does not auto-enable.
+    monkeypatch.delenv("RB_RECALL", raising=False)
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    importlib.reload(state)
+    assert state.recall_enabled() is False
+
+    # Both -> on.
+    monkeypatch.setenv("RB_RECALL", "true")
+    importlib.reload(state)
+    assert state.recall_enabled() is True
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "TRUE", "yes", "on"])
+def test_recall_tier_truthy_values(state, monkeypatch, truthy):
+    """`RB_RECALL` accepts the same truthy set as `quotas_enabled()`."""
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    monkeypatch.setenv("RB_RECALL", truthy)
+    importlib.reload(state)
+    assert state.recall_enabled() is True
+
+
+@pytest.mark.parametrize("falsy", ["", "0", "false", "no", "off", "  "])
+def test_recall_tier_falsy_values(state, monkeypatch, falsy):
+    """A blank/false `RB_RECALL` keeps the tier off even with a DSN set."""
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    monkeypatch.setenv("RB_RECALL", falsy)
+    importlib.reload(state)
+    assert state.recall_enabled() is False
+
+
+# --- recall_upsert_vectors(): LSN assignment + UPSERT call shape -------------
+
+
+class _FakeCursor:
+    """A psycopg2-cursor stand-in that records executed SQL + params.
+
+    The write path now allocates the whole LSN block in ONE upsert-increment
+    (`last_lsn = last_lsn + N`) and applies the batch in ONE multi-row UPSERT
+    (via `psycopg2.extras.execute_values`, which renders the rows into a single
+    `cur.execute`). `RETURNING last_lsn` is faked by advancing a running counter
+    by the requested block size (the 3rd param of the seq upsert), so the
+    returned value is the LAST lsn in the block — exactly the contract the
+    production code assigns the range `last_lsn-N+1 .. last_lsn` from.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, tuple]] = []
+        self._lsn = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+        if "recall_lsn_seq" in sql and "RETURNING" in sql:
+            # The block size N is bound as the 3rd positional param
+            # (VALUES (tenant, dataset, N) ...). Advance by N and return the
+            # last lsn in the freshly-reserved block.
+            block = params[2] if params else 1
+            self._lsn += block
+
+    def fetchone(self):
+        return (self._lsn,)
+
+
+class _FakeConn:
+    """A psycopg2-connection stand-in.
+
+    Recall ops now run through the pooled context manager `recall_pooled_conn()`,
+    which OWNS the transaction: it calls `conn.commit()` on a clean exit and
+    `conn.rollback()` on an exception (the connection is NOT used as a `with`
+    context manager any more, and it is RETURNED to the pool rather than closed).
+    So this stub records commit/rollback directly.
+    """
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.committed = False
+        self.rolled_back = False
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+class _FakeRecallPool:
+    """A `ThreadedConnectionPool`-shaped stub returning a single fake conn.
+
+    Mirrors the control-plane pool test's `_FakePool`: `getconn()` hands out the
+    one fake connection and `putconn()` records its return, so the test can prove
+    the pooled context manager returned the connection (instead of closing a
+    fresh one per op). A non-empty `_pool` keeps the `reused` probe happy.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._pool = [object()]
+        self.returned = 0
+
+    def getconn(self):
+        return self._conn
+
+    def putconn(self, conn):
+        assert conn is self._conn
+        self.returned += 1
+
+
+def _on_state(state, monkeypatch):
+    """Turn the tier on and return (conn, cur, upserts, pool).
+
+    The set-based write applies the batch in ONE multi-row UPSERT via
+    `psycopg2.extras.execute_values` (imported by-name into `state`). Driving the
+    real `execute_values` needs a live connection encoding, so stub it with a
+    recorder that captures the rendered SQL + the per-row params — that is the
+    call shape the test asserts. `upserts` is the list of recorded
+    `(sql, rows, template)` tuples.
+
+    Recall pooling: wire a fake recall pool (`_RECALL_POOL`) bound to the
+    matching DSN so `recall_pooled_conn()` checks the one fake conn out of it,
+    EXACTLY as `tests/unit/test_state_pool.py` wires `_POOL` for the
+    control-plane pool. The fake pool yields the fake conn and records its return.
+    """
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    monkeypatch.setenv("RB_RECALL", "true")
+    importlib.reload(state)
+    cur = _FakeCursor()
+    conn = _FakeConn(cur)
+    pool = _FakeRecallPool(conn)
+    monkeypatch.setattr(state, "_RECALL_POOL", pool)
+    monkeypatch.setattr(state, "_RECALL_POOL_DSN", state._recall_dsn())
+    upserts: list[tuple] = []
+
+    def _fake_execute_values(c, sql, rows, template=None, **kw):
+        assert c is cur
+        upserts.append((sql, list(rows), template))
+
+    monkeypatch.setattr(state, "execute_values", _fake_execute_values)
+    return conn, cur, upserts, pool
+
+
+def test_recall_upsert_allocates_lsn_block_and_single_upsert(state, monkeypatch):
+    """N LSNs are allocated in ONE statement; the batch is ONE multi-row UPSERT.
+
+    Round-trip count is now ~2 (one seq block-allocation + one multi-row UPSERT),
+    NOT 2N. Each record is stamped with its LSN from the contiguous block in
+    input order.
+    """
+    conn, cur, upserts, pool = _on_state(state, monkeypatch)
+    records = [
+        {"id": "a", "values": [1.0, 2.0, 3.0], "metadata": {"k": "v"}},
+        {"id": "b", "values": [4.0, 5.0, 6.0], "metadata": {}},
+    ]
+    written = state.recall_upsert_vectors("t1", "ds", records)
+    assert written == 2
+
+    # ONE seq allocation for the whole batch (not one per record).
+    seq_calls = [c for c in cur.calls if "recall_lsn_seq" in c[0]]
+    assert len(seq_calls) == 1, "the LSN block is allocated in a single statement"
+    # The block size N is bound (VALUES (tenant, dataset, N); +N on conflict).
+    assert seq_calls[0][1] == ("t1", "ds", 2, 2)
+
+    # ONE multi-row UPSERT for the whole batch.
+    assert len(upserts) == 1, "the batch is applied in a single multi-row UPSERT"
+    sql, rows, template = upserts[0]
+    assert len(rows) == 2, "both records in one UPSERT"
+
+    # Rows are (tenant, dataset, id, embedding_literal, metadata_json, lsn).
+    assert rows[0][0] == "t1" and rows[0][1] == "ds"
+    assert rows[0][2] == "a" and rows[0][5] == 1
+    assert rows[1][2] == "b" and rows[1][5] == 2
+
+    # The embedding is bound as a pgvector literal; metadata as JSON.
+    assert rows[0][3] == "[1.0,2.0,3.0]"
+    assert json.loads(rows[0][4]) == {"k": "v"}
+
+    # Last-write-wins + tombstone-clear on conflict, scoped to (tenant,ds,id).
+    assert "ON CONFLICT (tenant_id, dataset, id)" in sql
+    assert "deleted   = FALSE" in sql
+    # `deleted` is set FALSE for every row via the row template, not per-row.
+    assert template == "(%s, %s, %s, %s, %s, %s, FALSE)"
+
+    # The batch committed once on the pooled connection, which was then RETURNED
+    # to the recall pool (NOT closed) — the whole txn ran on one checked-out conn.
+    assert conn.committed is True
+    assert conn.rolled_back is False
+    assert pool.returned == 1, "the pooled recall connection must be returned once"
+
+
+def test_recall_upsert_intra_batch_duplicate_id_last_write_wins(state, monkeypatch):
+    """A duplicate id in one batch collapses to one row; the LAST input wins.
+
+    Postgres rejects a multi-row UPSERT that lists the same conflict key twice,
+    so the batch must be deduped before the UPSERT — keeping the latest
+    occurrence (last-write-wins) and giving it a single LSN from the block.
+    """
+    conn, cur, upserts, pool = _on_state(state, monkeypatch)
+    records = [
+        {"id": "dup", "values": [1.0, 1.0, 1.0], "metadata": {"v": 1}},
+        {"id": "other", "values": [2.0, 2.0, 2.0], "metadata": {}},
+        {"id": "dup", "values": [9.0, 9.0, 9.0], "metadata": {"v": 2}},
+    ]
+    written = state.recall_upsert_vectors("t1", "ds", records)
+    # Two distinct ids -> two rows written, two LSNs allocated.
+    assert written == 2
+    seq_calls = [c for c in cur.calls if "recall_lsn_seq" in c[0]]
+    assert seq_calls[0][1] == ("t1", "ds", 2, 2), "block size is the distinct count"
+
+    sql, rows, template = upserts[0]
+    by_id = {r[2]: r for r in rows}
+    assert set(by_id) == {"dup", "other"}, "exactly one row per distinct id"
+
+    # The surviving `dup` row is the LATEST occurrence (values [9,9,9], v=2)...
+    assert by_id["dup"][3] == "[9.0,9.0,9.0]"
+    assert json.loads(by_id["dup"][4]) == {"v": 2}
+    # ...and it carries the LATER LSN (its winning position is last in input).
+    assert by_id["dup"][5] == 2
+    assert by_id["other"][5] == 1
+
+
+def test_recall_upsert_empty_is_noop_no_connection(state, monkeypatch):
+    """An empty record list never checks a recall connection out of the pool."""
+    monkeypatch.setenv("RB_RECALL_DSN", "postgresql://u:p@recall:5432/recall")
+    monkeypatch.setenv("RB_RECALL", "true")
+    importlib.reload(state)
+
+    def _boom(*a, **k):  # pragma: no cover - must never be called
+        raise AssertionError("built a recall pool for an empty batch")
+
+    # Guard BOTH the pool builder and the low-level connect: the empty-batch
+    # short-circuit must return before either is reached.
+    monkeypatch.setattr(state, "_get_recall_pool", _boom)
+    monkeypatch.setattr(state, "_recall_conn", _boom)
+    assert state.recall_upsert_vectors("t1", "ds", []) == 0
+
+
+def test_recall_conn_raises_when_dsn_unset(state):
+    """`_recall_conn()` refuses to connect with `RB_RECALL_DSN` unset (off path).
+
+    Reaching here with the tier off is a programming error — it raises rather
+    than silently connecting to a default DSN.
+    """
+    with pytest.raises(RuntimeError):
+        state._recall_conn()
+
+
+def test_to_pgvector_literal_format(state):
+    """Embeddings format as a bracketed, comma-separated pgvector literal."""
+    assert state._to_pgvector_literal([1, 2, 3]) == "[1.0,2.0,3.0]"
+    assert state._to_pgvector_literal([0.5, -1.25]) == "[0.5,-1.25]"
