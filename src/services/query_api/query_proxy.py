@@ -59,6 +59,7 @@ from fastapi.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
 
+from adapters.errors import error_envelope
 from adapters.observability import metrics as obs_metrics
 from adapters.state.state import get_tenant_dp_pool, try_consume_query
 from services.auth.jwt_utils import current_tenant_id
@@ -601,11 +602,14 @@ async def reset_dp_clients() -> None:
 
 
 def _err(status_code: int, code: str, message: str) -> JSONResponse:
-    """Build a v1 error envelope response for a CP-originated error."""
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": {"code": code, "message": message}},
-    )
+    """Build a v1 error envelope response for a CP-originated error.
+
+    Signature intentionally keeps NO `details` parameter (unlike the other
+    `_err` copies) so this call site's public surface is unchanged. Delegates
+    to the canonical `adapters.errors.error_envelope`; with `details` left at
+    its default `None` the body is byte-identical to the previous inline
+    construction (`{"error": {"code", "message"}}`)."""
+    return error_envelope(status_code, code, message)
 
 
 def _trusted_headers(tenant_id: str) -> Dict[str, str]:

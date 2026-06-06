@@ -34,6 +34,8 @@ import logging
 import os
 import threading
 
+from config import truthy as _truthy
+
 # --- module state ---------------------------------------------------------
 
 _LOCK = threading.Lock()
@@ -45,10 +47,6 @@ _SERVICE_NAME = "rosalinddb"
 # / BatchLogRecordProcessor), so this only bounds the worker thread, never a
 # request path.
 _DEFAULT_EXPORT_TIMEOUT_S = 3
-
-
-def _truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def is_disabled() -> bool:

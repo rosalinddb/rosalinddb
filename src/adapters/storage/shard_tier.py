@@ -60,6 +60,8 @@ import uuid
 from collections import OrderedDict
 from typing import Dict, NamedTuple, Optional
 
+from adapters.errors import CacheCapacityExceeded, ShardTierTimeout
+
 
 _log = logging.getLogger(__name__)
 
@@ -110,33 +112,12 @@ class ResidencyEntry(NamedTuple):
     last_query_at: float
 
 
-class ShardTierTimeout(RuntimeError):
-    """A coalesced waiter exceeded `RB_SHARD_TIER_COALESCE_WAIT_S`.
-
-    Raised by `fetch()` when the per-URI in-flight event was not set within
-    the bounded wait. Distinct from a generic `TimeoutError` so the caller
-    can map it to a specific error code / observability signal — a waiter
-    timing out is a different operational condition from the initiator's
-    download itself failing.
-    """
-
-
-class CacheCapacityExceeded(RuntimeError):
-    """`prewarm()` could not admit a speculative shard.
-
-    Raised when the tier is at its byte budget and every candidate for
-    eviction is younger than `_MIN_RESIDENT_S` (the admission floor). The
-    intent is to keep recently-arrived shards stable under a
-    write storm: a prewarm that lands while the tier is full of fresh
-    arrivals is rejected, the operator / dashboard sees a
-    `cache_capacity_exceeded` 503, and the floor's discrimination signal
-    (queries-under-load beat speculative arrivals) holds.
-
-    `RuntimeError` subclass so callers that catch `RuntimeError` still
-    catch this, and so the classifier branches in `_classify_hot_path_error`
-    / `_classify_error` can sit alongside the existing `RuntimeError`-catching
-    frames without re-ordering risk.
-    """
+# `ShardTierTimeout` and `CacheCapacityExceeded` are defined once in
+# `adapters.errors` (shared class identity) and imported above; they are
+# re-exported here so the original `adapters.storage.shard_tier.*` import paths
+# and every `isinstance` / `except` frame keep working unchanged. They remain
+# `RuntimeError` subclasses (via `RosalindDBError`), preserving the
+# `except RuntimeError` contract the classifier branches rely on.
 
 
 # --- module state ---------------------------------------------------------

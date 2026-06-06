@@ -38,6 +38,13 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from opentelemetry import context as otel_context
 
+from config import truthy as _truthy
+from adapters.cache import CatalogCache, ensure_cached as _ensure_cached_shared
+from adapters.errors import (
+    DownloadCoalescingTimeout,
+    classify_query_error,
+    error_envelope,
+)
 from adapters.landing.parquet_reader import read_shard_sidecar
 from adapters.metrics.metrics import counter, timer
 from adapters.observability import metrics as obs_metrics
@@ -52,19 +59,22 @@ from adapters.queue.queue import consume, publish, ack, nack
 from adapters.queue.shutdown import should_stop
 from adapters.state import state as _state
 from adapters.state.state import (
-    RecallUnavailable,
     get_dataset,
     list_shards,
     recall_enabled,
     recall_search,
     try_consume_query,
 )
+# Re-exported for back-compat: recall_search raises RecallUnavailable, and tests
+# (and the error classifier) reach the typed exception as `v1_query.RecallUnavailable`.
+from adapters.state.state import RecallUnavailable  # noqa: F401
 # SSD-tier import. The import-time side effect is the bounded `.tmp` orphan
 # sweep in `adapters/storage/shard_tier.py` (one `scandir`, log-and-continue
 # on errors), cheap enough to run unconditionally. The actual `fetch` call at
 # the `_ensure_cached` entry is gated behind `RB_SHARD_TIER_BYTES` so a
 # deployment with the tier off does not touch any tier state at query time.
-from adapters.storage import shard_tier
+from adapters.storage import shard_tier  # noqa: F401  (imported for its import-time .tmp orphan sweep; see comment above)
+from schemas.v1 import QueryRequest
 from services.auth.jwt_utils import current_tenant_id
 from services.auth.quota import query_quota_429, quotas_enabled, rate_limit
 from services.query_api import result_store
@@ -244,14 +254,6 @@ RB_SHARD_CACHE_SIZE = max(0, int(os.getenv("RB_SHARD_CACHE_SIZE", "0")))
 # `cache_clear()` empties the set, so it never accumulates ids for shards that
 # are gone and a re-added shard can warn again.
 _OVERSIZE_WARNED: set = set()
-
-
-def _truthy(value: Optional[str]) -> bool:
-    """Mirror `adapters.observability.otel._truthy` (kept local to avoid a
-    cross-package import for one line of env parsing — the duplicate is
-    tiny, stable, and keeps this module's import graph slim).
-    """
-    return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _read_major_faults(stat_path: str = "/proc/self/stat") -> Optional[int]:
@@ -450,7 +452,7 @@ _maybe_warn_about_fuse_cache_dir(CACHE_DIR)
 #     `0` disables the cache entirely — operator emergency knob.
 #
 # The cache is keyed by `(tenant, dataset)` and bounded by a fixed-size LRU
-# (`_CATALOG_CACHE_MAX_ENTRIES`) to cap memory growth in a process serving
+# (`CatalogCache.max_entries`) to cap memory growth in a process serving
 # many tenants. Entries are tiny (a list of dicts from the catalog row), so
 # the cap is high enough that hot tenants will never evict each other.
 #
@@ -463,29 +465,12 @@ _maybe_warn_about_fuse_cache_dir(CACHE_DIR)
 # Without LISTEN the TTL is the only channel; with LISTEN the TTL is the
 # safety net for missed notifies (the LISTEN protocol is best-effort).
 
-# Hardcoded LRU bound. `_CATALOG_CACHE_MAX_ENTRIES` datasets is generous —
-# even a self-host with 10k distinct tenants under one dataset each fits.
-# This can be promoted to an env knob if a deployment grows past it;
-# today the env surface is intentionally minimal.
-_CATALOG_CACHE_MAX_ENTRIES = 10_000
-
-_CATALOG_CACHE: "OrderedDict[tuple[str, str], tuple[float, list]]" = OrderedDict()
-_CATALOG_CACHE_LOCK = threading.Lock()
-
-# Per-key generation counter. Bumped on every invalidation; the cache
-# writer compares pre-fetch and post-fetch generations under the lock and
-# refuses to install rows older than a concurrent invalidate.
-#
-# Closes the otherwise-real "race against concurrent invalidate" window:
-# a reader sees a miss, drops the lock, fetches `list_shards`, and is
-# about to install — meanwhile a NOTIFY-driven invalidate fires. Without
-# the generation check the just-fetched-but-already-stale rows would be
-# installed and live until the next TTL expiry; with it, the install is
-# silently skipped and the next caller re-fetches. The staleness window
-# was already bounded by `RB_CATALOG_FRESHNESS_S` (so this is a
-# tightening, not a correctness fix), but the generation check is cheap
-# and removes the bound entirely for invalidate-driven flows.
-_CATALOG_CACHE_GEN: "Dict[tuple[str, str], int]" = {}
+# The cache itself lives once in `adapters.cache.CatalogCache`; this module
+# owns its own instance (state is per-service, not shared with the ephemeral
+# runner). The thin wrappers below resolve `list_shards` / `_now` from THIS
+# module's namespace at call time so a test monkeypatching either keeps
+# retuning the cache exactly as before.
+_CATALOG_CACHE = CatalogCache()
 
 
 def _now() -> float:
@@ -536,39 +521,14 @@ def _cached_list_shards(tenant: str, dataset: str) -> list:
     short, so the worst case (a thundering herd at startup) is bounded;
     if it ever shows up in traces, a per-key in-flight set is the fix.
     """
-    if not _catalog_cache_active():
-        return list_shards(tenant, dataset)
-    key = (tenant, dataset)
-    ttl = _catalog_freshness_s()
-    now = _now()
-    with _CATALOG_CACHE_LOCK:
-        entry = _CATALOG_CACHE.get(key)
-        if entry is not None and (now - entry[0]) < ttl:
-            # LRU bump — move the warm entry to the most-recent end so
-            # the bounded-cap eviction prefers cold entries.
-            _CATALOG_CACHE.move_to_end(key)
-            return entry[1]
-        # Capture generation under the lock so a concurrent invalidate
-        # AFTER this snapshot bumps the counter and our install loses.
-        gen_pre = _CATALOG_CACHE_GEN.get(key, 0)
-    # Miss / expired — fetch outside the lock so a slow Postgres does
-    # not serialise other readers.
-    rows = list_shards(tenant, dataset)
-    with _CATALOG_CACHE_LOCK:
-        # Generation check: if an invalidate fired during the fetch, the
-        # counter has moved past our snapshot. Skip the install — the
-        # rows we just fetched are no fresher than the invalidate, and a
-        # future caller will re-fetch.
-        if _CATALOG_CACHE_GEN.get(key, 0) != gen_pre:
-            return rows
-        _CATALOG_CACHE[key] = (now, rows)
-        _CATALOG_CACHE.move_to_end(key)
-        # Bounded-cap eviction: drop the oldest entries until we are
-        # under the cap. The just-inserted entry is the MRU so it is
-        # never the one evicted in the same call.
-        while len(_CATALOG_CACHE) > _CATALOG_CACHE_MAX_ENTRIES:
-            _CATALOG_CACHE.popitem(last=False)
-    return rows
+    return _CATALOG_CACHE.cached_list_shards(
+        tenant,
+        dataset,
+        list_shards,
+        _now,
+        _catalog_freshness_s(),
+        _catalog_cache_active(),
+    )
 
 
 def _invalidate_catalog_cache(tenant: str, dataset: str) -> bool:
@@ -581,10 +541,7 @@ def _invalidate_catalog_cache(tenant: str, dataset: str) -> bool:
     Called by the NOTIFY handler and exposed for test/operator use.
     Returns True iff an entry was actually removed.
     """
-    key = (tenant, dataset)
-    with _CATALOG_CACHE_LOCK:
-        _CATALOG_CACHE_GEN[key] = _CATALOG_CACHE_GEN.get(key, 0) + 1
-        return _CATALOG_CACHE.pop(key, None) is not None
+    return _CATALOG_CACHE.invalidate(tenant, dataset)
 
 
 def _on_catalog_notify(payload: dict) -> None:
@@ -603,9 +560,7 @@ def _on_catalog_notify(payload: dict) -> None:
 
 def _catalog_cache_clear() -> None:
     """Test helper — drop every cached `(tenant, dataset)` entry."""
-    with _CATALOG_CACHE_LOCK:
-        _CATALOG_CACHE.clear()
-        _CATALOG_CACHE_GEN.clear()
+    _CATALOG_CACHE.clear()
 
 
 # Activate the LISTEN-driven push channel when the env opts in. The
@@ -648,12 +603,10 @@ _SHARD_CACHE_BYTES_USED = 0
 # a `threading.Event` (small), so the bound is real-time memory, not a slow
 # leak, and the entries drain as their downloads complete.
 #
-# NOTE: `services/ephemeral_runner/run.py` has a duplicate `_ensure_cached`
-# WITHOUT this coalescing — that runner deliberately avoids importing from
-# the query_api package (circular import) and the same classifier-duplication
-# rationale applies. The ephemeral path runs at much lower concurrency so the
-# stampede has not been observed there; a future refactor may want to port the
-# fix or extract a shared `adapters/storage/shard_fetch.py` module.
+# The fetch/coalescing logic itself lives once in `adapters.cache.shard_fetch`;
+# this module keeps owning the single-flight state so tests can reset / inspect
+# it by module attribute. The ephemeral runner calls the SAME shared helper
+# with coalescing disabled.
 _INFLIGHT_DOWNLOADS: Dict[str, threading.Event] = {}
 _INFLIGHT_DOWNLOADS_LOCK = threading.Lock()
 
@@ -665,16 +618,10 @@ _INFLIGHT_DOWNLOADS_LOCK = threading.Lock()
 _DOWNLOAD_COALESCE_WAIT_S = float(os.getenv("RB_DOWNLOAD_COALESCE_WAIT_S", "300"))
 
 
-class DownloadCoalescingTimeout(RuntimeError):
-    """A coalesced waiter exceeded its deadline on someone else's download.
-
-    Raised by `_ensure_cached` when the per-URI in-flight event was not set
-    within `_DOWNLOAD_COALESCE_WAIT_S` seconds. Surfaced as a distinct
-    exception (rather than a generic `TimeoutError`) so the caller can map it
-    to a specific error code / observability signal — a waiter timing out is
-    a different operational condition from the initiator's download itself
-    failing.
-    """
+# `DownloadCoalescingTimeout` is defined once in `adapters.errors` (shared
+# class identity) and imported above; it is re-exported here so the original
+# `services.query_api.v1_query.DownloadCoalescingTimeout` import path and every
+# `isinstance` / `raise` site keep working unchanged.
 
 
 def _sidecar_nbytes(sidecar) -> int:
@@ -836,11 +783,9 @@ router = APIRouter()
 
 
 def _err(status_code: int, code: str, message: str, details: Optional[dict] = None) -> JSONResponse:
-    """Build a v1 error envelope response."""
-    body: dict = {"error": {"code": code, "message": message}}
-    if details is not None:
-        body["error"]["details"] = details
-    return JSONResponse(status_code=status_code, content=body)
+    """Build a v1 error envelope response. Delegates to the canonical
+    `adapters.errors.error_envelope` (same byte-for-byte body)."""
+    return error_envelope(status_code, code, message, details)
 
 
 def _ensure_cached(shard_uri: str) -> str:
@@ -863,122 +808,27 @@ def _ensure_cached(shard_uri: str) -> str:
     environment, delegation runs through
     `adapters.storage.shard_tier.fetch(shard_uri)` — the same single-flight
     contract, but the local file is owned by the tier (which runs its own
-    byte-budgeted LRU eviction). The env check happens here rather than at
-    import time so a flip-flop env var across pod restarts cleanly toggles
-    the path without needing a code redeploy. When the env is unset, the
-    legacy single-flight body below runs unchanged — that is the rollback
-    contract.
+    byte-budgeted LRU eviction). The env check happens inside the shared
+    helper rather than at import time so a flip-flop env var across pod
+    restarts cleanly toggles the path without needing a code redeploy. When
+    the env is unset, the legacy single-flight body runs unchanged — that is
+    the rollback contract.
+
+    The body lives in `adapters.cache.shard_fetch.ensure_cached`; the
+    single-flight state (`_INFLIGHT_DOWNLOADS` / its lock), the bounded
+    waiter deadline (`_DOWNLOAD_COALESCE_WAIT_S`) and the timeout class
+    (`DownloadCoalescingTimeout`) are passed IN so tests can monkeypatch
+    them on this module and the change takes effect at call time.
     """
-    if os.getenv("RB_SHARD_TIER_BYTES"):
-        # Tier handles its own directory creation, single-flight, and
-        # eviction. `ShardTierTimeout` and `FileNotFoundError` are the two
-        # raise paths the caller's classifier already maps to 503; let them
-        # propagate untouched.
-        return shard_tier.fetch(shard_uri)
-
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    if not (shard_uri.startswith("s3://") or shard_uri.startswith("memory://")):
-        raise ValueError("Unsupported shard uri")
-
-    from adapters.storage.storage import read_bytes
-
-    cache_key = shard_uri.split("://", 1)[1].replace("/", "_")
-    path = os.path.join(CACHE_DIR, cache_key)
-
-    # Fast path: file already on disk. No coordination needed — the file is
-    # already atomic (written via temp + rename) so a concurrent reader sees
-    # either nothing or the complete bytes. Skip the lock/event dance
-    # entirely so the warm-cache case stays byte-for-byte unchanged.
-    if os.path.exists(path):
-        return path
-
-    # Single-flight registration. Atomically decide whether this thread is
-    # the *initiator* (creates the entry, will do the GET) or a *waiter*
-    # (found a pre-existing entry, will block on its Event).
-    is_initiator = False
-    with _INFLIGHT_DOWNLOADS_LOCK:
-        # A second `exists` check inside the lock closes a race where the
-        # initiator finished the download AND cleared the in-flight entry
-        # between our outer `exists` check and acquiring the lock. Without
-        # this, we'd needlessly become a fresh initiator for an already-
-        # cached shard.
-        if os.path.exists(path):
-            return path
-        event = _INFLIGHT_DOWNLOADS.get(shard_uri)
-        if event is None:
-            event = threading.Event()
-            _INFLIGHT_DOWNLOADS[shard_uri] = event
-            is_initiator = True
-
-    if not is_initiator:
-        # Waiter path. Block on the initiator's event with a bounded timeout
-        # so a wedged initiator cannot stall callers indefinitely. On a clean
-        # set(), re-check that the file actually materialised — the initiator
-        # may have failed, in which case the event fires but the file is
-        # absent and we surface that to the caller via the classifier as
-        # storage_unavailable (503), the right retry hint for "another caller
-        # tried, you should try again."
-        logging.getLogger(__name__).debug(
-            "coalesced waiter on %s", shard_uri,
-        )
-        completed = event.wait(_DOWNLOAD_COALESCE_WAIT_S)
-        if not completed:
-            logging.getLogger(__name__).warning(
-                "download coalescing timeout after %.1fs on %s",
-                _DOWNLOAD_COALESCE_WAIT_S, shard_uri,
-            )
-            raise DownloadCoalescingTimeout(
-                f"timed out after {_DOWNLOAD_COALESCE_WAIT_S}s waiting for "
-                f"an in-flight download of {shard_uri}"
-            )
-        if not os.path.exists(path):
-            # Initiator's download must have failed; the file is not there.
-            # Raise FileNotFoundError (not bare RuntimeError) so the existing
-            # classifier branch routes this to storage_unavailable / 503
-            # instead of the catch-all ephemeral_error / 500. Customers
-            # retrying on 503 get the right transient-failure semantics.
-            raise FileNotFoundError(
-                f"coalesced download of {shard_uri} did not produce a local file "
-                "(initiator likely failed); caller should retry"
-            )
-        return path
-
-    # Initiator path. Do the actual download, then publish the file via an
-    # atomic rename. Cleanup of the in-flight entry runs in `finally` so a
-    # failure does NOT leave a stale entry that wedges every future caller
-    # as a perpetual waiter — the next caller becomes a fresh initiator on
-    # a fresh event and can retry the download.
-    #
-    # `download_to` streams the GET to `tmp` without buffering the whole
-    # object in RAM. The previous `f.write(read_bytes(shard_uri))` pattern
-    # OOMed the DP container on a multi-GB shard (a 6 GB Python bytes
-    # object inside a 2 GB cgroup limit).
-    from adapters.storage.storage import download_to
-
-    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
-    try:
-        try:
-            download_to(shard_uri, tmp)
-            os.replace(tmp, path)
-        except BaseException:
-            # On any failure before the rename, remove the leftover temp
-            # file so a crash mid-write does not leak `.tmp` files into
-            # CACHE_DIR. Best-effort: the file may already be gone.
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        return path
-    finally:
-        # Order matters: clear the registry FIRST so a thread that wakes from
-        # `event.wait()` and re-enters this function sees no in-flight entry
-        # and becomes a fresh initiator (if the file is still missing).
-        # Then set the event so existing waiters unblock and re-check the
-        # filesystem. Both steps run on both success and failure paths.
-        with _INFLIGHT_DOWNLOADS_LOCK:
-            _INFLIGHT_DOWNLOADS.pop(shard_uri, None)
-        event.set()
+    return _ensure_cached_shared(
+        shard_uri,
+        cache_dir=CACHE_DIR,
+        coalescing=True,
+        inflight=_INFLIGHT_DOWNLOADS,
+        inflight_lock=_INFLIGHT_DOWNLOADS_LOCK,
+        coalesce_wait_s=_DOWNLOAD_COALESCE_WAIT_S,
+        timeout_exc=DownloadCoalescingTimeout,
+    )
 
 
 def map_hits_to_matches(
@@ -1573,69 +1423,25 @@ def validate_query_body(
 def _classify_hot_path_error(exc: BaseException) -> Tuple[str, str]:
     """Map a hot-path exception to a v1 `(error_code, safe_message)` tuple.
 
-    Mirrors `services/ephemeral_runner/run.py:_classify_error` so the hot
-    path and the ephemeral path surface the same error codes for the same
-    failure shapes (a `PermissionError` on the cache fs is `cache_unavailable`
-    in both worlds; an S3 outage is `storage_unavailable` in both). The
-    duplicate exists rather than a shared helper because the ephemeral runner
-    deliberately avoids importing from the query_api package — a circular
-    import — so the classification table is held twice. Keep them in sync.
+    The hot path and the ephemeral path (`services/ephemeral_runner/run.py:
+    _classify_error`) surface the same error codes for the same failure shapes
+    (a `PermissionError` on the cache fs is `cache_unavailable` in both worlds;
+    an S3 outage is `storage_unavailable` in both) because both delegate to the
+    one canonical classification table (see below).
 
     `safe_message` is built from the exception CLASS NAME only; `str(exc)` is
     never surfaced — a botocore `ClientError` carries an endpoint URL and
     sometimes signed-URL params that must not leak to the customer.
-    """
-    if isinstance(exc, RecallUnavailable):
-        # The recall (pgvector) tier is unreachable for this query — a typed
-        # boundary error raised ONLY by the recall search path (`recall_search`
-        # wraps a recall-store connection failure / sustained recall-pool
-        # exhaustion in `RecallUnavailable`). Distinct, retryable 503: NOT the
-        # generic `ephemeral_error` 500 (benchmark finding C2: an unclassified
-        # psycopg2 OperationalError from the recall path used to hard-500), NOT
-        # the write-side `recall_write_failed`. The query path must NOT silently
-        # serve consolidated-only results — a recall outage means recent,
-        # unconsolidated writes are unreadable, so a silent consolidated-only 200 would
-        # break read-your-writes without signal. A 503 tells the client to retry.
-        # Scoped by TYPE, not by `isinstance(exc, OperationalError)`, so an
-        # identical psycopg2 error from the control-plane/consolidated path is NOT
-        # misclassified as recall_unavailable.
-        return "recall_unavailable", "Recall tier is temporarily unavailable"
-    if isinstance(exc, PermissionError):
-        return "cache_unavailable", "Shard cache is unreadable or unwritable"
-    if isinstance(exc, shard_tier.CacheCapacityExceeded):
-        # SSD-tier admission floor (`MIN_RESIDENT_S`) rejected a speculative
-        # arrival because every eviction candidate is too young. Distinct from
-        # `storage_unavailable` so an operator dashboard can tell capacity
-        # pressure from a storage outage; both map to 503 but the dedicated
-        # code is the upsize signal for `RB_SHARD_TIER_BYTES`.
-        return "cache_capacity_exceeded", "SSD cache tier is at capacity"
-    if isinstance(exc, (DownloadCoalescingTimeout, shard_tier.ShardTierTimeout)):
-        # Bounded-wait coalescing timeout — the in-flight initiator hasn't
-        # released the event within the configured deadline. Transient by
-        # design; the next request becomes a fresh initiator on a fresh event.
-        # `DownloadCoalescingTimeout` is the legacy `_ensure_cached` path;
-        # `ShardTierTimeout` is the SSD-tier path — both describe the same
-        # operational condition from the customer's perspective and collapse
-        # to the same 503 so a client-side retry policy does not
-        # need to distinguish which layer timed out.
-        return "storage_unavailable", "Shard storage is temporarily unavailable"
-    if isinstance(exc, FileNotFoundError):
-        return "storage_unavailable", "Shard storage is temporarily unavailable"
-    # Optional botocore import — boto3 may not be installed in a memory-only
-    # test environment. A late import keeps this module's import graph slim.
-    try:
-        from botocore.exceptions import ClientError as _BotoClientError  # type: ignore
 
-        if isinstance(exc, _BotoClientError):
-            return (
-                "storage_unavailable",
-                "Shard storage is temporarily unavailable",
-            )
-    except Exception:  # noqa: BLE001 - boto3 missing in this env
-        pass
-    if isinstance(exc, OSError):
-        return "cache_unavailable", "Shard cache I/O error"
-    return "ephemeral_error", f"Query failed: {type(exc).__name__}"
+    The classification table itself now lives once in
+    `adapters.errors.classify_query_error` (the canonical home — it owns the
+    exception hierarchy and the only adapter-layer imports the table needs); this
+    is a thin back-compat wrapper that pins the hot-path catch-all message
+    (`"Query failed: <Cls>"`). Both this and the ephemeral runner's
+    `_classify_error` delegate to the same canonical table, so the codes/messages
+    cannot drift apart again.
+    """
+    return classify_query_error(exc, default_message_prefix="Query failed")
 
 
 # --- Recall + Consolidated union (RB_RECALL) ------------------------------
@@ -2281,6 +2087,19 @@ async def v1_query(
         body = await request.json()
     except Exception:  # noqa: BLE001
         return _err(400, "invalid_request", "Request body must be JSON")
+
+    # Parse the known `/v1/query` keys through the lenient `QueryRequest`
+    # Pydantic model. The model only mirrors the wire shape — it ignores extra
+    # keys and does NOT coerce or range-check values (those checks, and their
+    # load-bearing order and v1 error codes, stay in `validate_query_body`).
+    # A JSON body that is not an object is passed through UNCHANGED so
+    # `validate_query_body` still emits the "Request body must be a JSON
+    # object" 400; `model_dump(exclude_unset=True)` reproduces the legacy
+    # `body.get(...)` semantics exactly by forwarding only the keys the caller
+    # actually sent (so server-side defaults are still applied downstream, and
+    # an explicit `null` is preserved).
+    if isinstance(body, dict):
+        body = QueryRequest.model_validate(body).model_dump(exclude_unset=True)
 
     return execute_v1_query(
         tenant_id,

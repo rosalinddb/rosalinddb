@@ -20,10 +20,8 @@ import io
 import json
 import os
 import time
-import threading
 import uuid
 from typing import Dict, Any, Iterable
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from adapters.observability import init_observability
 from adapters.observability import metrics as obs_metrics
@@ -48,7 +46,11 @@ from adapters.state.state import (
     update_import_job,
     try_consume_vectors,
 )
-from adapters.metrics.metrics import counter, snapshot
+from adapters.metrics.metrics import counter
+from adapters.metrics.server import (
+    make_metrics_handler,
+    start_metrics_server as _start_metrics_server,
+)
 from services.auth.quota import quotas_enabled
 
 # Observability bootstrap at import so it works whether this module runs as a
@@ -662,80 +664,17 @@ def _landing_prefix(dataset: str, tenant: str) -> str:
     return f"{base}{dataset}"
 
 
-class MetricsHandler(BaseHTTPRequestHandler):
-    """HTTP handler for metrics endpoints."""
-
-    def do_GET(self):
-        """Handle GET requests for metrics."""
-        if self.path == "/metrics":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(snapshot()).encode())
-        elif self.path == "/prometheus":
-            self._serve_prometheus()
-        elif self.path == "/healthz":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status": "ok", "service": "validator_worker"}')
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def _serve_prometheus(self):
-        """Serve Prometheus format metrics."""
-        try:
-            from prometheus_client import CollectorRegistry, generate_latest, Gauge
-        except ImportError:
-            self.send_response(503)
-            self.end_headers()
-            self.wfile.write(b"prometheus-client not installed")
-            return
-
-        reg = CollectorRegistry()
-        snap = snapshot()
-        counters = snap.get("counters", {})
-        gauges = snap.get("gauges", {})
-        timers = snap.get("timers", {})
-
-        # Export counters as gauges
-        for name, value in counters.items():
-            g = Gauge(f"validator_{name}", f"validator counter {name}", registry=reg)
-            g.set(float(value))
-
-        # Export gauges
-        for name, value in gauges.items():
-            g = Gauge(f"validator_{name}", f"validator gauge {name}", registry=reg)
-            g.set(float(value))
-
-        # Export timer stats
-        for name, values in timers.items():
-            if values:
-                count = len(values)
-                avg_ms = (sum(values) / count) * 1000.0
-                Gauge(f"validator_{name}_count", f"validator timer {name} count", registry=reg).set(float(count))
-                Gauge(f"validator_{name}_avg_ms", f"validator timer {name} avg ms", registry=reg).set(float(avg_ms))
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; version=0.0.4")
-        self.end_headers()
-        self.wfile.write(generate_latest(reg))
-
-    def log_message(self, format, *args):
-        """Suppress default HTTP logging."""
-        pass
+# The metrics HTTP handler + server are the canonical implementation in
+# `adapters.metrics.server`. `MetricsHandler` is re-exported (a configured
+# subclass with this service's `/healthz` service name + Prometheus prefix) so
+# the name stays importable from this module; `start_metrics_server()` keeps its
+# no-arg signature and forwards this service's two strings + `METRICS_PORT`.
+MetricsHandler = make_metrics_handler("validator_worker", "validator_")
 
 
 def start_metrics_server():
     """Start the metrics HTTP server in a background thread."""
-    def run_server():
-        server = HTTPServer(("0.0.0.0", METRICS_PORT), MetricsHandler)
-        server.serve_forever()
-
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
-    print(f"Metrics server started on port {METRICS_PORT}")
+    return _start_metrics_server("validator_worker", "validator_", METRICS_PORT)
 
 
 def main_loop():

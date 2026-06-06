@@ -30,13 +30,13 @@ import hashlib
 import json
 import os
 import time
-import threading
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import List, Optional
 
 import faiss  # type: ignore
 import numpy as np
+
+from config import truthy as _truthy
 
 from adapters.observability import init_observability
 from adapters.observability import metrics as obs_metrics
@@ -72,7 +72,11 @@ from adapters.landing.parquet_reader import (
     read_landing_parts,
     read_shard_sidecar,
 )
-from adapters.metrics.metrics import counter, snapshot
+from adapters.metrics.metrics import counter
+from adapters.metrics.server import (
+    make_metrics_handler,
+    start_metrics_server as _start_metrics_server,
+)
 
 # Observability bootstrap at import — see validator_worker/run.py for the
 # single-process vs separate-process rationale. Idempotent.
@@ -120,13 +124,6 @@ def _recall_idle_seconds() -> float:
         except (TypeError, ValueError):
             pass
     return 60.0
-
-
-def _truthy(value: Optional[str]) -> bool:
-    """Env-flag parser. Mirror of `services.query_api.v1_query._truthy` —
-    duplicated to keep this module's import graph slim (one line of parsing
-    is not worth a cross-package import)."""
-    return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _delta_tier_enabled() -> bool:
@@ -2414,80 +2411,18 @@ def _major_compaction(tenant: str, dataset: str) -> Optional[str]:
     return new_uri
 
 
-class MetricsHandler(BaseHTTPRequestHandler):
-    """HTTP handler for metrics endpoints."""
-
-    def do_GET(self):
-        """Handle GET requests for metrics."""
-        if self.path == "/metrics":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(snapshot()).encode())
-        elif self.path == "/prometheus":
-            self._serve_prometheus()
-        elif self.path == "/healthz":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status": "ok", "service": "index_builder"}')
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def _serve_prometheus(self):
-        """Serve Prometheus format metrics."""
-        try:
-            from prometheus_client import CollectorRegistry, generate_latest, Gauge
-        except ImportError:
-            self.send_response(503)
-            self.end_headers()
-            self.wfile.write(b"prometheus-client not installed")
-            return
-
-        reg = CollectorRegistry()
-        snap = snapshot()
-        counters = snap.get("counters", {})
-        gauges = snap.get("gauges", {})
-        timers = snap.get("timers", {})
-
-        # Export counters as gauges
-        for name, value in counters.items():
-            g = Gauge(f"builder_{name}", f"builder counter {name}", registry=reg)
-            g.set(float(value))
-
-        # Export gauges
-        for name, value in gauges.items():
-            g = Gauge(f"builder_{name}", f"builder gauge {name}", registry=reg)
-            g.set(float(value))
-
-        # Export timer stats
-        for name, values in timers.items():
-            if values:
-                count = len(values)
-                avg_ms = (sum(values) / count) * 1000.0
-                Gauge(f"builder_{name}_count", f"builder timer {name} count", registry=reg).set(float(count))
-                Gauge(f"builder_{name}_avg_ms", f"builder timer {name} avg ms", registry=reg).set(float(avg_ms))
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; version=0.0.4")
-        self.end_headers()
-        self.wfile.write(generate_latest(reg))
-
-    def log_message(self, format, *args):
-        """Suppress default HTTP logging."""
-        pass
+# The metrics HTTP handler + server are the canonical implementation in
+# `adapters.metrics.server`. `MetricsHandler` is re-exported (a configured
+# subclass with this service's `/healthz` service name + Prometheus prefix —
+# note the prefix is `builder_`, NOT `index_builder_`) so the name stays
+# importable from this module; `start_metrics_server()` keeps its no-arg
+# signature and forwards this service's two strings + `METRICS_PORT`.
+MetricsHandler = make_metrics_handler("index_builder", "builder_")
 
 
 def start_metrics_server():
     """Start the metrics HTTP server in a background thread."""
-    def run_server():
-        server = HTTPServer(("0.0.0.0", METRICS_PORT), MetricsHandler)
-        server.serve_forever()
-
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
-    print(f"Metrics server started on port {METRICS_PORT}")
+    return _start_metrics_server("index_builder", "builder_", METRICS_PORT)
 
 
 def main_loop():

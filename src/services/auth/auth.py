@@ -20,6 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, ValidationError
 
+from adapters.errors import error_envelope
 from adapters.observability import metrics as obs_metrics
 from adapters.state import state as state_mod
 from services.auth.jwt_utils import (
@@ -68,11 +69,10 @@ def _err(status_code: int, code: str, message: str, details: Optional[dict] = No
 
     Centralising this prevents the router from drifting from the contract
     when new error codes are added; every handler funnels through here.
+    Delegates to the canonical `adapters.errors.error_envelope` (same
+    byte-for-byte body).
     """
-    body: dict = {"error": {"code": code, "message": message}}
-    if details is not None:
-        body["error"]["details"] = details
-    return JSONResponse(status_code=status_code, content=body)
+    return error_envelope(status_code, code, message, details)
 
 
 def _auth_disabled_404() -> JSONResponse:
