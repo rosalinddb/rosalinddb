@@ -27,7 +27,6 @@ Design notes / MVP limitations:
 """
 from __future__ import annotations
 
-import os
 import threading
 import time
 from typing import Dict, Optional
@@ -35,6 +34,7 @@ from typing import Dict, Optional
 from fastapi import Header
 from fastapi.responses import JSONResponse
 
+from adapters import config
 from adapters.errors import RateLimited, set_rate_limited_response_factory
 from adapters.observability import metrics as obs_metrics
 from services.auth.jwt_utils import (
@@ -72,20 +72,15 @@ def quotas_enabled() -> bool:
     turn full quota enforcement back on.
     Truthy values: `1`, `true`, `yes`, `on` (case-insensitive).
     """
-    return os.getenv("RB_ENABLE_QUOTAS", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    return config.enable_quotas()
 
 
 # --- rate limiter ---------------------------------------------------------
 
 # MVP defaults from the v1 contract "Rate limits" section. Overridable via env
 # so the E2E harness can dial them down to force a `rate_limited` 429 cheaply.
-RATE_LIMIT_RPS = float(os.getenv("RB_RATE_LIMIT_RPS", "50"))
-RATE_LIMIT_BURST = float(os.getenv("RB_RATE_LIMIT_BURST", "100"))
+RATE_LIMIT_RPS = config.rate_limit_rps()
+RATE_LIMIT_BURST = config.rate_limit_burst()
 
 
 class _TokenBucket:

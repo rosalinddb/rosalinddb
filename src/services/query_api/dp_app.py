@@ -22,7 +22,7 @@ import os
 
 from fastapi import FastAPI, Request
 
-from adapters.config import truthy as _truthy
+from adapters import config
 from adapters.observability import init_observability
 from adapters.observability.otel import instrument_fastapi
 from adapters.state.conn_middleware import RequestScopedConnectionMiddleware
@@ -54,7 +54,7 @@ install_pool_exhaustion_handler(app)
 # limiting at the edge.
 app.include_router(dp_query_router)
 
-CACHE_DIR = os.getenv("CACHE_DIR", "/var/cache/shards")
+CACHE_DIR = config.cache_dir()
 
 _log = logging.getLogger("rosalinddb.query_dp")
 
@@ -75,7 +75,9 @@ def on_start():
     in production, so emit a loud WARNING. Startup is NOT hard-failed — that
     would break dev and the test suite.
     """
-    if not os.getenv("RB_PROXY_SECRET"):
+    # Fail-fast on required-at-boot config (reads env fresh) before serving.
+    config.validate()
+    if not config.proxy_secret():
         _log.warning(
             "RB_PROXY_SECRET is unset — the Query-DP /v1/query shared-secret "
             "check is DISABLED. The DP is an unauthenticated FAISS endpoint "
@@ -89,7 +91,7 @@ def on_start():
     # `RB_PREWARM_ON_BUILD=true`; the DP consumes when this env opts in.
     # Defaults preserve current behaviour (no consumer thread, no admit
     # path engaged) so the rollback contract holds.
-    if _truthy(os.getenv("RB_PREWARM_CONSUMER")):
+    if config.prewarm_consumer():
         from services._common import prewarm_consumer
 
         prewarm_consumer.start_if_needed()
@@ -101,7 +103,7 @@ def on_start():
     # wiring pattern so an operator scanning startup code sees the
     # activation surface in one place. Defaults preserve current behaviour
     # (no thread, no DB writes).
-    if _truthy(os.getenv("RB_DP_RESIDENCY_REGISTRY")):
+    if config.dp_residency_registry():
         from services._common import residency_writer
 
         residency_writer.start_if_needed()
@@ -117,7 +119,7 @@ def on_stop():
     request_stop()
     # Stop the PREWARM_SHARD consumer if it was started. Idempotent so
     # calling stop on a never-started consumer is a clean no-op.
-    if _truthy(os.getenv("RB_PREWARM_CONSUMER")):
+    if config.prewarm_consumer():
         try:
             from services._common import prewarm_consumer
 
@@ -128,7 +130,7 @@ def on_stop():
     # stop on a never-started writer is a clean no-op. Wrapped so a stuck
     # writer cannot block the shutdown of its sibling subsystems (the
     # daemon thread is left to die with the process if the join times out).
-    if _truthy(os.getenv("RB_DP_RESIDENCY_REGISTRY")):
+    if config.dp_residency_registry():
         try:
             from services._common import residency_writer
 
@@ -166,7 +168,7 @@ def healthz():
 #
 # The consumer path (`services/_common/prewarm_consumer.py`) is the bulk
 # producer; this endpoint is the operator's manual hook.
-if _truthy(os.getenv("RB_ADMIN_ENDPOINTS")):
+if config.admin_endpoints():
 
     @app.post("/admin/prewarm", include_in_schema=False)
     async def admin_prewarm(request: Request):

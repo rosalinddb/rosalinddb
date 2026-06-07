@@ -7,13 +7,13 @@ dataset, and performs a FAISS top-K search. In the minimal implementation,
 results are computed and discarded; production would return via callback.
 """
 
-import os
 import time
 from typing import Any, Dict, Optional, Tuple
 
 import faiss  # type: ignore
 import numpy as np
 
+from adapters import config
 from adapters.cache import CatalogCache, ensure_cached as _ensure_cached_shared
 from adapters.errors import classify_query_error
 from adapters.observability import init_observability
@@ -46,7 +46,6 @@ from services.query_api.v1_query import (
     _MMAP_ENABLED,
     _ivf_search_params,
     _read_major_faults,
-    _truthy,
     metadata_matches_filter,
 )
 
@@ -60,8 +59,8 @@ from services.query_api.v1_query import (
 # Observability bootstrap at import — idempotent; see validator_worker/run.py.
 init_observability("rosalinddb-ephemeral-runner")
 
-CACHE_DIR = os.getenv("CACHE_DIR", "/var/cache/shards")
-METRICS_PORT = int(os.getenv("METRICS_PORT", "9102"))
+CACHE_DIR = config.cache_dir()
+METRICS_PORT = config.ephemeral_metrics_port()
 
 
 # --- Per-`(tenant, dataset)` catalog cache -----------------------------------
@@ -86,15 +85,12 @@ def _now() -> float:
 
 def _catalog_freshness_s() -> float:
     """`RB_CATALOG_FRESHNESS_S` in seconds (default 5; 0 disables cache)."""
-    try:
-        return max(0.0, float(os.getenv("RB_CATALOG_FRESHNESS_S", "5")))
-    except ValueError:
-        return 5.0
+    return config.catalog_freshness_s()
 
 
 def _catalog_cache_active() -> bool:
     """Active iff SSD tier is on AND TTL is positive (default-off rollback)."""
-    return bool(os.getenv("RB_SHARD_TIER_BYTES")) and _catalog_freshness_s() > 0
+    return config.shard_tier_bytes_set() and _catalog_freshness_s() > 0
 
 
 def _cached_list_shards(tenant: str, dataset: str) -> list:
@@ -139,9 +135,7 @@ def _catalog_cache_clear() -> None:
 # Match the v1_query opt-in: subscribe the cache invalidator to the
 # LISTEN consumer when `RB_CATALOG_LISTEN=true`. Default-off; with the
 # env unset, no thread is spawned and the TTL pull is the only channel.
-# Reuse v1_query's `_truthy` (already imported above) to keep the truthy
-# semantics provably identical between the two mirrors.
-if _truthy(os.getenv("RB_CATALOG_LISTEN")):
+if config.catalog_listen():
     from services._common import catalog_listener as _catalog_listener
 
     _catalog_listener.subscribe(_on_catalog_notify)
@@ -379,6 +373,8 @@ def main_loop():
     still publishes its own envelope, and a message exhausting
     `QUEUE_MAX_ATTEMPTS` is dead-lettered exactly as before.
     """
+    # Fail-fast on required-at-boot config (reads env fresh) before consuming.
+    config.validate()
     migrate()
     install_signal_handlers()
     start_metrics_server()

@@ -36,7 +36,7 @@ from typing import List, Optional
 import faiss  # type: ignore
 import numpy as np
 
-from adapters.config import truthy as _truthy
+from adapters import config
 
 from adapters.observability import init_observability
 from adapters.observability import metrics as obs_metrics
@@ -82,7 +82,7 @@ from adapters.metrics.server import (
 # single-process vs separate-process rationale. Idempotent.
 init_observability("rosalinddb-index-builder")
 
-DIMENSION = int(os.getenv("VECTOR_DIM", os.getenv("DIMENSION", "1536")))
+DIMENSION = config.vector_dim()
 # Recall touch-up: for non-tiny datasets the builder builds a FAISS **IVFFlat**
 # index — an IVF coarse quantizer over **raw, uncompressed float32 vectors** —
 # instead of the previous IVF+PQ. IVF+PQ's ~8x lossy Product-Quantization
@@ -92,11 +92,11 @@ DIMENSION = int(os.getenv("VECTOR_DIM", os.getenv("DIMENSION", "1536")))
 # codes — which is acceptable for an object-storage-first product: object
 # storage is cheap, and RosalindDB's cost pitch is about not paying for idle
 # compute, not about squeezing index bytes. See `docs/indexing.md`.
-INDEX_TYPE = os.getenv("INDEX_TYPE", "ivfflat")
-INDEXES_PREFIX = os.getenv("INDEXES_PREFIX", "s3://rosalinddb/indexes")
-LANDING_PREFIX = os.getenv("LANDING_PREFIX", "s3://rosalinddb/landing")
-TENANT_PREFIX = os.getenv("TENANT_PREFIX", "true").lower() == "true"
-METRICS_PORT = int(os.getenv("METRICS_PORT", "9101"))
+INDEX_TYPE = config.index_type()
+INDEXES_PREFIX = config.indexes_prefix()
+LANDING_PREFIX = config.landing_prefix()
+TENANT_PREFIX = config.tenant_prefix()
+METRICS_PORT = config.index_metrics_port()
 
 # --- Recall→Consolidated consolidation knobs (RB_RECALL, default OFF) ------
 #
@@ -115,15 +115,7 @@ def _recall_idle_seconds() -> float:
     tick → drains to 0 recall rows → idle queries skip pgvector entirely
     (scale-to-zero). A missing/malformed value falls back to the default.
     """
-    raw = os.getenv("RB_RECALL_IDLE_S")
-    if raw:
-        try:
-            val = float(raw)
-            if val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
-    return 60.0
+    return config.recall_idle_s()
 
 
 def _delta_tier_enabled() -> bool:
@@ -141,7 +133,7 @@ def _delta_tier_enabled() -> bool:
     tier is OFF by default; PR-D lands the delta-count cap before anyone enables
     it). See bench-lab/research/phase1-spec.md §9 (rollback).
     """
-    return _truthy(os.getenv("RB_DELTA_TIER"))
+    return config.delta_tier()
 
 
 # `RB_MAX_DELTAS` (default 8) — the live-delta count that triggers a MAJOR
@@ -152,15 +144,7 @@ def _delta_tier_enabled() -> bool:
 # with prior art (SlateDB `l0_compaction_threshold_ssts`/`level_compaction_
 # threshold_runs` = 8). See phase1-spec.md §7, opendata-rfcs-notes.md item 1.
 def _max_deltas() -> int:
-    raw = os.getenv("RB_MAX_DELTAS")
-    if raw:
-        try:
-            val = int(raw)
-            if val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
-    return 8
+    return config.max_deltas()
 
 
 # `RB_MAX_DELTAS_HARD` (default 16) — a BACKSTOP ceiling above the compaction
@@ -172,15 +156,7 @@ def _max_deltas() -> int:
 # is observed `>= _max_deltas_hard()` we emit a metric/log AND force one more
 # compaction attempt, so read amplification cannot grow unbounded silently.
 def _max_deltas_hard() -> int:
-    raw = os.getenv("RB_MAX_DELTAS_HARD")
-    if raw:
-        try:
-            val = int(raw)
-            if val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
-    return 16
+    return config.max_deltas_hard()
 
 
 def _compute_shard_uri(tenant: str, dataset: str, shard_name: str, blob: bytes) -> str:
@@ -198,7 +174,7 @@ def _compute_shard_uri(tenant: str, dataset: str, shard_name: str, blob: bytes) 
     that two builds of the same bytes converge on the same S3 key (cheap
     dedup) and two builds of different bytes can never collide.
     """
-    if _truthy(os.getenv("RB_SHARD_VERSIONED_URIS")):
+    if config.shard_versioned_uris():
         # `INDEXES_PREFIX` is `s3://{bucket}[/{prefix...}]`. The new shape
         # ignores any path prefix and writes flat under the bucket — see the
         # versioned-URI rationale in `docs/architecture/ssd-cache.md`.
@@ -247,7 +223,7 @@ BUILD_SKIPPED = -1
 # vectors and trains no codebook, so the index-type gate only needs IVF's
 # floor. The old `_pq_training_floor()` / `_choose_pq_m()` helpers and the
 # `PQ_NBITS`/`PQ_M` env knobs are therefore gone.
-IVF_TRAINING_FLOOR = max(4, int(os.getenv("IVF_TRAINING_FLOOR", "64")))
+IVF_TRAINING_FLOOR = config.ivf_training_floor()
 
 
 def _choose_nlist(n_vectors: int) -> int:
@@ -269,7 +245,7 @@ def _choose_nlist(n_vectors: int) -> int:
     import math
 
     rule_of_thumb = int(4 * math.sqrt(max(1, n_vectors)))
-    ceiling = int(os.getenv("IVF_NLIST", "4096"))
+    ceiling = config.ivf_nlist()
     # never more cells than 1/8 of the points — keeps every posting non-empty
     # and leaves k-means enough training points per centroid.
     nlist = min(rule_of_thumb, ceiling, max(1, n_vectors // 8))
@@ -759,7 +735,7 @@ def _union_rebuild_blob(
 # shard is the one queries load; the one before it is a grace buffer for an
 # in-flight query that resolved it as the latest shard moments before this
 # build wrote a newer one and is still faulting it into its local cache.
-_SHARDS_TO_KEEP = max(2, int(os.getenv("SHARD_KEEP", "2")))
+_SHARDS_TO_KEEP = config.shard_keep()
 
 
 def _sweep_superseded_shards(tenant: str, dataset: str) -> int:
@@ -1049,9 +1025,7 @@ def _write_shard(
     # runs AFTER `add_shard` so a queue-side failure cannot leave a PREWARM
     # message pointing at an uncataloged shard, and is wrapped in best-effort
     # error handling so a queue blip cannot fail an otherwise-successful build.
-    if os.getenv("RB_PREWARM_ON_BUILD", "false").strip().lower() in (
-        "1", "true", "yes", "on",
-    ):
+    if config.prewarm_on_build():
         try:
             publish(
                 "PREWARM_SHARD",
@@ -2462,6 +2436,8 @@ def main_loop():
     home. On `SIGTERM` the loop stops pulling new messages and the reaper
     thread is signalled to stop via the shared shutdown event.
     """
+    # Fail-fast on required-at-boot config (reads env fresh) before consuming.
+    config.validate()
     migrate()
     install_signal_handlers()
     start_metrics_server()

@@ -48,7 +48,6 @@ BODY VALIDATION — accepted v1 behaviour change:
 import asyncio
 import hashlib
 import logging
-import os
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -59,6 +58,7 @@ from fastapi.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
 
+from adapters import config
 from adapters.errors import error_envelope
 from adapters.observability import metrics as obs_metrics
 from adapters.state.state import get_tenant_dp_pool, try_consume_query
@@ -145,15 +145,15 @@ def resolve_dp_base_url(dp_pool: str) -> str:
 
     The returned URL has no trailing slash; callers append `/v1/query` etc.
     """
-    shared = os.getenv("QUERY_DP_URL", "http://localhost:8090").rstrip("/")
+    shared = config.query_dp_url().rstrip("/")
     if not dp_pool or dp_pool == SHARED_POOL:
         return shared
     if dp_pool.startswith("dedicated-"):
         tenant = dp_pool[len("dedicated-") :]
-        env_key = "QUERY_DP_URL_" + "".join(
+        env_suffix = "".join(
             c if c.isalnum() else "_" for c in tenant
         ).upper()
-        dedicated = os.getenv(env_key)
+        dedicated = config.query_dp_url_for(env_suffix)
         if dedicated:
             return dedicated.rstrip("/")
         # Dedicated pool not provisioned yet -> fall back to shared, never to
@@ -197,8 +197,7 @@ def _routing_enabled() -> bool:
     Read live (per-request) so a test can flip the gate without re-importing
     the module — matches the style of `_query_timeout` / `_connect_retries`.
     """
-    raw = os.getenv("RB_ROUTING_RENDEZVOUS", "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    return config.routing_rendezvous()
 
 
 def _routing_key(tenant_id: str, dataset: str) -> str:
@@ -286,15 +285,16 @@ def _resolve_pool_urls(dp_pool: str) -> Tuple[str, List[str]]:
     exact variable the operator must fix.
     """
     shared_env = "QUERY_DP_URL"
-    shared_raw = os.getenv(shared_env, "http://localhost:8090")
+    shared_raw = config.query_dp_url()
     if not dp_pool or dp_pool == SHARED_POOL:
         return shared_env, _parse_dp_urls(shared_raw)
     if dp_pool.startswith("dedicated-"):
         tenant = dp_pool[len("dedicated-") :]
-        env_key = "QUERY_DP_URL_" + "".join(
+        env_suffix = "".join(
             c if c.isalnum() else "_" for c in tenant
         ).upper()
-        dedicated_raw = os.getenv(env_key)
+        env_key = "QUERY_DP_URL_" + env_suffix
+        dedicated_raw = config.query_dp_url_for(env_suffix)
         if dedicated_raw:
             return env_key, _parse_dp_urls(dedicated_raw)
         # Dedicated pool not provisioned -> fall back to shared (parity with
@@ -466,10 +466,10 @@ def _read_timeout_s() -> float:
     knob never masks a valid legacy knob, and a non-positive value falls back
     instead of being clamped to a near-zero budget.
     """
-    value = _parse_positive_timeout_s(os.getenv("RB_QUERY_DP_READ_TIMEOUT_S"))
+    value = _parse_positive_timeout_s(config.query_dp_read_timeout_s())
     if value is None:
         # Backwards-compat: the legacy scalar knob now tunes the read budget.
-        value = _parse_positive_timeout_s(os.getenv("RB_QUERY_DP_TIMEOUT_S"))
+        value = _parse_positive_timeout_s(config.query_dp_timeout_s())
     if value is None:
         return _DEFAULT_READ_TIMEOUT_S
     return value
@@ -483,7 +483,7 @@ def _connect_timeout_s() -> float:
     non-positive value falls back to the default rather than being clamped to a
     near-zero budget. Read live.
     """
-    value = _parse_positive_timeout_s(os.getenv("RB_QUERY_DP_CONNECT_TIMEOUT_S"))
+    value = _parse_positive_timeout_s(config.query_dp_connect_timeout_s())
     if value is None:
         return _DEFAULT_CONNECT_TIMEOUT_S
     return value
@@ -518,10 +518,7 @@ def _connect_retries() -> int:
     unreachable / connection refused). A request that reached the DP and
     produced a 5xx is NOT retried — see `_proxy`.
     """
-    try:
-        return max(0, int(os.getenv("RB_QUERY_DP_CONNECT_RETRIES", "2")))
-    except (TypeError, ValueError):
-        return 2
+    return config.query_dp_connect_retries()
 
 
 def _connect_retry_backoff_s() -> float:
@@ -532,10 +529,7 @@ def _connect_retry_backoff_s() -> float:
     unreachable DP. A short sleep gives a transiently-restarting DP node a
     moment to come back.
     """
-    try:
-        return max(0.0, float(os.getenv("RB_QUERY_DP_CONNECT_BACKOFF_S", "0.025")))
-    except (TypeError, ValueError):
-        return 0.025
+    return config.query_dp_connect_backoff_s()
 
 
 def _build_client(base_url: str) -> httpx.AsyncClient:
@@ -555,10 +549,8 @@ def _build_client(base_url: str) -> httpx.AsyncClient:
         http2=True,
         timeout=_query_timeout(),
         limits=httpx.Limits(
-            max_connections=int(os.getenv("RB_QUERY_DP_MAX_CONNECTIONS", "100")),
-            max_keepalive_connections=int(
-                os.getenv("RB_QUERY_DP_MAX_KEEPALIVE", "20")
-            ),
+            max_connections=config.query_dp_max_connections(),
+            max_keepalive_connections=config.query_dp_max_keepalive(),
         ),
     )
 
@@ -625,7 +617,7 @@ def _trusted_headers(tenant_id: str) -> Dict[str, str]:
         TENANT_HEADER: tenant_id,
         "Content-Type": "application/json",
     }
-    secret = os.getenv("RB_PROXY_SECRET")
+    secret = config.proxy_secret()
     if secret:
         headers[PROXY_SECRET_HEADER] = secret
     return headers

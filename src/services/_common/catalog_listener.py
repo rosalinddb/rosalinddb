@@ -35,7 +35,6 @@ code — no connection opened, no thread spawned.
 
 import json
 import logging
-import os
 import select
 import threading
 import time
@@ -43,6 +42,8 @@ from typing import Callable, List, Optional
 
 import psycopg2
 import psycopg2.extensions
+
+from adapters import config
 
 
 _LOG = logging.getLogger(__name__)
@@ -160,9 +161,7 @@ def _is_running() -> bool:
 def _dsn() -> str:
     """Read the DSN at start time so a flip-flopping env across pod
     restarts cleanly toggles the listener target."""
-    return os.getenv(
-        "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/vectors"
-    )
+    return config.database_url_dsn()
 
 
 def _start_if_needed() -> None:

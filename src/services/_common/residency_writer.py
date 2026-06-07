@@ -46,11 +46,11 @@ must not stop the writer.
 """
 
 import logging
-import os
 import threading
 import time
 from typing import Dict, Optional, Set, Tuple
 
+from adapters import config
 from adapters.state import state
 from adapters.storage import shard_tier
 from services._common.dp_id import dp_id
@@ -81,8 +81,7 @@ def _gate_enabled() -> bool:
     pod restarts cleanly toggles the writer. Matches the rest of the
     codebase's env-flag parsing — `true` / `1` / `yes`.
     """
-    value = os.getenv("RB_DP_RESIDENCY_REGISTRY", "")
-    return value.strip().lower() in ("1", "true", "yes", "on")
+    return config.dp_residency_registry()
 
 
 def _sync_interval_s() -> float:
@@ -93,7 +92,7 @@ def _sync_interval_s() -> float:
     and the first cycle. The 0.001-second floor prevents an operator
     accidentally pinning the worker into a busy loop.
     """
-    raw = os.getenv("RB_DP_RESIDENCY_SYNC_S")
+    raw = config.dp_residency_sync_s()
     if raw is None or raw.strip() == "":
         return _DEFAULT_SYNC_INTERVAL_S
     try:

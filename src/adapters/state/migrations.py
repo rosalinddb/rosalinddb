@@ -26,9 +26,10 @@ this; see `pooling.py` for the same seam rationale).
 
 import contextlib
 import datetime as _dt
-import os
 import threading
 from pathlib import Path
+
+from adapters import config
 
 # The state module owns the mutable process-wide globals + the recall connection
 # seam. Reference them through `_state.X` at call time. Imported here, but every
@@ -154,7 +155,7 @@ def migrate(force: bool = False):
         # tenants store (see _bootstrap_default_tenant_memory).
         _bootstrap_default_tenant_memory()
         return
-    if not force and os.getenv("RB_SKIP_MIGRATE", "").lower() in ("1", "true", "yes"):
+    if not force and config.skip_migrate():
         # Schema applied out-of-band (see docstring) — skip to avoid the
         # cross-process AccessExclusiveLock deadlock. `force=True` (the release
         # command) bypasses this: it must apply the schema regardless.
@@ -354,7 +355,7 @@ def migrate_recall(force: bool = False) -> bool:
     if dsn is None:
         # Recall tier off — nothing to migrate, nothing connects to a recall store.
         return False
-    if not force and os.getenv("RB_SKIP_MIGRATE", "").lower() in ("1", "true", "yes"):
+    if not force and config.skip_migrate():
         # Schema applied out-of-band (same contract as the control-plane
         # migrate()); a recall DSN IS configured, so report True.
         return True

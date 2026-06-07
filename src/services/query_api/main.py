@@ -18,6 +18,7 @@ import numpy as np
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 
+from adapters import config
 from adapters.observability import init_observability
 from adapters.observability.otel import instrument_fastapi
 from adapters.state.conn_middleware import RequestScopedConnectionMiddleware
@@ -59,7 +60,7 @@ install_rate_limit_handler(app)
 # process.
 app.include_router(v1_query_router)
 
-CACHE_DIR = os.getenv("CACHE_DIR", "/var/cache/shards")
+CACHE_DIR = config.cache_dir()
 
 
 class QueryRequest(BaseModel):
@@ -128,6 +129,8 @@ def on_start():
     surface read ephemeral results from that single shared store — running two
     consumer threads would split messages between them.
     """
+    # Fail-fast on required-at-boot config (reads env fresh) before serving.
+    config.validate()
     migrate()
     os.makedirs(CACHE_DIR, exist_ok=True)
     start_result_consumer()
@@ -188,8 +191,8 @@ def query(req: QueryRequest, tenant_id: str = Depends(current_tenant_id)):
     dashboard and existing tests.
     """
     start = time.time()
-    top_k = req.top_k or int(os.getenv("TOP_K", "10"))
-    mode = req.mode or os.getenv("QUERY_MODE", "auto")
+    top_k = req.top_k or config.top_k()
+    mode = req.mode or config.query_mode()
 
     if mode in ("hot", "auto"):
         try:
@@ -221,7 +224,7 @@ def query(req: QueryRequest, tenant_id: str = Depends(current_tenant_id)):
         "vector": req.vector,
         "top_k": top_k,
         "correlation_id": correlation_id,
-        "reply_to": os.getenv("RESULT_TOPIC", "RESULT_READY"),
+        "reply_to": config.result_topic(),
     }
     publish("RUN_EPHEMERAL_QUERY", payload)
     counter("ephemeral_queries", 1)

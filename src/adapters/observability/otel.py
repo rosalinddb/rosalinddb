@@ -31,10 +31,9 @@ Env vars honoured:
 """
 
 import logging
-import os
 import threading
 
-from adapters.config import truthy as _truthy
+from adapters import config
 
 # --- module state ---------------------------------------------------------
 
@@ -55,7 +54,7 @@ def is_disabled() -> bool:
     Honours the standard `OTEL_SDK_DISABLED` env var so tests can switch the
     whole SDK off without touching code.
     """
-    return _truthy(os.getenv("OTEL_SDK_DISABLED"))
+    return config.otel_sdk_disabled()
 
 
 def is_enabled() -> bool:
@@ -70,14 +69,11 @@ def service_name() -> str:
 
 def _otlp_endpoint() -> str:
     """Resolve the OTLP/HTTP base endpoint (no signal path suffix)."""
-    return os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318").rstrip("/")
+    return config.otel_exporter_otlp_endpoint()
 
 
 def _export_timeout_s() -> int:
-    try:
-        return int(float(os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT", str(_DEFAULT_EXPORT_TIMEOUT_S))))
-    except (TypeError, ValueError):
-        return _DEFAULT_EXPORT_TIMEOUT_S
+    return config.otel_exporter_otlp_timeout()
 
 
 def init_observability(service_name: str) -> bool:
@@ -95,7 +91,7 @@ def init_observability(service_name: str) -> bool:
     """
     global _INITIALIZED, _SERVICE_NAME
 
-    resolved = os.getenv("OTEL_SERVICE_NAME") or service_name
+    resolved = config.otel_service_name() or service_name
     _SERVICE_NAME = resolved
 
     if is_disabled():
@@ -161,7 +157,7 @@ def _bootstrap(resolved_service_name: str) -> None:
     )
     metric_reader = PeriodicExportingMetricReader(
         metric_exporter,
-        export_interval_millis=int(os.getenv("OTEL_METRIC_EXPORT_INTERVAL", "10000")),
+        export_interval_millis=config.otel_metric_export_interval(),
     )
     meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
     _metrics_api.set_meter_provider(meter_provider)

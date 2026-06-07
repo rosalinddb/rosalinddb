@@ -18,11 +18,11 @@ Queue message handling:
 
 import io
 import json
-import os
 import time
 import uuid
 from typing import Dict, Any, Iterable
 
+from adapters import config
 from adapters.observability import init_observability
 from adapters.observability import metrics as obs_metrics
 from adapters.observability.tracing import validate_dataset_span, landing_write_span
@@ -59,20 +59,20 @@ from services.auth.quota import quotas_enabled
 init_observability("rosalinddb-validator")
 
 
-DIMENSION = int(os.getenv("VECTOR_DIM", os.getenv("DIMENSION", "1536")))
+DIMENSION = config.vector_dim()
 # Landing parts are written exclusively as parquet — `bson_writer.py` and the
 # `LANDING_FORMAT` env switch were removed on this branch.
 LANDING_FORMAT = "parquet"
-LANDING_PREFIX = os.getenv("LANDING_PREFIX", "s3://rosalinddb/landing")
-TENANT_PREFIX = os.getenv("TENANT_PREFIX", "true").lower() == "true"
-METRICS_PORT = int(os.getenv("METRICS_PORT", "9100"))
+LANDING_PREFIX = config.landing_prefix()
+TENANT_PREFIX = config.tenant_prefix()
+METRICS_PORT = config.validator_metrics_port()
 # Bulk-import staged-upload size cap. The presigned-PUT URL handed to the
 # client cannot enforce this server-side (only a presigned-POST policy could,
 # and presigned POST is not universally supported across S3-compatible
 # backends — so the bulk-import flow uses presigned PUT). The cap is enforced
 # here: `process_import` `head`s the staged object and fails the job if it is
 # larger. Must mirror `_IMPORT_MAX_BYTES` in `source_registry/main.py`.
-IMPORT_MAX_BYTES = int(os.getenv("IMPORT_MAX_BYTES", str(5 * 1024 * 1024 * 1024)))
+IMPORT_MAX_BYTES = config.import_max_bytes()
 
 
 def _dataset_dimension(tenant: str, dataset: str, fallback: int) -> int:
@@ -98,7 +98,13 @@ def _validate_record(obj: Dict[str, Any], dim: int | None = None) -> Dict[str, A
     tests (`tests/unit/test_validator.py`) working without modification.
     """
     if dim is None:
-        dim = int(os.getenv("VECTOR_DIM", os.getenv("DIMENSION", str(DIMENSION))))
+        # Fresh `VECTOR_DIM`/`DIMENSION` read (via config); when BOTH are unset
+        # fall back to the module-level `DIMENSION` snapshot, matching the
+        # original nested-getenv default `str(DIMENSION)` exactly.
+        if not config.vector_dim_set():
+            dim = DIMENSION
+        else:
+            dim = config.vector_dim()
     if "id" not in obj or not isinstance(obj["id"], str) or not obj["id"]:
         raise ValueError("missing id")
     values = obj.get("values")
@@ -687,6 +693,8 @@ def main_loop():
     `QUEUE_MAX_ATTEMPTS`). On `SIGTERM` the loop stops pulling new messages and
     exits cleanly so the in-flight message is acked/nacked before shutdown.
     """
+    # Fail-fast on required-at-boot config (reads env fresh) before consuming.
+    config.validate()
     migrate()
     install_signal_handlers()
     start_metrics_server()

@@ -32,13 +32,13 @@ so every `except PoolCheckoutTimeout` frame (here and in callers) keeps matching
 
 import contextlib
 import contextvars
-import os
 import time
 from typing import Iterator, Optional
 
 import psycopg2
 import psycopg2.pool
 
+from adapters import config
 from adapters.errors import PoolCheckoutTimeout
 from adapters.observability.tracing import state_connect_span
 
@@ -59,9 +59,7 @@ _POOL_CHECKOUT_POLL_S = 0.015  # sleep between fail-fast getconn() retries (~15m
 
 def _dsn() -> str:
     """Return the Postgres DSN from the environment (Postgres mode only)."""
-    return os.getenv(
-        "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/vectors"
-    )
+    return config.database_url_dsn()
 
 
 def _conn():
@@ -96,10 +94,7 @@ def _pool_max_size() -> int:
     database's connection cap when many worker processes run side by side. A
     missing or malformed value falls back to the default rather than crashing.
     """
-    raw = os.getenv("RB_PG_POOL_MAX")
-    if raw and raw.isdigit() and int(raw) > 0:
-        return int(raw)
-    return _DEFAULT_PG_POOL_MAX
+    return config.pg_pool_max()
 
 
 def _pool_checkout_timeout_s() -> float:
@@ -111,15 +106,7 @@ def _pool_checkout_timeout_s() -> float:
     up with a 503. Read live (per call) so a test can retune it without a
     module reload. A missing or malformed value falls back to the default.
     """
-    raw = os.getenv("RB_PG_POOL_CHECKOUT_TIMEOUT_S")
-    if raw:
-        try:
-            val = float(raw)
-            if val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
-    return _DEFAULT_POOL_CHECKOUT_TIMEOUT_S
+    return config.pg_pool_checkout_timeout_s()
 
 
 def _get_pool(maxconn_override: Optional[int] = None) -> psycopg2.pool.ThreadedConnectionPool:
