@@ -4,7 +4,7 @@
 
 # RosalindDB
 
-**Object-storage-first vector database for cold and bursty workloads.**
+**Object-storage-native vector database with read-your-writes.**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -15,153 +15,162 @@
 
 ---
 
-RosalindDB stores FAISS IVFFlat shards on any S3-compatible object store and
-serves nearest-neighbour search out of a byte-budgeted in-process cache. The
-always-on footprint is small; heavy work (validate, build, cold queries) runs
-on queue-driven workers that can scale to zero.
+## What it is
 
-**Built for:** agent long-term memory, indie or early-stage RAG over
-slowly-changing corpora, batch retrieval, internal-tool search, cost-sensitive
-similarity lookups where always-on cluster pricing is the wrong shape.
+The index lives where your data already lives — on object storage — and search is served from a small, byte-budgeted in-process cache. No always-on cluster; cost tracks what you query, not corpus size.
 
-**Not built for:** sub-10ms p50 interactive search at scale, billion-vector
-multi-tenant production on a single node, or a drop-in replacement for a
-tuned hot-tier in-memory cluster.
+The differentiator is **strong read-your-writes**: an optional **recall tier** (pgvector) takes synchronous, immediately-queryable upserts, while the cold **consolidate tier** holds FAISS shards on S3. Queries union the two LSM-style — recall is the memtable, the S3 shards are the SSTables.
 
-## Quickstart
-
-Requirements: Docker and `curl`. No signup.
-
-```bash
-git clone https://github.com/rosalinddb/rosalinddb.git
-cd rosalinddb
-docker compose up
-```
-
-The Control Plane comes up on `http://localhost:8080` as the single public
-origin. MinIO, Postgres, Redis, and the validator / builder / ephemeral
-workers all run privately on the compose network.
-
-Once the stack is healthy:
-
-```bash
-# Create a dataset (dimension fixed at create time).
-curl -X POST http://localhost:8080/v1/datasets \
-  -H 'Content-Type: application/json' \
-  -d '{"name": "products", "dimension": 4}'
-
-# Ingest a couple of vectors as NDJSON.
-curl -X POST http://localhost:8080/v1/datasets/products/vectors \
-  -H 'Content-Type: application/x-ndjson' \
-  --data-binary $'{"id":"a","values":[0.1,0.2,0.3,0.4],"metadata":{"category":"books"}}\n{"id":"b","values":[0.5,0.5,0.5,0.5],"metadata":{"category":"movies"}}\n'
-
-# Query (top-k nearest, optional AND-of-equals metadata filter).
-curl -X POST http://localhost:8080/v1/query \
-  -H 'Content-Type: application/json' \
-  -d '{"dataset":"products","vector":[0.1,0.2,0.3,0.4],"top_k":2,"filter":{"category":"books"}}'
-```
-
-For uploads above the 10 MiB request cap, use the async bulk-import flow in
-[`docs/api/imports.md`](docs/api/imports.md). The full REST contract — every
-endpoint, every error code — is in [`docs/api/v1.md`](docs/api/v1.md).
+- **Built for** — agent memory, early-stage RAG, batch retrieval, cost-sensitive search.
+- **Not for** — sub-10ms p50 at scale, billion-vector single-node, a drop-in hot-tier cluster.
 
 ## Features
 
-- Vector search — FAISS IVFFlat shards on S3-compatible object storage.
-- Metadata filtering — flat AND-of-equals, strict type-and-value match
-  (no coercion, no ranges, no OR in v1).
-- Incremental indexing — subsequent ingests `add()` to the trained shard;
-  no full rebuild per batch.
-- Async bulk import — NDJSON and Parquet via presigned PUT, with a
-  rejected-records report and `continue`/`abort` modes.
-- Multi-tenancy and API keys — opt-in via `RB_REQUIRE_AUTH=true`.
-- Per-tenant quotas — opt-in via `RB_ENABLE_QUOTAS=true`.
-- CP / DP split — public Control Plane, private Data Plane; the query
-  path is isolated from auth and ingest admission.
-- Reliable queue — Redis-backed, at-least-once delivery, DLQ, reaper.
-- OpenTelemetry observability — metrics, traces, structured logs over OTLP
-  to any backend you point it at.
-- One image, many roles — every service runs from the same `Dockerfile`;
-  per-process commands live in `docker-compose.yml`.
-
-## Run modes
-
-| Mode | Auth | Quotas | Use case |
-|---|---|---|---|
-| OSS default | off | off | Local dev. Single-tenant self-host on a private network. |
-| Production self-host | on | optional | Multi-tenant self-host behind a public URL. |
-
-**OSS default.** `docker compose up`. No auth, single implicit `default`
-tenant, quotas off, one public port (`:8080`). The CP logs a loud warning on
-startup if it detects a likely-public bind. **Do not expose this to the
-public internet without flipping `RB_REQUIRE_AUTH=true` first.**
-
-**Production self-host.** Set `RB_REQUIRE_AUTH=true` to turn on the full
-signup + API-key + multi-tenant stack. Set `RB_ENABLE_QUOTAS=true` to
-enforce per-tenant vector and query caps. Set a real `JWT_SECRET` (e.g.
-`openssl rand -hex 32`) — the bundled `dev-secret` is a dev-only default
-and a non-starter for anything real. Point `DATABASE_URL`, `REDIS_URL`, and
-the `S3_*` envs at your own managed services. Walkthrough in
-[`docs/deploy/self-host.md`](docs/deploy/self-host.md).
+- **Object-storage-native** — immutable FAISS IVFFlat shards on any S3 store; no always-on cluster.
+- **Strong read-your-writes** — optional pgvector recall tier; upserts are durable and instantly queryable.
+- **LSM tiering** — hot recall ∪ cold S3 shards on a `consolidated_lsn` watermark; optional delta tier for incremental compaction.
+- **One image, five roles** — control plane, query DP, validator, index builder, ephemeral runner.
+- **Scale-to-zero workers** — Redis reliable queue + DLQ + reaper.
+- **Auth & quotas, opt-in** — off by default; two env switches make it multi-tenant (JWT + API keys).
+- **OpenTelemetry** — OTLP traces/metrics/logs, fully no-op-able.
 
 ## Architecture
 
-Five service roles, one image: a public **Control Plane** (auth, dataset
-CRUD, ingest admission, `/v1/query` reverse proxy) plus a private
-**Query Data Plane** and three async workers (`validator_worker`,
-`index_builder`, `ephemeral_runner`) that consume from a Redis reliable
-queue. Each dataset owns one or more FAISS IVFFlat shards on object
-storage; subsequent ingests `add()` to the existing trained shard instead
-of rebuilding from scratch.
+Two tiers, partitioned by a write-freshness watermark:
 
-Full design — process roles, trust model, queue topics, catalog schema,
-shard cache budgeting — in
-[`docs/architecture/architecture.md`](docs/architecture/architecture.md).
+| Tier | Storage | Role | Flag |
+|---|---|---|---|
+| **Consolidated** (cold) | FAISS IVFFlat shards on S3 | always on | — |
+| **Recall** (hot) | separate pgvector instance | read-your-writes | `RB_RECALL_DSN` (off) |
+
+```
+read query
+  ├─► recall scan (pgvector, exact L2²)     lsn >  consolidated_lsn
+  └─► consolidated FAISS search (IVFFlat)    lsn <= consolidated_lsn
+         ▼
+   merge → recall wins above the watermark, tombstone/filter suppression,
+           sort by L2², truncate top_k        (wall-time ≈ max, not sum)
+```
+
+- **Watermark seam** — `consolidated_lsn` (on `shard_catalog`) puts every vector in exactly one tier, so the union is complete and non-overlapping.
+- **Consolidation** folds recall → cold shards and advances the watermark — on cap (`RB_RECALL_MAX_ROWS`, 2000) or idle (`RB_RECALL_IDLE_S`, 60s).
+- **Delta-tier LSM** (`RB_DELTA_TIER`, off) — cold shards become base + ≤8 deltas; minor fold is `O(new rows)`, major compaction at the cap. Validated flat to 1M vectors.
+
+→ [`recall-consolidate.md`](docs/architecture/recall-consolidate.md) · diagrams in [`docs/architecture/diagrams/`](docs/architecture/diagrams/)
+
+### Five roles, one image
+
+| Role | Command | Public |
+|---|---|---|
+| Control Plane | `services.control_plane.cp_app:app` | **yes — `:8080`** |
+| Query Data Plane | `services.query_api.dp_app:app` | no |
+| validator_worker | `python -m services.validator_worker.run` | no |
+| index_builder | `python -m services.index_builder.run` | no |
+| ephemeral_runner | `python -m services.ephemeral_runner.run` | no |
+
+The CP is the only public origin; workers consume a Redis queue. Infra: `postgres` (catalog), `pgvector` (recall, `:5433`, idle until enabled), `redis`, `minio` (S3). → [`architecture.md`](docs/architecture/architecture.md)
+
+## Quickstart
+
+Needs **Docker**.
+
+```bash
+git clone https://github.com/rosalinddb/rosalinddb.git && cd rosalinddb
+make run-local                         # build + docker compose up -d
+curl http://localhost:8080/healthz     # {"status":"ok","service":"control_plane"}
+make smoke                             # full happy-path check (health→ingest→query)
+```
+
+Only the CP publishes a port (`:8080`); everything else stays private to the compose network. Dev defaults (`postgres/postgres`, `minio/minio123`, auth **off**) are localhost-only.
+
+Minimal flow — auth is off by default, so no header is needed:
+
+```bash
+BASE=http://localhost:8080
+
+curl -s -X POST "$BASE/v1/datasets" -H 'Content-Type: application/json' \
+  -d '{"name":"demo","dimension":4}'
+
+printf '%s\n' '{"id":"v0","values":[0,1,2,3]}' '{"id":"v1","values":[1,2,3,4]}' \
+| curl -s -X POST "$BASE/v1/datasets/demo/vectors" \
+  -H 'Content-Type: application/x-ndjson' --data-binary @-
+
+curl -s "$BASE/v1/datasets/demo"       # poll until "status":"indexed"
+curl -s -X POST "$BASE/v1/query" -H 'Content-Type: application/json' \
+  -d '{"dataset":"demo","vector":[0,1,2,3],"top_k":5}'
+```
+
+`score` = raw FAISS L2 (lower is closer). `mode` ∈ `hot | cold | recall | ephemeral`. Auth-on: `POST /auth/signup`, then send `Authorization: Bearer rb_live_…`. Full contract → [`docs/api/v1.md`](docs/api/v1.md).
+
+## Configuration
+
+**Runs on defaults — set only what points at your infra.** Every flag is off by default; the full, typed surface is [`src/adapters/config.py`](src/adapters/config.py).
+
+| Var | Default | Purpose |
+|---|---|---|
+| `S3_ENDPOINT_URL` · `S3_ACCESS_KEY` · `S3_SECRET_KEY` | AWS / unset | Object store (MinIO, R2, GCS…) |
+| `INDEXES_PREFIX` · `LANDING_PREFIX` | `s3://rosalinddb/…` | Where shards / ingests live |
+| `DATABASE_URL` | `memory://local` | Catalog DSN — **point at Postgres for any real deploy** |
+| `RB_RECALL_DSN` | off | Separate pgvector instance → enables read-your-writes |
+| `RB_DELTA_TIER` | off | Delta-tier (LSM) query path |
+| `RB_REQUIRE_AUTH` | `false` | **Set `true` for any public deploy** |
+| `JWT_SECRET` | `dev-secret` | Required when auth on (`validate()` fails at boot if unset). `openssl rand -hex 32` |
+
+Tuning knobs — pools, `nprobe`, recall lifecycle, SSD cache, quotas, `OTEL_*` — all have safe defaults. → [`.env.example`](.env.example)
 
 ## Production notes
 
-A short, opinionated list — the things that have bitten real self-hosters.
+What bites real self-hosters:
 
-- **PgBouncer in transaction-pooling mode breaks advisory locks.** The
-  migrator and the per-dataset builder lock both rely on PostgreSQL
-  session-level advisory locks. PgBouncer's transaction mode releases the
-  lock between statements, which deadlocks the migration and lets two
-  builders race on the same dataset. Use session-pooling, or skip
-  PgBouncer for the catalog connection.
-- **The FAISS shard cache is ephemeral by design.** It lives inside the
-  container filesystem, warms on first cold query, and is gone on
-  `docker compose down`. There is no volume to persist — re-warm takes
-  seconds and avoids stale-cache hazards on shard rebuilds.
-- **JWTs are HS256 with a 24h TTL** and there is no refresh-token flow
-  yet. Server-to-server callers should mint `rb_live_…` API keys instead.
-- **API keys are SHA-256 hashed at rest.** The raw value is surfaced
-  once on creation and never again — store it where you'd store a
-  password.
+- **PgBouncer txn-pooling breaks advisory locks** — the migrator + builder lock need **session** pooling (the recall pgvector instance is fine on txn pooling).
+- **The shard cache is ephemeral** — warms on first cold query, gone on `compose down`; no volume to persist.
+- **JWTs are HS256 / 24h, no refresh** — server-to-server callers should use `rb_live_…` API keys.
+- **API keys are SHA-256 at rest** — the raw value is shown once; store it like a password.
 
-More gotchas in [`docs/deploy/self-host.md`](docs/deploy/self-host.md) §5.
+More → [`docs/deploy/self-host.md`](docs/deploy/self-host.md)
+
+## API
+
+Served from the CP on `:8080`. Full reference → [`docs/api/`](docs/api/).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/healthz` | Liveness (unauthenticated) |
+| `POST` | `/auth/signup` · `/auth/login` | Tenant / JWT (`404` when auth off) |
+| `POST` `GET` `DELETE` | `/v1/datasets[/{name}]` | Create / list / get / soft-delete a dataset |
+| `POST` `GET` | `/v1/datasets/{name}/vectors` | Ingest (NDJSON, 10 MiB) / list |
+| `GET` `DELETE` | `/v1/datasets/{name}/vectors/{id}` | Fetch / delete one vector |
+| `POST` | `/v1/datasets/{name}/imports` | Bulk import via presigned upload (5 GiB) |
+| `POST` | `/v1/query` | Nearest-neighbour query → `{matches, latency_ms, mode}` |
+| `GET` | `/v1/query/status/{job_id}` | Poll an async (`ephemeral`) result |
 
 ## MCP server
 
-The companion MCP server for Claude / Cursor users lives at
-[rosalinddb/rosalinddb-mcp](https://github.com/rosalinddb/rosalinddb-mcp).
-It exposes the full RosalindDB management surface (datasets, ingest,
-query) as MCP tools.
+Operate RosalindDB from any MCP client (Claude Desktop, Cursor, Claude Code) → [rosalinddb/rosalinddb-mcp](https://github.com/rosalinddb/rosalinddb-mcp).
 
 ## Development
 
-```bash
-make test               # unit + integration; integration needs Docker
-make test-unit          # fast, hermetic — memory:// storage, no Docker
-make test-integration   # real MinIO + Postgres + Redis via testcontainers
-make smoke              # post-deploy gate against a running instance
-make lint               # ruff check
-```
+Real installable package, **src-layout**, `pip install -e .` — imports are `services.*` / `adapters.*`, no path hacks. Python 3.11.
 
-Integration tests run against real MinIO and real Postgres because the
-storage and state adapters are the parts that break in production —
-fakes get fakey. Patch flow is in [`CONTRIBUTING.md`](CONTRIBUTING.md);
-vulnerability reports in [`SECURITY.md`](SECURITY.md).
+| Target | Does |
+|---|---|
+| `make venv` | `.venv` + `pip install -e .` |
+| `make test-unit` | `pytest -m unit` — hermetic, no Docker |
+| `make test-integration` | real MinIO via testcontainers (Docker) |
+| `make run-local` | build + `compose up -d` |
+| `make fmt` · `make lint` | ruff |
+
+Tests are marked by directory (`tests/unit` → unit, `tests/integration` → integration). Integration runs against real MinIO + Postgres on purpose — fakes get the seams (multipart, presigned URLs, advisory locks) wrong. Patch workflow → [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+```
+src/
+  services/   # 5 roles + auth, source_registry, _common
+  adapters/   # storage, state, recall, queue, cache, observability, config.py
+  schemas/    # request/response models
+tests/{unit,integration}/ · docs/ · bench/ (private)
+```
 
 ## License
 
-Apache 2.0. See [`LICENSE`](LICENSE).
+Apache 2.0 — [`LICENSE`](LICENSE).
+Deploy → [`self-host.md`](docs/deploy/self-host.md) · Architecture → [`docs/architecture/`](docs/architecture/) · Security → [`SECURITY.md`](SECURITY.md)
