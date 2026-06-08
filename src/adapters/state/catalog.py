@@ -253,114 +253,32 @@ def _parse_iso(value) -> Optional[_dt.datetime]:
 
 class _MemoryBackend:
     """In-memory (`memory://`) implementation of the dataset/shard CRUD. All
-    mutable state lives on `_state`."""
+    mutable state lives on `_state`.
+
+    EVERY method here acquires `_state._MEM_CATALOG_LOCK` (a process-wide
+    RLock) for the WHOLE body — both reads and mutations. The all-in-one
+    single-process server drives this store from many threads at once
+    (the index_builder daemon mutating shards/dataset status while uvicorn's
+    threadpool serves concurrent queries + CP writes), and `dataset_build_lock`
+    is a no-op in memory mode, so this lock is the only thing serialising the
+    read-modify-write of `_MEM_SHARD_ID`, the shared `_MEM_SHARDS` list, and the
+    `_MEM_DATASETS` dict. The lock is RE-ENTRANT because these methods (and the
+    notify hooks they fire) re-enter the catalog (e.g. a subscriber re-reading
+    `list_shards`). The lock is NEVER held across a call into the recall memtable
+    — only the catalog stores live under it — so the query path's sequential
+    catalog-then-recall calls cannot deadlock with `_MemRecall._lock`. The
+    Postgres backend does NOT take this lock (the database serialises its CRUD),
+    keeping that path byte-identical.
+    """
 
     # --- Datasets ---------------------------------------------------------
 
     def create_dataset(self, tenant_id, dataset_name, dimension, now):
-        key = (tenant_id, dataset_name)
-        existing = _state._MEM_DATASETS.get(key)
-        if existing is not None and not existing.get("deleted_at"):
-            raise ValueError("dataset_exists")
-        row = {
-            "tenant_id": tenant_id,
-            "dataset_name": dataset_name,
-            "dimension": dimension,
-            "row_count": 0,
-            "status": "empty",
-            "error_message": None,
-            "source_uris": [],
-            "landing_format": "jsonl",
-            "object_store_uri": None,
-            "last_indexed_at": None,
-            "status_updated_at": now,
-            "deleted_at": None,
-            "created_at": now,
-        }
-        _state._MEM_DATASETS[key] = row
-        return dict(row)
-
-    def get_dataset(self, tenant_id, dataset_name):
-        row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
-        if row is None or row.get("deleted_at"):
-            return None
-        return dict(row)
-
-    def list_datasets(self, tenant_id):
-        out = [
-            dict(row)
-            for (tid, _), row in _state._MEM_DATASETS.items()
-            if tid == tenant_id and not row.get("deleted_at")
-        ]
-        out.sort(key=lambda r: r["dataset_name"])
-        return out
-
-    def delete_dataset(self, tenant_id, dataset_name):
-        row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
-        if row is None or row.get("deleted_at"):
-            return False
-        row["deleted_at"] = _state._now_iso()
-        # Hard-delete the matching shard rows so list_shards returns []
-        # for this (tenant, dataset) immediately.
-        _state._MEM_SHARDS[:] = [
-            r for r in _state._MEM_SHARDS
-            if not (
-                r["tenant_id"] == tenant_id
-                and r["dataset_name"] == dataset_name
-            )
-        ]
-        # Fire the memory-backend NOTIFY so the DP's catalog cache (and
-        # any other in-process subscriber) sees the invalidation.
-        _fire_catalog_notify_memory({
-            "tenant": tenant_id,
-            "dataset": dataset_name,
-            "shard_uri": "",
-        })
-        return True
-
-    def update_dataset_status(self, tenant_id, dataset_name, status, error_message, last_indexed_at):
-        row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
-        if row is None:
-            return
-        row["status"] = status
-        row["status_updated_at"] = _state._now_iso()
-        if error_message is not None:
-            row["error_message"] = error_message
-        elif status != "error":
-            # Clear stale error on a non-error transition.
-            row["error_message"] = None
-        if last_indexed_at is not None:
-            row["last_indexed_at"] = last_indexed_at
-
-    def find_stale_datasets(self, statuses, cutoff):
-        out: List[dict] = []
-        for row in _state._MEM_DATASETS.values():
-            if row.get("deleted_at") or row.get("status") not in statuses:
-                continue
-            updated = _parse_iso(row.get("status_updated_at"))
-            if updated is None or updated <= cutoff:
-                out.append(dict(row))
-        return out
-
-    def fail_dataset_if_stale(self, tenant_id, dataset_name, error_message, statuses, cutoff):
-        row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
-        if row is None or row.get("deleted_at"):
-            return False
-        if row.get("status") not in statuses:
-            # A worker already moved it to a terminal status — do not clobber.
-            return False
-        updated = _parse_iso(row.get("status_updated_at"))
-        if updated is not None and updated > cutoff:
-            return False
-        row["status"] = "error"
-        row["status_updated_at"] = _state._now_iso()
-        row["error_message"] = error_message
-        return True
-
-    def upsert_dataset(self, tenant_id, dataset_name, dimension, source_uri, landing_format):
-        key = (tenant_id, dataset_name)
-        row = _state._MEM_DATASETS.get(key)
-        if row is None:
+        with _state._MEM_CATALOG_LOCK:
+            key = (tenant_id, dataset_name)
+            existing = _state._MEM_DATASETS.get(key)
+            if existing is not None and not existing.get("deleted_at"):
+                raise ValueError("dataset_exists")
             row = {
                 "tenant_id": tenant_id,
                 "dataset_name": dataset_name,
@@ -369,26 +287,137 @@ class _MemoryBackend:
                 "status": "empty",
                 "error_message": None,
                 "source_uris": [],
-                "landing_format": landing_format,
+                "landing_format": "jsonl",
                 "object_store_uri": None,
                 "last_indexed_at": None,
-                "status_updated_at": _state._now_iso(),
+                "status_updated_at": now,
                 "deleted_at": None,
-                "created_at": _state._now_iso(),
+                "created_at": now,
             }
             _state._MEM_DATASETS[key] = row
-        row["landing_format"] = landing_format
-        row.setdefault("source_uris", []).append(source_uri)
+            return dict(row)
+
+    def get_dataset(self, tenant_id, dataset_name):
+        with _state._MEM_CATALOG_LOCK:
+            row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
+            if row is None or row.get("deleted_at"):
+                return None
+            return dict(row)
+
+    def list_datasets(self, tenant_id):
+        with _state._MEM_CATALOG_LOCK:
+            out = [
+                dict(row)
+                for (tid, _), row in _state._MEM_DATASETS.items()
+                if tid == tenant_id and not row.get("deleted_at")
+            ]
+        out.sort(key=lambda r: r["dataset_name"])
+        return out
+
+    def delete_dataset(self, tenant_id, dataset_name):
+        with _state._MEM_CATALOG_LOCK:
+            row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
+            if row is None or row.get("deleted_at"):
+                return False
+            row["deleted_at"] = _state._now_iso()
+            # Hard-delete the matching shard rows so list_shards returns []
+            # for this (tenant, dataset) immediately.
+            _state._MEM_SHARDS[:] = [
+                r for r in _state._MEM_SHARDS
+                if not (
+                    r["tenant_id"] == tenant_id
+                    and r["dataset_name"] == dataset_name
+                )
+            ]
+            # Fire the memory-backend NOTIFY so the DP's catalog cache (and
+            # any other in-process subscriber) sees the invalidation. Fired
+            # under the RLock: a subscriber that re-reads `list_shards` re-enters
+            # the same re-entrant lock (safe), and subscribers never touch the
+            # recall memtable, so no cross-lock ordering arises.
+            _fire_catalog_notify_memory({
+                "tenant": tenant_id,
+                "dataset": dataset_name,
+                "shard_uri": "",
+            })
+            return True
+
+    def update_dataset_status(self, tenant_id, dataset_name, status, error_message, last_indexed_at):
+        with _state._MEM_CATALOG_LOCK:
+            row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
+            if row is None:
+                return
+            row["status"] = status
+            row["status_updated_at"] = _state._now_iso()
+            if error_message is not None:
+                row["error_message"] = error_message
+            elif status != "error":
+                # Clear stale error on a non-error transition.
+                row["error_message"] = None
+            if last_indexed_at is not None:
+                row["last_indexed_at"] = last_indexed_at
+
+    def find_stale_datasets(self, statuses, cutoff):
+        with _state._MEM_CATALOG_LOCK:
+            out: List[dict] = []
+            for row in _state._MEM_DATASETS.values():
+                if row.get("deleted_at") or row.get("status") not in statuses:
+                    continue
+                updated = _parse_iso(row.get("status_updated_at"))
+                if updated is None or updated <= cutoff:
+                    out.append(dict(row))
+            return out
+
+    def fail_dataset_if_stale(self, tenant_id, dataset_name, error_message, statuses, cutoff):
+        with _state._MEM_CATALOG_LOCK:
+            row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
+            if row is None or row.get("deleted_at"):
+                return False
+            if row.get("status") not in statuses:
+                # A worker already moved it to a terminal status — do not clobber.
+                return False
+            updated = _parse_iso(row.get("status_updated_at"))
+            if updated is not None and updated > cutoff:
+                return False
+            row["status"] = "error"
+            row["status_updated_at"] = _state._now_iso()
+            row["error_message"] = error_message
+            return True
+
+    def upsert_dataset(self, tenant_id, dataset_name, dimension, source_uri, landing_format):
+        with _state._MEM_CATALOG_LOCK:
+            key = (tenant_id, dataset_name)
+            row = _state._MEM_DATASETS.get(key)
+            if row is None:
+                row = {
+                    "tenant_id": tenant_id,
+                    "dataset_name": dataset_name,
+                    "dimension": dimension,
+                    "row_count": 0,
+                    "status": "empty",
+                    "error_message": None,
+                    "source_uris": [],
+                    "landing_format": landing_format,
+                    "object_store_uri": None,
+                    "last_indexed_at": None,
+                    "status_updated_at": _state._now_iso(),
+                    "deleted_at": None,
+                    "created_at": _state._now_iso(),
+                }
+                _state._MEM_DATASETS[key] = row
+            row["landing_format"] = landing_format
+            row.setdefault("source_uris", []).append(source_uri)
 
     def increment_row_count(self, tenant_id, dataset_name, count):
-        row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
-        if row:
-            row["row_count"] = row.get("row_count", 0) + count
+        with _state._MEM_CATALOG_LOCK:
+            row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
+            if row:
+                row["row_count"] = row.get("row_count", 0) + count
 
     def set_row_count(self, tenant_id, dataset_name, value):
-        row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
-        if row:
-            row["row_count"] = value
+        with _state._MEM_CATALOG_LOCK:
+            row = _state._MEM_DATASETS.get((tenant_id, dataset_name))
+            if row:
+                row["row_count"] = value
 
     # --- Shards -----------------------------------------------------------
 
@@ -396,53 +425,56 @@ class _MemoryBackend:
                   index_type, build_type, uris, consolidated_lsn, quantizer_version,
                   parent_shard_id, level, covered_lsn_lo, covered_lsn_hi, tombstones,
                   notify_payload):
-        _state._MEM_SHARD_ID += 1
-        record = {
-            "id": _state._MEM_SHARD_ID,
-            "tenant_id": tenant_id,
-            "dataset_name": dataset_name,
-            "shard_uri": shard_uri,
-            "checksum": checksum,
-            "vector_count": vector_count,
-            "index_type": index_type,
-            "build_type": build_type,
-            "indexed_landing_uris": uris,
-            "consolidated_lsn": consolidated_lsn,
-            "sealed": True,
-            "supersedes": [],
-            "created_at": time.time(),
-            "quantizer_version": quantizer_version,
-            "parent_shard_id": parent_shard_id,
-            "level": level,
-            "covered_lsn_lo": covered_lsn_lo,
-            "covered_lsn_hi": covered_lsn_hi,
-            "tombstone_int_ids": tombstones,
-        }
-        _state._MEM_SHARDS.append(record)
-        # Fire AFTER the row is appended so any subscriber that immediately
-        # re-reads `list_shards` sees the new row (the contract the DP cache
-        # listener relies on).
-        _fire_catalog_notify_memory(notify_payload)
-        return _state._MEM_SHARD_ID
+        with _state._MEM_CATALOG_LOCK:
+            _state._MEM_SHARD_ID += 1
+            record = {
+                "id": _state._MEM_SHARD_ID,
+                "tenant_id": tenant_id,
+                "dataset_name": dataset_name,
+                "shard_uri": shard_uri,
+                "checksum": checksum,
+                "vector_count": vector_count,
+                "index_type": index_type,
+                "build_type": build_type,
+                "indexed_landing_uris": uris,
+                "consolidated_lsn": consolidated_lsn,
+                "sealed": True,
+                "supersedes": [],
+                "created_at": time.time(),
+                "quantizer_version": quantizer_version,
+                "parent_shard_id": parent_shard_id,
+                "level": level,
+                "covered_lsn_lo": covered_lsn_lo,
+                "covered_lsn_hi": covered_lsn_hi,
+                "tombstone_int_ids": tombstones,
+            }
+            _state._MEM_SHARDS.append(record)
+            # Fire AFTER the row is appended so any subscriber that immediately
+            # re-reads `list_shards` sees the new row (the contract the DP cache
+            # listener relies on). Fired under the RLock — see `delete_dataset`.
+            _fire_catalog_notify_memory(notify_payload)
+            return _state._MEM_SHARD_ID
 
     def list_shards(self, tenant_id, dataset_name):
-        return [
-            dict(r)
-            for r in sorted(_state._MEM_SHARDS, key=lambda x: x["id"], reverse=True)
-            if r["tenant_id"] == tenant_id and r["dataset_name"] == dataset_name
-        ]
+        with _state._MEM_CATALOG_LOCK:
+            return [
+                dict(r)
+                for r in sorted(_state._MEM_SHARDS, key=lambda x: x["id"], reverse=True)
+                if r["tenant_id"] == tenant_id and r["dataset_name"] == dataset_name
+            ]
 
     def delete_shards(self, tenant_id, dataset_name, id_set):
-        before = len(_state._MEM_SHARDS)
-        _state._MEM_SHARDS[:] = [
-            r for r in _state._MEM_SHARDS
-            if not (
-                r["tenant_id"] == tenant_id
-                and r["dataset_name"] == dataset_name
-                and r["id"] in id_set
-            )
-        ]
-        return before - len(_state._MEM_SHARDS)
+        with _state._MEM_CATALOG_LOCK:
+            before = len(_state._MEM_SHARDS)
+            _state._MEM_SHARDS[:] = [
+                r for r in _state._MEM_SHARDS
+                if not (
+                    r["tenant_id"] == tenant_id
+                    and r["dataset_name"] == dataset_name
+                    and r["id"] in id_set
+                )
+            ]
+            return before - len(_state._MEM_SHARDS)
 
 
 class _PostgresBackend:

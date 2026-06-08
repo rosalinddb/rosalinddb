@@ -44,9 +44,16 @@ def test_recall_tier_off_by_default(state):
 
 
 def test_recall_tier_needs_flag_and_dsn(state, monkeypatch):
-    """The tier is on ONLY when `RB_RECALL` is truthy AND `RB_RECALL_DSN` is set."""
-    # Flag alone (no DSN) -> still off: a deploy that forgets the DSN stays on
-    # the byte-identical flag-off path rather than erroring on every write.
+    """A PGVECTOR deploy needs BOTH `RB_RECALL` truthy AND `RB_RECALL_DSN` set.
+
+    Pinned to `RB_RECALL_BACKEND=pgvector` so this asserts the pgvector-tier
+    contract specifically (flag without a DSN stays off). The embedded-backend
+    path — `auto`/`memory` enables recall with NO DSN — is the all-in-one mode,
+    covered by `test_recall_memtable_parity::test_enabled_without_dsn`.
+    """
+    # pgvector backend: flag alone (no DSN) -> still off (a deploy that forgets
+    # the DSN stays on the byte-identical flag-off path rather than erroring).
+    monkeypatch.setenv("RB_RECALL_BACKEND", "pgvector")
     monkeypatch.setenv("RB_RECALL", "true")
     importlib.reload(state)
     assert state.recall_enabled() is False

@@ -89,6 +89,30 @@ _MEM_DATASETS: dict[Tuple[str, str], dict] = {}
 _MEM_SHARDS: list[dict] = []
 _MEM_SHARD_ID = 0
 
+# Process-wide RE-ENTRANT lock guarding EVERY in-memory catalog read AND mutation
+# (`_MEM_DATASETS`, `_MEM_SHARDS`, the `_MEM_SHARD_ID` allocation). The all-in-one
+# single-process server drives this catalog from MANY threads at once — the
+# index_builder daemon thread mutates it (`add_shard`/`update_dataset_status`/
+# `set_row_count`) while uvicorn's threadpool serves concurrent queries + CP
+# writes that read/mutate it. The `dataset_build_lock` is a yield-only no-op in
+# memory mode, so it provides NO serialisation; without this lock a concurrent
+# `add_shard` (read-modify-write of `_MEM_SHARD_ID`, append to the shared list)
+# racing a `list_shards`/`delete_dataset` is a data race (lost shard ids, torn
+# list reads). RE-ENTRANT because the memory backend methods call each other
+# (e.g. `delete_dataset` fires the notify hooks, `add_shard` re-reads after the
+# append) and `_MemoryBackend` is wrapped by public functions that may nest.
+# Postgres mode does NOT use this — its CRUD is serialised by the database (a
+# single `INSERT ... RETURNING` / `UPDATE ... WHERE`), so the `_PostgresBackend`
+# path never acquires it and stays byte-identical. OWNED here; `catalog.py`
+# acquires it via `_state._MEM_CATALOG_LOCK` so `importlib.reload(state)` /
+# `monkeypatch.setattr(state, …)` are honoured.
+#
+# Lock-ordering note: this lock and the recall memtable's `_MemRecall._lock` are
+# NEVER held nested. The query path calls the catalog (`list_shards`) and the
+# recall memtable (`recall_search`) SEQUENTIALLY, each releasing its lock before
+# the other is taken, so no lock-order deadlock is possible.
+_MEM_CATALOG_LOCK = threading.RLock()
+
 # In-memory tenant + api_key stores. Indexed by primary identifier for
 # O(1) lookup; we also expose `get_tenant_by_email` and `get_tenant_by_id`
 # so callers do not depend on which key we used. OWNED here; the quota/tenant
