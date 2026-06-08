@@ -108,12 +108,14 @@ jobs:
   # Post-publish smoke. ONLY on release tags (v*): pulls the JUST-PUBLISHED image
   # and brings the real compose stack up to prove the deploy path end to end
   # (pull -> up -> health -> dataset -> ingest -> async index -> query). Free on a
-  # public repo; tag-gated so routine main/`edge` pushes stay fast. Runs after the
+  # public repo; runs on release tags (pulls the semver image) and on manual
+  # workflow_dispatch (pulls `edge`), so routine `main` pushes stay fast but you
+  # can verify the deploy path on demand without cutting a tag. Runs after the
   # image job so the tag exists in the registry to pull.
   smoke:
     name: pull & smoke the published image
     needs: image
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -122,9 +124,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # v0.1.0 -> 0.1.0 : the semver tag docker-compose.yml pins via ${RB_IMAGE_TAG}.
+      # On a release tag (v0.1.0 -> 0.1.0) smoke the published semver image that
+      # docker-compose.yml pins via ${RB_IMAGE_TAG}; on a manual dispatch there is
+      # no version, so smoke the `edge` image the image job just pushed.
       - name: Resolve published image tag
-        run: echo "RB_IMAGE_TAG=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "RB_IMAGE_TAG=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "RB_IMAGE_TAG=edge" >> "$GITHUB_ENV"
+          fi
 
       # A freshly-published GHCR package is private until made public, so log in
       # (read scope) to pull it from the runner regardless of package visibility.
