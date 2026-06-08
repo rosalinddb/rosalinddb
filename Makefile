@@ -43,9 +43,12 @@ test: test-unit test-integration
 smoke:
 	$(PYTHON_BIN) scripts/smoke.py --base-url $(BASE_URL)
 
+# run-local: contributor compile-from-source flow. The default
+# `docker compose up` PULLS the published image; this layers the build override
+# so contributors build the image locally (tagged the same name the base file
+# pulls) and run it. Behaviour is identical to the old compile-from-source path.
 run-local:
-	$(MAKE) build
-	docker compose up -d
+	docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 fmt:
 	ruff format .

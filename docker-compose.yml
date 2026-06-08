@@ -1,8 +1,11 @@
 # RosalindDB — self-host docker compose stack.
 #
-# THE HEADLINE PORTABLE INSTALL PATH. `git clone && docker compose up --build`
-# from a fresh checkout MUST come up healthy with a single public origin at
-# `http://localhost:8080`, against which `python -m scripts.smoke` passes.
+# THE HEADLINE PORTABLE INSTALL PATH. `docker compose up` PULLS the published
+# image (`ghcr.io/rosalinddb/rosalinddb:0.1.0`) — no clone+build needed — and
+# comes up healthy with a single public origin at `http://localhost:8080`,
+# against which `python -m scripts.smoke` passes. Contributors who want the
+# from-source build path use the `docker-compose.build.yml` override (or
+# `make run-local`); see the note on the app services below.
 #
 # Topology mirrors a typical CP/DP split. The public/private network
 # isolation is provided by the Docker compose network (or your container
@@ -37,8 +40,11 @@
 #   index_builder   `services.index_builder.run`. Queue-driven, private.
 #   ephemeral_runner `services.ephemeral_runner.run`. Queue-driven, private.
 #
-# All Python services build from the root `Dockerfile`; per-service
-# `command:` overrides select the process role.
+# All Python services run the one published image
+# (`ghcr.io/rosalinddb/rosalinddb:0.1.0`); per-service `command:` overrides
+# select the process role. The default path PULLS this image. To build it from
+# the root `Dockerfile` instead, layer the build override:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
 #
 # Dev defaults below (postgres/postgres, minio/minio123, JWT_SECRET=dev-secret)
 # are for LOCAL DEVELOPMENT ONLY. For a real self-host install, override via
@@ -151,10 +157,7 @@ services:
   # so the app never boots against an un-migrated catalog. Replaces the
   # in-process auto-migrate that needed `RB_SKIP_MIGRATE=1` workarounds.
   migrator:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rosalinddb-backend:latest
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
     # Cold-boot race: on a fresh volume Postgres flips between "accepting
     # connections" / "rejecting connections" during its first-time initdb /
     # superuser-create phase, so `pg_isready` (the healthcheck) can report
@@ -200,10 +203,7 @@ services:
   # the bulk-import surface, and the /v1/query reverse proxy live here.
   # Self-hoster's client (CLI, SDK, dashboard) points at http://localhost:8080.
   cp:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rosalinddb-backend:latest
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
     command:
       [
         "uvicorn",
@@ -258,10 +258,7 @@ services:
   # is the only thing that talks to this; a self-hoster's traffic always
   # arrives via the CP at :8080.
   query_dp:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rosalinddb-backend:latest
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
     command:
       [
         "uvicorn",
@@ -307,10 +304,7 @@ services:
     restart: unless-stopped
 
   validator:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rosalinddb-backend:latest
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
     command: ["python", "-m", "services.validator_worker.run"]
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
@@ -338,10 +332,7 @@ services:
     restart: unless-stopped
 
   index_builder:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rosalinddb-backend:latest
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
     command: ["python", "-m", "services.index_builder.run"]
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
@@ -375,10 +366,7 @@ services:
     restart: unless-stopped
 
   ephemeral_runner:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rosalinddb-backend:latest
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
     command: ["python", "-m", "services.ephemeral_runner.run"]
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors

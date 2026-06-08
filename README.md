@@ -8,7 +8,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#quickstart)
+[![Docker image](https://img.shields.io/badge/ghcr.io-rosalinddb%2Frosalinddb-2496ED?logo=docker&logoColor=white)](https://github.com/rosalinddb/rosalinddb/pkgs/container/rosalinddb)
 [![Self-hostable](https://img.shields.io/badge/self--hostable-yes-green.svg)](docs/deploy/self-host.md)
 
 </div>
@@ -72,16 +72,25 @@ The CP is the only public origin; workers consume a Redis queue. Infra: `postgre
 
 ## Quickstart
 
-Needs **Docker**.
+Needs **Docker**. No clone or build — `docker compose up` **pulls** the published image (`ghcr.io/rosalinddb/rosalinddb:0.1.0`).
 
 ```bash
-git clone https://github.com/rosalinddb/rosalinddb.git && cd rosalinddb
-make run-local                         # build + docker compose up -d
+# grab just the two compose files (or clone the repo — either works)
+curl -O https://raw.githubusercontent.com/rosalinddb/rosalinddb/main/docker-compose.yml
+
+docker compose up -d                   # pulls ghcr.io/rosalinddb/rosalinddb:0.1.0
 curl http://localhost:8080/healthz     # {"status":"ok","service":"control_plane"}
 make smoke                             # full happy-path check (health→ingest→query)
 ```
 
 Only the CP publishes a port (`:8080`); everything else stays private to the compose network. Dev defaults (`postgres/postgres`, `minio/minio123`, auth **off**) are localhost-only.
+
+**Build from source (contributors).** To compile the image locally instead of pulling, layer the build override — this tags the local build with the same name the base file pulls:
+
+```bash
+git clone https://github.com/rosalinddb/rosalinddb.git && cd rosalinddb
+make run-local   # = docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
 
 Minimal flow — auth is off by default, so no header is needed:
 

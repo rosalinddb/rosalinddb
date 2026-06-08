@@ -1,0 +1,51 @@
+# RosalindDB — from-source build override (contributors).
+#
+# The base `docker-compose.yml` PULLS the published image
+# (`ghcr.io/rosalinddb/rosalinddb:0.1.0`). This override restores the
+# build-from-source path: it re-declares the 6 app services with a `build:`
+# block AND tags the locally built image the SAME name the base file pulls, so
+# the compose run uses the just-built image instead of pulling.
+#
+# Usage (also wired into `make run-local`):
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
+#
+# Only `build:`/`image:` are declared here; everything else (command, env,
+# ports, healthchecks, depends_on, networks, volumes) is inherited from the
+# base file. Bump the pinned tag in lockstep with docker-compose.yml on release.
+
+services:
+  migrator:
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  cp:
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  query_dp:
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  validator:
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  index_builder:
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  ephemeral_runner:
+    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
