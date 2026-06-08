@@ -73,7 +73,8 @@ def test_recall_backend_normalized(monkeypatch):
 
 
 def test_enabled_without_dsn(monkeypatch):
-    """RB_RECALL on + backend=memory (or auto) + no DSN => recall_enabled() True."""
+    """recall_enabled(): RB_RECALL on + backend=memory + no DSN => True; under
+    auto (default) + no DSN => False (safe no-op — the memtable is opt-in)."""
     import adapters.recall as recall_pkg
 
     # memory backend explicitly, no DSN -> enabled
@@ -83,10 +84,13 @@ def test_enabled_without_dsn(monkeypatch):
     importlib.reload(recall_pkg)
     assert recall_pkg.recall_enabled() is True
 
-    # auto backend, recall on, no DSN -> embedded selected -> enabled
+    # auto backend (default): recall on, no DSN -> NOT the memtable -> recall
+    # OFF (a safe no-op). The memtable is opt-in via RB_RECALL_BACKEND=memory;
+    # `auto` never silently falls back to a non-durable in-process store, so the
+    # default ingest path stays async (202) for any RB_RECALL-without-DSN deploy.
     monkeypatch.setenv("RB_RECALL_BACKEND", "auto")
     importlib.reload(recall_pkg)
-    assert recall_pkg.recall_enabled() is True
+    assert recall_pkg.recall_enabled() is False
 
     # RB_RECALL off -> disabled regardless of backend
     monkeypatch.delenv("RB_RECALL", raising=False)

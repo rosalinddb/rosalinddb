@@ -111,20 +111,20 @@ def _use_memory_backend() -> bool:
     `RB_RECALL_BACKEND`, default `auto`). The single decision point routing every
     recall_* function to `memtable` instead of pgvector:
 
-      - `memory` — always the embedded memtable (forces no-docker mode).
-      - `auto`   — the embedded memtable when recall is ON and no `RB_RECALL_DSN`
-        is configured (the all-in-one eval default); else the pgvector path.
-      - `pgvector` (or any other value) — never the memtable.
+      - `memory` — the embedded memtable. The all-in-one sets this EXPLICITLY
+        (`RB_RECALL_BACKEND=memory`); it is the only way to select the memtable.
+      - `auto` (default) / `pgvector` / anything else — NEVER the memtable; the
+        recall tier resolves to the pgvector path (DSN-gated in `recall_enabled`).
 
-    Keeps the pgvector path byte-identical whenever a DSN is set: with a DSN,
-    `auto` resolves to pgvector, so a real deploy is unchanged.
+    Why `auto` does NOT auto-pick the memtable: it must preserve the long-standing
+    contract that `RB_RECALL=true` with no `RB_RECALL_DSN` is a safe NO-OP (recall
+    OFF, ingest stays async/202). Otherwise a forgotten DSN would silently fall
+    back to a NON-durable in-process store, and any stray `RB_RECALL=true` would
+    flip the default ingest path to synchronous. The memtable is therefore strictly
+    opt-in via `memory`. The pgvector path stays byte-identical whenever a DSN is
+    set, so a real deploy is unchanged.
     """
-    backend = config.recall_backend()
-    if backend == "memory":
-        return True
-    if backend == "auto":
-        return config.recall() and _recall_dsn() is None
-    return False
+    return config.recall_backend() == "memory"
 
 
 def recall_enabled() -> bool:
