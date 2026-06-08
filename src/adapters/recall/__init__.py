@@ -69,6 +69,13 @@ from adapters.observability.tracing import recall_search_span, state_connect_spa
 # partial-init of `state` during its own import of this module is safe.
 from adapters.state._lazy_state import state as _state  # lazy proxy: resolves the facade at call time (breaks the import cycle)
 
+# Embedded in-process numpy recall backend (the memtable). Selected by
+# `_use_memory_backend()` when recall is on with no DSN (the all-in-one /
+# no-docker mode). `memtable` is stdlib + numpy only (no psycopg2), and it
+# imports `_metadata_matches_filter` from this package LAZILY (at call time
+# inside `_filter_matches`), so this module-top import has no import cycle.
+from adapters.recall import memtable  # noqa: E402
+
 
 _DEFAULT_RECALL_POOL_MAX = 10  # per-process ceiling; override with RB_RECALL_POOL_MAX
 _RECALL_POOL_MIN = 1  # connections kept warm even when idle
@@ -97,6 +104,29 @@ def _recall_dsn() -> Optional[str]:
     return config.recall_dsn()
 
 
+def _use_memory_backend() -> bool:
+    """Whether the EMBEDDED in-process numpy memtable backs the recall tier.
+
+    Read fresh on every call (the seam is `config.recall_backend()` —
+    `RB_RECALL_BACKEND`, default `auto`). The single decision point routing every
+    recall_* function to `memtable` instead of pgvector:
+
+      - `memory` — always the embedded memtable (forces no-docker mode).
+      - `auto`   — the embedded memtable when recall is ON and no `RB_RECALL_DSN`
+        is configured (the all-in-one eval default); else the pgvector path.
+      - `pgvector` (or any other value) — never the memtable.
+
+    Keeps the pgvector path byte-identical whenever a DSN is set: with a DSN,
+    `auto` resolves to pgvector, so a real deploy is unchanged.
+    """
+    backend = config.recall_backend()
+    if backend == "memory":
+        return True
+    if backend == "auto":
+        return config.recall() and _recall_dsn() is None
+    return False
+
+
 def recall_enabled() -> bool:
     """Whether the synchronous recall-tier write path is active.
 
@@ -104,18 +134,19 @@ def recall_enabled() -> bool:
     the env fresh on every call so a test can flip it via monkeypatch without a
     module reload. It is the MASTER switch for recall-tier behaviour.
 
-    Two conditions must BOTH hold for it to be on:
-      - `RB_RECALL` is truthy (`1`/`true`/`yes`/`on`, case-insensitive), and
-      - `RB_RECALL_DSN` is configured (non-empty) — there is a recall store to
-        write to.
+    `RB_RECALL` must be truthy (`1`/`true`/`yes`/`on`, case-insensitive). Then
+    EITHER of two stores must be available:
+      - the pgvector recall tier — `RB_RECALL_DSN` is configured (non-empty); or
+      - the embedded in-process memtable — `_use_memory_backend()` selects it
+        (the all-in-one / no-docker mode, which needs NO DSN).
 
-    Requiring the DSN as well as the flag means a deploy that flips
-    `RB_RECALL=true` but forgets to point `RB_RECALL_DSN` at an instance stays
-    on the byte-identical flag-off path rather than erroring on every write.
+    A deploy that flips `RB_RECALL=true` but neither points `RB_RECALL_DSN` at an
+    instance NOR selects the embedded backend stays on the byte-identical
+    flag-off path rather than erroring on every write.
     """
     if not config.recall():
         return False
-    return _recall_dsn() is not None
+    return _recall_dsn() is not None or _use_memory_backend()
 
 
 def _recall_conn() -> "psycopg2.extensions.connection":
@@ -460,6 +491,8 @@ def recall_upsert_vectors(
     Only ever called when `recall_enabled()` is True (the service gates it),
     so it never runs — and never opens a connection — with the flag off.
     """
+    if _use_memory_backend():
+        return memtable.recall_upsert_vectors(tenant_id, dataset, records)
     if not records:
         return 0
 
@@ -635,6 +668,10 @@ def recall_search(
     Only ever called when `recall_enabled()` is True (the query path gates it),
     so it never runs — and never opens a recall connection — with the flag off.
     """
+    if _use_memory_backend():
+        return memtable.recall_search(
+            tenant_id, dataset, vector, top_k, watermark, flt
+        )
     qlit = _to_pgvector_literal(vector)
     flt = flt or {}
     # `recall.search` span + `rosalinddb.recall_search.duration` metric (task #20):
@@ -826,6 +863,8 @@ def recall_get_vector(
     this partition → `(None, None)` → the caller's cold lookup (also tenant-
     scoped) yields the 404. Only ever called when `recall_enabled()` is True.
     """
+    if _use_memory_backend():
+        return memtable.recall_get_vector(tenant_id, dataset, vector_id, watermark)
     with _state.recall_pooled_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -866,6 +905,10 @@ def recall_get_vector_with_embedding(
     Scope is byte-identical to `recall_get_vector` (I1 partition + I3 watermark
     pairing). Only ever called when `recall_enabled()` is True.
     """
+    if _use_memory_backend():
+        return memtable.recall_get_vector_with_embedding(
+            tenant_id, dataset, vector_id, watermark
+        )
     with _state.recall_pooled_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -941,6 +984,8 @@ def recall_list_rows(
     live AND tombstoned — suppresses; only `deleted = false` rows become
     `live_rows`.
     """
+    if _use_memory_backend():
+        return memtable.recall_list_rows(tenant_id, dataset, watermark)
     # ONE statement, ONE MVCC snapshot. Select every row above the watermark with
     # its `deleted` flag and split it in Python: `suppress_ids` = every id (live
     # AND tombstoned), `live_rows` = the not-deleted subset. DO NOT split this back
@@ -1022,6 +1067,8 @@ def recall_delete_vector(
     # Zero-vector placeholder of the dataset dimension (see docstring): same
     # dimension as every live row in the partition, so the search scan's `<->`
     # never hits a dimension mismatch on a cold-only delete's fresh tombstone.
+    if _use_memory_backend():
+        return memtable.recall_delete_vector(tenant_id, dataset, vector_id, dimension)
     placeholder = _to_pgvector_literal([0.0] * max(1, int(dimension)))
     with _state.recall_pooled_conn() as conn, conn.cursor() as cur:
         # 1. Allocate a SINGLE fresh lsn from the per-(tenant, dataset) sequence —
@@ -1108,6 +1155,8 @@ def recall_snapshot_for_consolidation(
     the union (`lsn > consolidated_lsn`), and the next consolidation folds it.
     This is what makes read-your-writes hold THROUGH a consolidation (I1 + I2).
     """
+    if _use_memory_backend():
+        return memtable.recall_snapshot_for_consolidation(tenant_id, dataset)
     with _state.recall_pooled_conn() as conn, conn.cursor() as cur:
         # ONE statement: derive the bound N inside the same query via a scalar
         # sub-SELECT, so N and the selected rows share a single MVCC snapshot. A
@@ -1173,6 +1222,8 @@ def recall_partition_count(tenant_id: str, dataset: str) -> int:
     still costs the brute-force scan), so the cap genuinely bounds the recall
     set the union scans.
     """
+    if _use_memory_backend():
+        return memtable.recall_partition_count(tenant_id, dataset)
     with _state.recall_pooled_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT COUNT(*) FROM recall_vectors "
@@ -1198,6 +1249,8 @@ def recall_trim(tenant_id: str, dataset: str, grace_watermark: int) -> int:
     aged into the grace window yet — e.g. the very first consolidation, whose
     new shard is the only one).
     """
+    if _use_memory_backend():
+        return memtable.recall_trim(tenant_id, dataset, grace_watermark)
     if grace_watermark <= 0:
         return 0
     with _state.recall_pooled_conn() as conn, conn.cursor() as cur:
@@ -1222,6 +1275,8 @@ def recall_idle_partitions(idle_seconds: float) -> List[Tuple[str, str]]:
     Grouped per `(tenant, dataset)` so a single SQL round-trip finds every idle
     partition across the whole recall instance in one pass.
     """
+    if _use_memory_backend():
+        return memtable.recall_idle_partitions(idle_seconds)
     cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=idle_seconds)
     with _state.recall_pooled_conn() as conn, conn.cursor() as cur:
         cur.execute(

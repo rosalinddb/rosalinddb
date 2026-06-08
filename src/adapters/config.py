@@ -292,6 +292,25 @@ def recall() -> bool:
     return truthy(os.getenv("RB_RECALL"))
 
 
+def recall_backend() -> str:
+    """Which recall-tier backend to use (`RB_RECALL_BACKEND`, default `auto`).
+
+    Read fresh on every call (no module reload needed for a test to flip it).
+    The seam that selects the recall storage engine:
+
+      - `auto` (default) — resolve at call time: the EMBEDDED in-process numpy
+        memtable when recall is on AND no `RB_RECALL_DSN` is configured (the
+        all-in-one / single-process eval default), else the pgvector path.
+      - `memory` — force the embedded memtable regardless of DSN (the no-docker
+        path; `RB_RECALL_DSN` is ignored / left unset).
+      - `pgvector` — force the pgvector path; it still requires a DSN to enable.
+
+    The resolution lives in `adapters.recall._use_memory_backend()`; this is
+    only the single read-fresh config surface for it.
+    """
+    return os.getenv("RB_RECALL_BACKEND", "auto")
+
+
 def recall_pool_max() -> int:
     return _pool_max("RB_RECALL_POOL_MAX", _DEFAULT_RECALL_POOL_MAX)
 
