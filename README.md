@@ -72,14 +72,29 @@ The CP is the only public origin; workers consume a Redis queue. Infra: `postgre
 
 ## Quickstart
 
-Needs **Docker**. No clone or build — `docker compose up` **pulls** the published image (`ghcr.io/rosalinddb/rosalinddb:0.1.0`, overridable via `RB_IMAGE_TAG`).
+Needs **Docker**. Everything runs from one prebuilt multi-arch image (amd64 + arm64) on GHCR — no clone, no build.
+
+### Fastest — one container, zero infra
+
+The whole DB in a single process: no Postgres, Redis, or S3. Read-your-writes out of the box. For a laptop, a demo, or CI.
+
+```bash
+docker run --rm -p 8080:8080 ghcr.io/rosalinddb/rosalinddb:edge python -m services.allinone
+curl http://localhost:8080/healthz     # {"status":"ok","service":"control_plane"}
+```
+
+In-memory only — data is gone when the container stops. For durability and the full tiering, use the stack below.
+
+### Full stack — Docker Compose
+
+The CP/DP split with real infra (Postgres catalog, Redis queue, MinIO object store, optional pgvector recall). `up` **pulls** the image — no build step.
 
 ```bash
 # grab just the compose file (or clone the repo — either works)
 curl -O https://raw.githubusercontent.com/rosalinddb/rosalinddb/main/docker-compose.yml
 
-docker compose up -d                   # pulls ghcr.io/rosalinddb/rosalinddb:0.1.0
-curl http://localhost:8080/healthz     # {"status":"ok","service":"control_plane"}
+RB_IMAGE_TAG=edge docker compose up -d  # pull + start (latest main build)
+curl http://localhost:8080/healthz      # {"status":"ok","service":"control_plane"}
 
 # no-clone happy-path check (create → ingest → poll-indexed → query), all curl:
 curl -s -X POST localhost:8080/v1/datasets -H 'Content-Type: application/json' \
@@ -94,7 +109,7 @@ curl -s -X POST localhost:8080/v1/query -H 'Content-Type: application/json' \
 
 > `make smoke` (`scripts/smoke.py`) is the fuller happy-path check, but it needs the **repo checked out** — there's no Makefile/scripts on the no-clone path. Clone first, or use the curl flow above.
 
-To pull a different build, set the tag: `RB_IMAGE_TAG=edge docker compose up -d` (latest main) or `RB_IMAGE_TAG=0.1 …`. **The image must have been published first** — push to `main` publishes `edge`; a `v0.1.0` tag publishes `0.1.0`/`0.1`/`latest` (see `.github/workflows/release.yml`).
+**Image tags.** `:edge` tracks `main` (published on every push); `:vX.Y.Z` · `:0.1` · `:latest` are pinned releases, published by pushing a `vX.Y.Z` git tag (see [`.github/workflows/release.yml`](.github/workflows/release.yml)). `RB_IMAGE_TAG` pins the tag for the whole stack — once a release is cut, plain `docker compose up -d` pulls the pinned default (`0.1.0`).
 
 Only the CP publishes a port (`:8080`); everything else stays private to the compose network. Dev defaults (`postgres/postgres`, `minio/minio123`, auth **off**) are localhost-only.
 
@@ -179,7 +194,7 @@ Real installable package, **src-layout**, `pip install -e .` — imports are `se
 | `make venv` | `.venv` + `pip install -e .` |
 | `make test-unit` | `pytest -m unit` — hermetic, no Docker |
 | `make test-integration` | real MinIO via testcontainers (Docker) |
-| `make run-local` | build + `compose up -d` |
+| `make run-local` | build from source + `compose up -d` |
 | `make fmt` · `make lint` | ruff |
 
 Tests are marked by directory (`tests/unit` → unit, `tests/integration` → integration). Integration runs against real MinIO + Postgres on purpose — fakes get the seams (multipart, presigned URLs, advisory locks) wrong. Patch workflow → [`CONTRIBUTING.md`](CONTRIBUTING.md).
