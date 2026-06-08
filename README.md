@@ -72,16 +72,29 @@ The CP is the only public origin; workers consume a Redis queue. Infra: `postgre
 
 ## Quickstart
 
-Needs **Docker**. No clone or build — `docker compose up` **pulls** the published image (`ghcr.io/rosalinddb/rosalinddb:0.1.0`).
+Needs **Docker**. No clone or build — `docker compose up` **pulls** the published image (`ghcr.io/rosalinddb/rosalinddb:0.1.0`, overridable via `RB_IMAGE_TAG`).
 
 ```bash
-# grab just the two compose files (or clone the repo — either works)
+# grab just the compose file (or clone the repo — either works)
 curl -O https://raw.githubusercontent.com/rosalinddb/rosalinddb/main/docker-compose.yml
 
 docker compose up -d                   # pulls ghcr.io/rosalinddb/rosalinddb:0.1.0
 curl http://localhost:8080/healthz     # {"status":"ok","service":"control_plane"}
-make smoke                             # full happy-path check (health→ingest→query)
+
+# no-clone happy-path check (create → ingest → poll-indexed → query), all curl:
+curl -s -X POST localhost:8080/v1/datasets -H 'Content-Type: application/json' \
+  -d '{"name":"smoke","dimension":4}'
+printf '%s\n' '{"id":"v0","values":[0,1,2,3]}' \
+| curl -s -X POST localhost:8080/v1/datasets/smoke/vectors \
+  -H 'Content-Type: application/x-ndjson' --data-binary @-
+until curl -s localhost:8080/v1/datasets/smoke | grep -q '"indexed"'; do sleep 1; done
+curl -s -X POST localhost:8080/v1/query -H 'Content-Type: application/json' \
+  -d '{"dataset":"smoke","vector":[0,1,2,3],"top_k":1}'   # -> one match
 ```
+
+> `make smoke` (`scripts/smoke.py`) is the fuller happy-path check, but it needs the **repo checked out** — there's no Makefile/scripts on the no-clone path. Clone first, or use the curl flow above.
+
+To pull a different build, set the tag: `RB_IMAGE_TAG=edge docker compose up -d` (latest main) or `RB_IMAGE_TAG=0.1 …`. **The image must have been published first** — push to `main` publishes `edge`; a `v0.1.0` tag publishes `0.1.0`/`0.1`/`latest` (see `.github/workflows/release.yml`).
 
 Only the CP publishes a port (`:8080`); everything else stays private to the compose network. Dev defaults (`postgres/postgres`, `minio/minio123`, auth **off**) are localhost-only.
 

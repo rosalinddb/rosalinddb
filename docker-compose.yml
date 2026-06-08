@@ -1,11 +1,23 @@
 # RosalindDB — self-host docker compose stack.
 #
 # THE HEADLINE PORTABLE INSTALL PATH. `docker compose up` PULLS the published
-# image (`ghcr.io/rosalinddb/rosalinddb:0.1.0`) — no clone+build needed — and
-# comes up healthy with a single public origin at `http://localhost:8080`,
-# against which `python -m scripts.smoke` passes. Contributors who want the
-# from-source build path use the `docker-compose.build.yml` override (or
-# `make run-local`); see the note on the app services below.
+# image (`ghcr.io/rosalinddb/rosalinddb:${RB_IMAGE_TAG:-0.1.0}`) — no
+# clone+build needed — and comes up healthy with a single public origin at
+# `http://localhost:8080`, against which `python -m scripts.smoke` passes.
+# Contributors who want the from-source build path use the
+# `docker-compose.build.yml` override (or `make run-local`); see the note on
+# the app services below.
+#
+# IMAGE MUST EXIST FIRST. A plain `docker compose up` PULLS the tag below; it
+# does not build. So the image has to have been published once before this
+# works: the `release image` workflow (.github/workflows/release.yml) does
+# that — push to `main` publishes the rolling `edge` tag; pushing a `vX.Y.Z`
+# tag publishes `X.Y.Z` + `X.Y` + `latest`. The pinned default here is `0.1.0`
+# (set by tag `v0.1.0`). Override the whole tag with `RB_IMAGE_TAG`, e.g.
+# `RB_IMAGE_TAG=edge docker compose up` to run the latest main build, or use
+# the `docker-compose.build.yml` override to build the image from source.
+# `RB_IMAGE_TAG` is the SINGLE source for the tag across all services here and
+# in docker-compose.build.yml.
 #
 # Topology mirrors a typical CP/DP split. The public/private network
 # isolation is provided by the Docker compose network (or your container
@@ -41,9 +53,11 @@
 #   ephemeral_runner `services.ephemeral_runner.run`. Queue-driven, private.
 #
 # All Python services run the one published image
-# (`ghcr.io/rosalinddb/rosalinddb:0.1.0`); per-service `command:` overrides
-# select the process role. The default path PULLS this image. To build it from
-# the root `Dockerfile` instead, layer the build override:
+# (`ghcr.io/rosalinddb/rosalinddb:${RB_IMAGE_TAG:-0.1.0}`); per-service
+# `command:` overrides select the process role. The default path PULLS this
+# image (which therefore must already be published — see the IMAGE MUST EXIST
+# FIRST note at the top). To build it from the root `Dockerfile` instead, layer
+# the build override:
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
 #
 # Dev defaults below (postgres/postgres, minio/minio123, JWT_SECRET=dev-secret)
@@ -157,7 +171,7 @@ services:
   # so the app never boots against an un-migrated catalog. Replaces the
   # in-process auto-migrate that needed `RB_SKIP_MIGRATE=1` workarounds.
   migrator:
-    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    image: ghcr.io/rosalinddb/rosalinddb:${RB_IMAGE_TAG:-0.1.0}
     # Cold-boot race: on a fresh volume Postgres flips between "accepting
     # connections" / "rejecting connections" during its first-time initdb /
     # superuser-create phase, so `pg_isready` (the healthcheck) can report
@@ -203,7 +217,7 @@ services:
   # the bulk-import surface, and the /v1/query reverse proxy live here.
   # Self-hoster's client (CLI, SDK, dashboard) points at http://localhost:8080.
   cp:
-    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    image: ghcr.io/rosalinddb/rosalinddb:${RB_IMAGE_TAG:-0.1.0}
     command:
       [
         "uvicorn",
@@ -258,7 +272,7 @@ services:
   # is the only thing that talks to this; a self-hoster's traffic always
   # arrives via the CP at :8080.
   query_dp:
-    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    image: ghcr.io/rosalinddb/rosalinddb:${RB_IMAGE_TAG:-0.1.0}
     command:
       [
         "uvicorn",
@@ -304,7 +318,7 @@ services:
     restart: unless-stopped
 
   validator:
-    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    image: ghcr.io/rosalinddb/rosalinddb:${RB_IMAGE_TAG:-0.1.0}
     command: ["python", "-m", "services.validator_worker.run"]
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
@@ -332,7 +346,7 @@ services:
     restart: unless-stopped
 
   index_builder:
-    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    image: ghcr.io/rosalinddb/rosalinddb:${RB_IMAGE_TAG:-0.1.0}
     command: ["python", "-m", "services.index_builder.run"]
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
@@ -366,7 +380,7 @@ services:
     restart: unless-stopped
 
   ephemeral_runner:
-    image: ghcr.io/rosalinddb/rosalinddb:0.1.0
+    image: ghcr.io/rosalinddb/rosalinddb:${RB_IMAGE_TAG:-0.1.0}
     command: ["python", "-m", "services.ephemeral_runner.run"]
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/vectors
