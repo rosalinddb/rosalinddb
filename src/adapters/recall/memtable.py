@@ -188,7 +188,11 @@ def recall_search(
         # Tombstone: NEVER a match (split on the explicit flag, not by distance).
         if row["deleted"]:
             continue
-        meta = row["metadata"] or {}
+        # Defensive COPY of the stored metadata: the pgvector path returns a
+        # fresh decode of the JSONB on every fetch, so a caller mutating a
+        # returned match's metadata must not corrupt the memtable's row (the
+        # snapshot rows alias the live dict). Filter against the copy too.
+        meta = dict(row["metadata"] or {})
         if flt and not _filter_matches(meta, flt):
             continue
         v = np.asarray(row["values"], dtype=np.float32)
@@ -245,7 +249,10 @@ def recall_list_rows(
         suppress_ids.add(row["id"])
         if row["deleted"]:
             continue
-        live_rows.append({"id": row["id"], "metadata": row["metadata"] or {}})
+        # Defensive COPY of the stored metadata (see `recall_search`): pgvector
+        # returns a fresh JSONB decode per fetch, so the returned dict must not
+        # alias the live memtable row.
+        live_rows.append({"id": row["id"], "metadata": dict(row["metadata"] or {})})
     return live_rows, suppress_ids
 
 

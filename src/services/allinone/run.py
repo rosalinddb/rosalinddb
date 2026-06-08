@@ -153,7 +153,68 @@ def _start_workers() -> None:
                 daemon=True,
             )
             thread.start()
+
+        # Start the RESULT_READY consumer the data plane uses. The query path's
+        # ephemeral fallback (a dataset with no shard yet enqueues a
+        # RUN_EPHEMERAL_QUERY) publishes its result on the RESULT_READY queue; a
+        # `GET /v1/query/status/{job_id}` poll only finds it once this consumer
+        # has stashed it in the shared `result_store`. Without it the fallback
+        # hangs at `ready:false` forever. Mirrors `dp_app.on_start()` which calls
+        # the same `start_result_consumer()` symbol. It is itself a daemon thread
+        # started idempotently (guarded by its own module-level flag).
+        from services.query_api.v1_query import start_result_consumer
+
+        start_result_consumer()
         _WORKERS_STARTED.set()
+
+
+class _AllInOneServer:
+    """A `uvicorn.Server` subclass that also trips the workers' stop event.
+
+    uvicorn installs its OWN SIGTERM/SIGINT handlers (setting `should_exit` to
+    drain in-flight HTTP requests), but those never call
+    `queue.shutdown.request_stop()`, so the worker daemon threads' consume loops
+    (which poll `should_stop()` at the top of each iteration) are never told to
+    exit. The daemon threads die with the process regardless, so this is not
+    required for a clean exit, but tripping the event lets a worker holding a
+    queue message ack/nack it promptly (avoiding a reaper reclaim) instead of
+    being killed mid-consume.
+
+    Rather than fight uvicorn's handler ordering, we OWN the signal handler:
+    `install_signal_handlers()` is uvicorn's hook (called on the main thread when
+    the server starts). We override it to install a handler that BOTH trips our
+    queue stop event AND drives uvicorn's own `should_exit` shutdown, so a single
+    SIGINT/SIGTERM tears down HTTP and the workers together with no hang.
+    """
+
+    def __init__(self, config):  # noqa: ANN001
+        import uvicorn
+
+        # Build via the real Server so all of uvicorn's machinery is intact.
+        self._inner = uvicorn.Server(config)
+
+    def install_signal_handlers(self) -> None:
+        import signal
+
+        from adapters.queue import shutdown as queue_shutdown
+
+        def _handler(signum, _frame):  # noqa: ANN001
+            queue_shutdown.request_stop()
+            # Mirror uvicorn's own handler: ask the HTTP server to drain+exit.
+            self._inner.should_exit = True
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError):
+                # Off the main thread — nothing to wire (daemon threads die
+                # with the process anyway).
+                pass
+
+    def run(self) -> None:
+        # Substitute our signal-handler installer onto the inner server, then run.
+        self._inner.install_signal_handlers = self.install_signal_handlers  # type: ignore[method-assign]
+        self._inner.run()
 
 
 def main() -> None:
@@ -161,11 +222,15 @@ def main() -> None:
 
     `migrate()` in memory mode is a pure bootstrap-default-tenant no-op (no
     schema); each worker `main_loop` also calls it (idempotent). uvicorn binds
-    `0.0.0.0:$PORT` (default 8080).
+    `0.0.0.0:$PORT` (default 8080). On SIGTERM/SIGINT the server drains HTTP and
+    trips the workers' shutdown event (see `_AllInOneServer`).
     """
     import uvicorn
 
     config.validate()
     state_mod.migrate()
     _start_workers()
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    server = _AllInOneServer(
+        uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    )
+    server.run()

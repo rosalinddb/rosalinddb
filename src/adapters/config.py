@@ -307,8 +307,12 @@ def recall_backend() -> str:
 
     The resolution lives in `adapters.recall._use_memory_backend()`; this is
     only the single read-fresh config surface for it.
+
+    Normalised (stripped + lower-cased) so `_use_memory_backend()` /
+    `recall_enabled()` can compare against the canonical tokens without each
+    caller re-normalising — ` Memory `, `MEMORY`, `Auto` all resolve correctly.
     """
-    return os.getenv("RB_RECALL_BACKEND", "auto")
+    return os.getenv("RB_RECALL_BACKEND", "auto").strip().lower()
 
 
 def recall_pool_max() -> int:

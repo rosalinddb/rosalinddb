@@ -49,6 +49,26 @@ def test_recall_backend_read_fresh(monkeypatch):
     assert config.recall_backend() == "pgvector"
 
 
+def test_recall_backend_normalized(monkeypatch):
+    """`recall_backend()` strips + lower-cases so casing/whitespace can't break
+    the `_use_memory_backend()` token compare."""
+    import adapters.config as config
+    import adapters.recall as recall_pkg
+
+    monkeypatch.setenv("RB_RECALL_BACKEND", "  MEMORY ")
+    assert config.recall_backend() == "memory"
+    monkeypatch.setenv("RB_RECALL_BACKEND", "Auto")
+    assert config.recall_backend() == "auto"
+
+    # And the normalisation actually flows through to backend selection: a
+    # mixed-case " Memory " still routes to the embedded memtable.
+    monkeypatch.setenv("RB_RECALL", "true")
+    monkeypatch.setenv("RB_RECALL_BACKEND", " Memory ")
+    monkeypatch.delenv("RB_RECALL_DSN", raising=False)
+    importlib.reload(recall_pkg)
+    assert recall_pkg._use_memory_backend() is True
+
+
 # --- enabled gate (headline embedded-mode change) -------------------------
 
 
@@ -108,6 +128,45 @@ def test_upsert_then_search_ryw(mem):
     assert matches[0]["deleted"] is False
     # score == exact L2-squared distance
     assert matches[0]["score"] == pytest.approx(_dist([1.0, 0.0], [1.0, 0.0]))
+
+
+def test_search_score_is_l2_squared_not_sqrt(mem):
+    """The recall score MUST be L2-SQUARED (not plain L2/sqrt) so it ranks on the
+    same scale as the FAISS L2-squared distances the cold tier produces.
+
+    A distance of 2 along ONE axis distinguishes the two: squared = 4.0, while a
+    sqrt impl would return 2.0. Pin the SQUARED value so a plain-L2 regression
+    fails green here (this is the load-bearing ranking property of the union).
+    """
+    mem.recall_upsert_vectors("t", "d", [{"id": "x", "values": [0.0, 0.0], "metadata": {}}])
+    suppress, matches = mem.recall_search("t", "d", [2.0, 0.0], top_k=10, watermark=0)
+    assert len(matches) == 1
+    # squared distance = (2-0)^2 + 0 = 4.0; a sqrt impl would give 2.0.
+    assert matches[0]["score"] == pytest.approx(4.0)
+    assert matches[0]["score"] != pytest.approx(2.0)
+    # And a two-axis case where squared (8) and sqrt (~2.83) also differ.
+    mem.recall_upsert_vectors("t", "d2", [{"id": "y", "values": [0.0, 0.0], "metadata": {}}])
+    _, m2 = mem.recall_search("t", "d2", [2.0, 2.0], top_k=10, watermark=0)
+    assert m2[0]["score"] == pytest.approx(8.0)
+
+
+def test_search_returns_metadata_copy_not_alias(mem):
+    """`recall_search` / `recall_list_rows` return DEFENSIVE COPIES of the stored
+    metadata (the pgvector path returns a fresh JSONB decode per fetch). A caller
+    mutating a returned dict must NOT corrupt the live memtable row."""
+    mem.recall_upsert_vectors("t", "d", [{"id": "x", "values": [1.0, 0.0], "metadata": {"k": "v"}}])
+
+    _, matches = mem.recall_search("t", "d", [1.0, 0.0], top_k=10, watermark=0)
+    matches[0]["metadata"]["k"] = "MUTATED"
+    matches[0]["metadata"]["injected"] = True
+    # a fresh read is unaffected (the store kept the original)
+    _, again = mem.recall_search("t", "d", [1.0, 0.0], top_k=10, watermark=0)
+    assert again[0]["metadata"] == {"k": "v"}
+
+    live_rows, _ = mem.recall_list_rows("t", "d", watermark=0)
+    live_rows[0]["metadata"]["k"] = "MUTATED2"
+    again_rows, _ = mem.recall_list_rows("t", "d", watermark=0)
+    assert again_rows[0]["metadata"] == {"k": "v"}
 
 
 def test_upsert_last_write_wins(mem):

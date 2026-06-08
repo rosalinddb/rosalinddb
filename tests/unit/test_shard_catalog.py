@@ -98,3 +98,95 @@ def test_add_shard_round_trips_consolidated_lsn(state):
     shard = state.get_latest_shard("t1", "ds")
     assert shard["consolidated_lsn"] == 42
     assert shard["build_type"] == "consolidate"
+
+
+def test_concurrent_add_shard_and_list_no_lost_ids(state):
+    """The in-memory catalog is driven from MANY threads by the all-in-one
+    (index_builder daemon mutating + uvicorn threadpool reading). `add_shard`
+    is a read-modify-write of `_MEM_SHARD_ID` plus an append to a shared list;
+    without `_MEM_CATALOG_LOCK` two concurrent `add_shard`s lose an id (both read
+    the same counter) and a concurrent `list_shards` can tear.
+
+    This races N writer threads doing many `add_shard`s against reader threads
+    doing `list_shards`, then asserts: every shard id is UNIQUE (no lost-update),
+    the total count matches the number of writes, and no read raised."""
+    import threading
+
+    errors: list = []
+    n_writers = 8
+    per_writer = 40
+
+    def writer(wid):
+        try:
+            for i in range(per_writer):
+                state.add_shard(
+                    "t1", "ds", f"memory://idx/ds/w{wid}-{i}.bin",
+                    checksum=f"c{wid}-{i}", vector_count=1, index_type="flat",
+                )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def reader():
+        try:
+            for _ in range(per_writer):
+                # A torn read (mutated mid-iteration) would raise here.
+                rows = state.list_shards("t1", "ds")
+                # ids seen in a single snapshot must be unique.
+                seen = [r["id"] for r in rows]
+                assert len(seen) == len(set(seen))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(w,)) for w in range(n_writers)]
+    threads += [threading.Thread(target=reader) for _ in range(3)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert not errors, errors
+    final = state.list_shards("t1", "ds")
+    ids = [r["id"] for r in final]
+    assert len(ids) == n_writers * per_writer  # no lost-update dropped a shard
+    assert len(ids) == len(set(ids))  # every allocated id is unique
+
+
+def test_concurrent_dataset_mutation_and_read(state):
+    """Concurrent dataset create/status-update (mutation) racing list/get
+    (reads) on the locked in-memory catalog: no read raises, and the final
+    state is consistent. Exercises the dataset side of `_MEM_CATALOG_LOCK`."""
+    import threading
+
+    errors: list = []
+    n = 30
+    for i in range(n):
+        state.create_dataset("t1", f"ds{i}", 4)
+
+    def mutator():
+        try:
+            for i in range(n):
+                state.update_dataset_status("t1", f"ds{i}", "indexing")
+                state.set_row_count("t1", f"ds{i}", i)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def reader():
+        try:
+            for _ in range(n):
+                rows = state.list_datasets("t1")
+                # consistent snapshot: each row is a complete dict
+                for r in rows:
+                    assert "dataset_name" in r and "status" in r
+                state.get_dataset("t1", "ds0")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=mutator) for _ in range(4)]
+    threads += [threading.Thread(target=reader) for _ in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert not errors, errors
+    assert len(state.list_datasets("t1")) == n
