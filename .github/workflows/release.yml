@@ -104,3 +104,58 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Post-publish smoke. ONLY on release tags (v*): pulls the JUST-PUBLISHED image
+  # and brings the real compose stack up to prove the deploy path end to end
+  # (pull -> up -> health -> dataset -> ingest -> async index -> query). Free on a
+  # public repo; tag-gated so routine main/`edge` pushes stay fast. Runs after the
+  # image job so the tag exists in the registry to pull.
+  smoke:
+    name: pull & smoke the published image
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # v0.1.0 -> 0.1.0 : the semver tag docker-compose.yml pins via ${RB_IMAGE_TAG}.
+      - name: Resolve published image tag
+        run: echo "RB_IMAGE_TAG=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      # A freshly-published GHCR package is private until made public, so log in
+      # (read scope) to pull it from the runner regardless of package visibility.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: rosalinddb-ci
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and start the published stack
+        run: |
+          docker compose pull
+          docker compose up -d
+
+      - name: Wait for the control plane to be healthy
+        run: |
+          for _ in $(seq 1 60); do
+            if [ "$(curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8080/healthz || true)" = "200" ]; then
+              echo "control plane healthy"; exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::stack did not become healthy in time"
+          docker compose ps
+          docker compose logs --tail=80
+          exit 1
+
+      - name: Smoke (health -> dataset -> ingest -> index -> query)
+        run: python scripts/smoke.py --base-url http://localhost:8080
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
