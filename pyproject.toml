@@ -15,12 +15,8 @@ dynamic = ["dependencies"]
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
 
-# Console entrypoint: `pip install -e .` exposes a `rosalinddb` command that
-# launches the single-process all-in-one server (memory:// catalog + storage,
-# in-process queue, embedded numpy recall — zero external infra). Equivalent to
-# `python -m services.allinone`.
-[project.scripts]
-rosalinddb = "services.allinone.run:main"
+# No console script — the engine is operated via the Docker image /
+# docker-compose.yml, not a CLI.
 
 # src-layout. The app packages live under src/ and are *installed*
 # (`pip install -e .`) so `import services.*` / `import adapters.*` resolve via
