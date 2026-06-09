@@ -72,22 +72,7 @@ The CP is the only public origin; workers consume a Redis queue. Infra: `postgre
 
 ## Quickstart
 
-Needs **Docker**. Everything runs from one prebuilt multi-arch image (amd64 + arm64) on GHCR — no clone, no build.
-
-### Fastest — one container, zero infra
-
-The whole DB in a single process: no Postgres, Redis, or S3. Read-your-writes out of the box. For a laptop, a demo, or CI.
-
-```bash
-docker run --rm -p 8080:8080 ghcr.io/rosalinddb/rosalinddb:edge python -m services.allinone
-curl http://localhost:8080/healthz     # {"status":"ok","service":"control_plane"}
-```
-
-In-memory only — data is gone when the container stops. For durability and the full tiering, use the stack below.
-
-### Full stack — Docker Compose
-
-The CP/DP split with real infra (Postgres catalog, Redis queue, MinIO object store, optional pgvector recall). `up` **pulls** the image — no build step.
+Needs **Docker**. `docker compose up` **pulls** the prebuilt multi-arch image (amd64 + arm64) from GHCR — no clone, no build. You get the full CP/DP stack (Postgres catalog, Redis queue, MinIO object store, optional pgvector recall) behind a single public origin at `:8080`.
 
 ```bash
 # grab just the compose file (or clone the repo — either works)
